@@ -1,7 +1,8 @@
 import { createOptimisticAction, createTransaction } from '@tanstack/react-db'
-import { PLAN_PRICE, type Customer } from '../../shared/domain'
+import { PLAN_PRICE, type ActivityEvent, type Customer, type Page } from '../../shared/domain'
 import type { CustomerFormValues } from '../lib/validation'
 import type { Product, Subscription } from '../../shared/domain'
+import { api } from '../lib/api'
 import {
   customersCollection,
   eventsCollection,
@@ -9,18 +10,55 @@ import {
   newId,
   paymentsCollection,
   persist,
+  productsCollection,
   selectionCollection,
   subscriptionsCollection,
   tasksCollection,
   withCustomerDerived,
 } from './collections'
+import { applyChange } from './live'
 
 // Intent-level mutations. Each one is a *transaction*: it can touch several
 // collections, applies optimistically everywhere at once, persists in a single
 // atomic request, and rolls back every collection together if that fails.
 
+/** List-price MRR of a brand-new account (no add-ons, no negotiated prices yet). */
 export const mrrOf = (c: Pick<Customer, 'plan' | 'seats' | 'status'>) =>
   c.status === 'active' ? PLAN_PRICE[c.plan] * c.seats : 0
+
+type Billing = Pick<Customer, 'id' | 'plan' | 'seats' | 'status' | 'mrr'>
+
+/**
+ * Optimistic MRR after a plan/seats/status change. The server's MRR is
+ * Σ quantity × unit_price over the account's active/past-due subscriptions
+ * (base plan at its *sold* price + add-ons), and editing the customer only
+ * changes the base-plan subscription — so predict exactly that when the
+ * subscriptions are loaded, and otherwise move the known MRR by the base-plan
+ * delta. The real value is read back after commit either way.
+ */
+export function predictMrr(before: Billing, next: Pick<Customer, 'plan' | 'seats' | 'status'>) {
+  // trial -> subscriptions are "trialing", churned -> canceled: neither counts
+  if (next.status !== 'active') return 0
+  if (subscriptionsCollection.status === 'ready' && productsCollection.status === 'ready') {
+    const live = subscriptionsCollection.toArray.filter((s) => s.customerId === before.id && s.status !== 'canceled')
+    const kind = (s: Subscription) => productsCollection.get(s.productId)
+    const base = live.filter((s) => kind(s)?.kind === 'plan').sort((a, b) => b.id - a.id)[0]
+    const addons = live.filter((s) => kind(s)?.kind === 'addon').reduce((sum, s) => sum + s.quantity * s.unitPrice, 0)
+    // same plan keeps its sold price; a plan change starts a new subscription at list price
+    const unitPrice = base && kind(base)?.planCode === next.plan ? base.unitPrice : PLAN_PRICE[next.plan]
+    return addons + next.seats * unitPrice
+  }
+  if (before.status === 'active' && before.plan === next.plan)
+    return before.mrr + (next.seats - before.seats) * PLAN_PRICE[next.plan]
+  return mrrOf(next)
+}
+
+/** Apply a plan/seats/status patch to a customer draft, moving MRR with it. */
+export function applyBillingPatch(d: Billing, patch: Partial<Pick<Customer, 'plan' | 'seats' | 'status'>>) {
+  const before = { id: d.id, plan: d.plan, seats: d.seats, status: d.status, mrr: d.mrr }
+  Object.assign(d, patch)
+  if (before.plan !== d.plan || before.seats !== d.seats || before.status !== d.status) d.mrr = predictMrr(before, d)
+}
 
 /** Create a customer with a client-generated id — the row never changes key, so nothing flickers. */
 export function createCustomer(values: CustomerFormValues) {
@@ -32,12 +70,20 @@ export function createCustomer(values: CustomerFormValues) {
   return { id, tx }
 }
 
-/** Patch a customer; MRR is recomputed optimistically so KPIs/charts move instantly. */
+/**
+ * Patch customers; MRR is predicted optimistically so KPIs/charts move
+ * instantly (it is server-computed, so it isn't sent — see toBatchOps).
+ */
 export function updateCustomers(ids: number[], patch: Partial<CustomerFormValues>) {
   return customersCollection.update(ids, (drafts) => {
     for (const d of drafts) {
-      Object.assign(d, patch)
-      d.mrr = mrrOf(d)
+      const { plan, seats, status, ...rest } = patch
+      Object.assign(d, rest)
+      applyBillingPatch(d, {
+        ...(plan !== undefined && { plan }),
+        ...(seats !== undefined && { seats }),
+        ...(status !== undefined && { status }),
+      })
       d.updatedAt = new Date().toISOString()
     }
   })
@@ -78,10 +124,11 @@ export const markInvoicePaid = createOptimisticAction<{ invoiceId: number; numbe
       d.paidAt = now
       d.paidMonth = now.slice(0, 7)
     })
-    // provisional feed entry; `derived` = not sent, replaced by the server's real event
+    // provisional feed entry; `derived` = not sent, replaced by the server's real event.
+    // A positive (client-generated, larger than any server id) key sorts it at the head.
     eventsCollection.insert(
       {
-        id: -newId(),
+        id: newId(),
         type: 'invoice.paid',
         category: 'invoice',
         actorId: null,
@@ -92,12 +139,27 @@ export const markInvoicePaid = createOptimisticAction<{ invoiceId: number; numbe
       { metadata: { derived: true } },
     )
   },
-  mutationFn: async (_vars, { transaction }) => {
+  mutationFn: async ({ customerId }, { transaction }) => {
     await persist(transaction.mutations)
     // land the server's canonical event before the provisional one is dropped
-    await eventsCollection.utils.refetch()
+    await landLatestEvent(customerId)
   },
 })
+
+/**
+ * Read the newest event for a customer and write it like an SSE change would
+ * (same guards and fan-out). Refetching the events collection instead would
+ * re-read every window it holds. Best effort: the change feed delivers it too.
+ */
+async function landLatestEvent(customerId: number) {
+  try {
+    const page = await api.get<Page<ActivityEvent>>('/events', { 'customerId[eq]': customerId, sort: '-id', limit: 1 })
+    const row = page.data[0]
+    if (row) await applyChange({ kind: 'upsert', entity: 'events', row })
+  } catch (e) {
+    console.error('[markInvoicePaid] could not read back the activity event', e)
+  }
+}
 
 /**
  * Staged bulk reassignment: changes are applied to the UI immediately as a
@@ -141,7 +203,8 @@ export const recordPayment = createOptimisticAction<{
       customerId,
       amount,
       method,
-      reference: 'pending…',
+      // generated by the server (never sent, see toBatchOps); the UI shows "pending…" until then
+      reference: '',
       receivedAt: now,
       recordedBy: userId,
     })

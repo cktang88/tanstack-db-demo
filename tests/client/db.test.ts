@@ -10,6 +10,7 @@ import {
   type PendingMutation,
 } from '@tanstack/react-db'
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test'
+import { predictMrr } from '../../src/db/actions'
 import {
   auditCollection,
   commentsCollection,
@@ -325,6 +326,18 @@ describe('sign-in/out reset', () => {
     await applyChange({ kind: 'upsert', entity: 'customers', row: customer })
     expect(customersCollection.get(1)).toMatchObject({ company: 'Acme', createdMonth: '2026-01' })
     await resetServerCollections()
+  })
+})
+
+describe('optimistic MRR', () => {
+  it('moves the known MRR by the base-plan delta when subscriptions are not loaded', () => {
+    const before = { id: 1, plan: 'pro' as const, seats: 10, status: 'active' as const, mrr: 123_456 }
+    // keeps add-ons and the sold price already folded into the known MRR
+    expect(predictMrr(before, { plan: 'pro', seats: 12, status: 'active' }) - before.mrr).toBe(
+      predictMrr({ ...before, mrr: 0 }, { plan: 'pro', seats: 12, status: 'active' }),
+    )
+    expect(predictMrr(before, { plan: 'pro', seats: 10, status: 'churned' })).toBe(0)
+    expect(predictMrr(before, { plan: 'pro', seats: 10, status: 'trial' })).toBe(0)
   })
 })
 
