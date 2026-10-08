@@ -21,7 +21,7 @@ import {
   usersCollection,
   withInvoiceDerived,
 } from '../../src/db/collections'
-import { isNewestFirstWindow, loadSubsetToSearch, whereToParams } from '../../src/db/pushdown'
+import { isNewestFirstWindow, loadSubsetToSearch, orderByToSort, whereToParams } from '../../src/db/pushdown'
 
 const ref = (field: string) => new IR.PropRef([field])
 const val = (v: unknown) => new IR.Value(v)
@@ -48,7 +48,7 @@ describe('predicate push-down', () => {
 
   it('builds sort, limit and offset', () => {
     const orderBy = [
-      { expression: ref('createdAt'), compareOptions: { direction: 'desc', nulls: 'first', stringSort: 'lexical' } },
+      { expression: ref('createdAt'), compareOptions: { direction: 'desc', nulls: 'last', stringSort: 'lexical' } },
       { expression: ref('id'), compareOptions: { direction: 'asc', nulls: 'first', stringSort: 'lexical' } },
     ]
     const sp = loadSubsetToSearch({ where: fn('eq', ref('category'), val('task')), orderBy, limit: 31, offset: 30 } as never)
@@ -63,6 +63,28 @@ describe('predicate push-down', () => {
     expect(() => whereToParams(fn('or', fn('eq', ref('a'), val(1)), fn('eq', ref('b'), val(2))) as never)).toThrow()
     expect(() => whereToParams(fn('like', ref('a'), val('%x%')) as never)).toThrow()
     expect(() => whereToParams(fn('eq', new IR.PropRef(['a', 'b']), val(1)) as never)).toThrow(/Nested/)
+  })
+
+  it('refuses field-to-field comparisons and misplaced lists instead of sending a field name as a literal', () => {
+    expect(() => whereToParams(fn('eq', ref('a'), ref('b')) as never)).toThrow(/literal/)
+    expect(() => whereToParams(fn('and', fn('eq', ref('x'), val(1)), fn('gt', ref('a'), ref('b'))) as never)).toThrow()
+    expect(() => whereToParams(fn('eq', val(1), ref('a')) as never)).toThrow(/field/)
+    expect(() => whereToParams(fn('eq', ref('a'), val([1, 2])) as never)).toThrow(/list/)
+    expect(() => whereToParams(fn('in', ref('a'), ref('b')) as never)).toThrow()
+  })
+
+  it("refuses sort orders SQLite wouldn't produce", () => {
+    const by = (field: string, direction: 'asc' | 'desc', nulls: 'first' | 'last', stringSort = 'locale') => [
+      { expression: ref(field), compareOptions: { direction, nulls, stringSort } },
+    ]
+    // SQLite: NULLs first ascending, last descending
+    expect(orderByToSort(by('dueAt', 'asc', 'first') as never)).toBe('dueAt')
+    expect(orderByToSort(by('dueAt', 'desc', 'last') as never)).toBe('-dueAt')
+    expect(() => orderByToSort(by('dueAt', 'desc', 'first') as never)).toThrow(/NULLs/)
+    expect(() => orderByToSort(by('dueAt', 'asc', 'last') as never)).toThrow(/NULLs/)
+    // ids are never NULL: the default (nulls first) is fine in both directions
+    expect(orderByToSort(by('id', 'desc', 'first') as never)).toBe('-id')
+    expect(() => orderByToSort(by('name', 'asc', 'first', 'custom') as never)).toThrow(/custom/)
   })
 })
 
