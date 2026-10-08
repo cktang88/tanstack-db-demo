@@ -1,7 +1,7 @@
 import type { Page } from '../../shared/domain.ts'
 import type { Resource, ScopeSql } from '../resources.ts'
 import type { DB } from './schema.ts'
-import { buildOrderBy, buildWhere, type ListParams } from './sql.ts'
+import { BadQuery, buildOrderBy, buildWhere, lookup, type ListParams } from './sql.ts'
 
 // Generic, whitelist-driven SQL for any registered resource.
 
@@ -28,15 +28,30 @@ const andScope = (where: { sql: string; params: unknown[] }, scope: ScopeSql | u
     : { sql: `WHERE ${scope.sql}`, params: scope.params }
 }
 
-export function listRows<T>(db: DB, r: Resource, p: ListParams, scope?: ScopeSql): Page<T> {
-  const where = andScope(buildWhere(r.columns, p.filters, { term: p.search, fields: r.search ?? [] }), scope)
+/** `?sum=` fields -> their (whitelisted, numeric) column SQL */
+const sumColumns = (r: Resource, fields: string[]) =>
+  fields.map((f) => {
+    const col = r.summable?.includes(f) ? lookup(r.columns, f) : undefined
+    if (!col || col.type !== 'number') throw new BadQuery(`Cannot sum "${f}"`)
+    return [f, col.sql] as const
+  })
+
+export function listRows<T>(db: DB, r: Resource, p: ListParams, scope?: ScopeSql): Page<T> & { sums?: Record<string, number> } {
+  const where = andScope(buildWhere(r.columns, p.filters, { term: p.search, fields: r.search ?? [] }, r.virtual), scope)
   const sorts = p.sorts.length
     ? p.sorts
     : r.defaultSort
       ? [{ field: r.defaultSort.replace(/^-/, ''), dir: r.defaultSort.startsWith('-') ? ('desc' as const) : ('asc' as const) }]
       : []
-  const order = buildOrderBy(r.columns, sorts)
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${r.table} ${where.sql}`).get(...where.params) as { n: number }).n
+  const order = buildOrderBy(r.columns, sorts, 'id', r.virtual)
+  const sums = sumColumns(r, [...new Set(p.sums ?? [])])
+  // the count and any totals are aggregates over every matching row, not just this page
+  const agg = db
+    .prepare(
+      `SELECT COUNT(*) AS n${sums.map(([, sql], i) => `, COALESCE(SUM(${sql}), 0) AS s${i}`).join('')} FROM ${r.table} ${where.sql}`,
+    )
+    .get(...where.params) as Record<string, number>
+  const total = agg.n!
   const limit = p.limit !== undefined ? `LIMIT ${Math.max(0, Math.floor(p.limit))}` : ''
   const offset = p.offset ? `OFFSET ${Math.max(0, Math.floor(p.offset))}` : ''
   const rows = db
@@ -50,6 +65,7 @@ export function listRows<T>(db: DB, r: Resource, p: ListParams, scope?: ScopeSql
     page: pageSize ? Math.floor((p.offset ?? 0) / pageSize) + 1 : 1,
     pageSize,
     pageCount: pageSize ? Math.max(1, Math.ceil(total / pageSize)) : 1,
+    ...(sums.length && { sums: Object.fromEntries(sums.map(([f], i) => [f, agg[`s${i}`]!])) }),
   }
 }
 

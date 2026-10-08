@@ -3,7 +3,7 @@ import { Effect, Layer, ManagedRuntime, Schema } from 'effect'
 import { Hono, type Context as HonoContext } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { streamSSE } from 'hono/streaming'
-import type { Me, Permission } from '../shared/domain.ts'
+import { PLANS, type Me, type Permission } from '../shared/domain.ts'
 import { BatchRequest, ChaosConfig, LoginInput, PaymentInput } from '../shared/schemas.ts'
 import {
   authenticate,
@@ -498,8 +498,11 @@ export function makeApp(opts: AppOptions) {
       Effect.gen(function* () {
         yield* requirePermission('customers:read')
         const by = yield* Schema.decodeUnknownEffect(Schema.Literals(['plan', 'country', 'status']))(c.req.query('by'))
+        const plan = yield* Schema.decodeUnknownEffect(Schema.UndefinedOr(Schema.Literals(PLANS)))(
+          c.req.query('plan') || undefined,
+        )
         const d = yield* database
-        return yield* sql(() => metrics.breakdown(d, by))
+        return yield* sql(() => metrics.breakdown(d, by, plan))
       }),
     ),
   )

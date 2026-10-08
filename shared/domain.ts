@@ -395,6 +395,11 @@ export interface Page<T> {
   pageCount: number
 }
 
+/** A list page that also carries totals over every matching row (`?sum=mrr`), not just this page. */
+export interface SummedPage<T, K extends string = string> extends Page<T> {
+  sums: Record<K, number>
+}
+
 export interface CursorPage<T> {
   data: T[]
   nextCursor: number | null

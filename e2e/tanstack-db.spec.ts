@@ -1,6 +1,7 @@
 import { expect, test, type Page, type Request } from '@playwright/test'
 
-// Behaviour that only exists because of TanStack DB.
+// Properties specific to the TanStack DB data layer (requests made, transactions,
+// push-down). User-visible features both branches share are in features.spec.ts.
 
 const usdFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
 const usd = (n: number) => usdFmt.format(n)
@@ -97,37 +98,6 @@ test('changes made elsewhere stream in over SSE and update live queries', async 
   expect(requests.filter((r) => r.startsWith('GET /api/customers'))).toEqual([])
 })
 
-test('localStorage collections sync across tabs (theme + pins)', async ({ page, context }) => {
-  await page.goto('/settings')
-  const other = await context.newPage()
-  await other.goto('/')
-  await page.getByRole('radio', { name: 'Dark' }).click()
-  await expect(other.locator('html')).toHaveClass(/dark/)
-
-  await page.goto('/customers/1')
-  await page.getByRole('button', { name: '☆ Pin' }).click()
-  await expect(other.getByTestId('pinned-accounts').getByRole('link')).toHaveCount(1)
-  await page.getByRole('button', { name: '★ Pinned' }).click()
-  await expect(other.getByTestId('pinned-accounts')).toHaveCount(0)
-  await page.goto('/settings')
-  await page.getByRole('radio', { name: 'Light' }).click()
-  await expect(other.locator('html')).not.toHaveClass(/dark/)
-  await other.close()
-})
-
-test('row selection is a local-only collection: survives paging, summarised by a join', async ({ page }) => {
-  await page.goto('/customers?status=active')
-  const table = page.getByTestId('customers-table')
-  await table.getByLabel('Select row').nth(0).check()
-  await page.getByLabel('Next page').click()
-  await table.getByLabel('Select row').nth(0).check()
-  await expect(table.getByTestId('selection-summary')).toContainText('2 across all pages')
-  await page.getByLabel('Previous page').click()
-  await expect(table.getByLabel('Select row').nth(0)).toBeChecked()
-  await table.getByRole('button', { name: 'Clear' }).click()
-  await expect(table.getByTestId('bulk-bar')).toHaveCount(0)
-})
-
 test('multi-collection archive transaction rolls back customers AND their invoices', async ({ page }) => {
   await page.goto('/invoices?status=open')
   const link = page.getByTestId('invoices-table').getByTestId('row').first().getByRole('link')
@@ -198,17 +168,6 @@ test('collection schema (Effect Schema) rejects invalid inserts before they reac
   await expect(todo.getByTestId('task-card')).toHaveCount(before)
 })
 
-test('pending writes are visible per row ($hasPendingWrites)', async ({ page }) => {
-  await page.goto('/projects/4')
-  await setChaos(page, { latencyMs: 1500, failRate: 0 })
-  const card = page.getByTestId('column-todo').getByTestId('task-card').first()
-  const title = (await card.getByTestId('task-title').textContent())!
-  await card.getByLabel('Move right').click()
-  const moved = page.getByTestId('column-in_progress').getByTestId('task-card').filter({ hasText: title })
-  await expect(moved).toHaveAttribute('data-pending', 'true')
-  await expect(moved).not.toHaveAttribute('data-pending', 'true', { timeout: 5000 })
-})
-
 test('debounced autosave: many keystrokes, one request', async ({ page }) => {
   await page.goto('/projects/5')
   const box = page.getByLabel('Project description')
@@ -273,49 +232,6 @@ test('a partial payment goes to the append-only ledger optimistically; the balan
   const customerId = Number(new URL(page.url()).pathname.split('/').pop())
   const rollup = (await (await page.request.get(`/api/customer-balances/${customerId}`)).json()) as { outstanding: number }
   await expect(balance).toHaveText(usd(rollup.outstanding / 100))
-})
-
-test('many-to-many tag toggles and team membership are optimistic inserts/deletes on join tables', async ({ page }) => {
-  await page.goto('/customers/1')
-  const tag = page.getByTestId('tags').getByRole('button').first()
-  const pressed = await tag.getAttribute('aria-pressed')
-  await tag.click()
-  await expect(tag).toHaveAttribute('aria-pressed', pressed === 'true' ? 'false' : 'true')
-  await page.reload()
-  await expect(page.getByTestId('tags').getByRole('button').first()).toHaveAttribute(
-    'aria-pressed',
-    pressed === 'true' ? 'false' : 'true',
-  )
-
-  await page.goto('/team')
-  await page.getByRole('radio', { name: 'Teams' }).click()
-  const team = page.getByTestId('teams').locator('section').first()
-  const add = team.getByRole('combobox')
-  const name = (await add.locator('option').nth(1).textContent())!
-  await add.selectOption({ index: 1 })
-  const chip = team.getByRole('button', { name: new RegExp(`^Remove ${name} from`) })
-  await expect(chip).toBeVisible()
-  await chip.click()
-  await expect(chip).toHaveCount(0)
-})
-
-test('a server-side refusal (409: task has comments) rolls the optimistic delete back', async ({ page }) => {
-  await page.goto('/projects/1')
-  const card = page.getByTestId('task-card').first()
-  const title = (await card.getByTestId('task-title').textContent())!
-  await card.getByTestId('task-title').click()
-  const dialog = page.getByRole('dialog')
-  await dialog.getByLabel('Comment').fill('Blocking the delete')
-  await dialog.getByRole('button', { name: 'Post' }).click()
-  await expect(dialog.getByText('Blocking the delete')).toBeVisible()
-  await page.keyboard.press('Escape')
-  await page.getByTestId('task-card').filter({ hasText: title }).first().hover()
-  await page
-    .getByRole('button', { name: `Delete ${title}` })
-    .first()
-    .click()
-  await expect(page.getByRole('alert').filter({ hasText: 'Could not delete task' })).toBeVisible()
-  await expect(page.getByTestId('task-card').filter({ hasText: title }).first()).toBeVisible()
 })
 
 test('a viewer gets read-only UI driven by the same permissions the API enforces', async ({ browser, baseURL }) => {

@@ -29,6 +29,8 @@ export interface ListParams {
   search?: string
   limit?: number
   offset?: number
+  /** numeric fields to total over every matching row (`?sum=mrr,seats`) */
+  sums?: string[]
 }
 
 export class BadQuery extends Error {}
@@ -47,7 +49,16 @@ const coerce = (col: ColumnDef, v: unknown) => {
   return String(v)
 }
 
-export function buildWhere(columns: Columns, filters: Filter[], search?: { term?: string; fields: string[] }) {
+/**
+ * `virtual` holds extra whitelisted expressions (e.g. a related row's name via a
+ * scalar subquery) that may be searched but not filtered on.
+ */
+export function buildWhere(
+  columns: Columns,
+  filters: Filter[],
+  search?: { term?: string; fields: string[] },
+  virtual: Columns = {},
+) {
   const clauses: string[] = []
   const params: unknown[] = []
   for (const f of filters) {
@@ -91,15 +102,16 @@ export function buildWhere(columns: Columns, filters: Filter[], search?: { term?
   }
   if (search?.term) {
     const like = `%${escapeLike(search.term)}%`
-    clauses.push(`(${search.fields.map((f) => `${columns[f]!.sql} LIKE ? ESCAPE '\\'`).join(' OR ')})`)
+    const exprs = search.fields.map((f) => (lookup(columns, f) ?? lookup(virtual, f))!.sql)
+    clauses.push(`(${exprs.map((e) => `${e} LIKE ? ESCAPE '\\'`).join(' OR ')})`)
     params.push(...search.fields.map(() => like))
   }
   return { sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params }
 }
 
-export function buildOrderBy(columns: Columns, sorts: Sort[], fallback = 'id') {
+export function buildOrderBy(columns: Columns, sorts: Sort[], fallback = 'id', virtual: Columns = {}) {
   const parts = sorts.map((s) => {
-    const col = lookup(columns, s.field)
+    const col = lookup(columns, s.field) ?? lookup(virtual, s.field)
     if (!col) throw new BadQuery(`Unknown sort field "${s.field}"`)
     return `${col.sql} ${s.dir === 'desc' ? 'DESC' : 'ASC'}`
   })

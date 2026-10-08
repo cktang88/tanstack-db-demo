@@ -3,6 +3,7 @@ import type {
   CursorPage,
   ActivityEvent,
   OverviewMetrics,
+  Plan,
   RevenuePoint,
   SignupPoint,
 } from '../../shared/domain.ts'
@@ -93,13 +94,14 @@ export const metrics = {
          GROUP BY month, plan ORDER BY month`,
       )
       .all(`-${months - 1} months`) as SignupPoint[],
-  breakdown: (db: DB, by: 'plan' | 'country' | 'status'): BreakdownPoint[] =>
+  /** `plan` narrows the breakdown to customers on that plan (bound parameter) */
+  breakdown: (db: DB, by: 'plan' | 'country' | 'status', plan?: Plan): BreakdownPoint[] =>
     db
       .prepare(
         `SELECT ${by} AS key, COUNT(*) AS customers, COALESCE(SUM(CASE WHEN status = 'active' THEN mrr END), 0) AS mrr
-         FROM customers WHERE ${LIVE} GROUP BY ${by} ORDER BY mrr DESC, customers DESC`,
+         FROM customers WHERE ${LIVE}${plan ? ' AND plan = ?' : ''} GROUP BY ${by} ORDER BY mrr DESC, customers DESC`,
       )
-      .all() as BreakdownPoint[],
+      .all(...(plan ? [plan] : [])) as BreakdownPoint[],
   workload: (db: DB) =>
     db
       .prepare(

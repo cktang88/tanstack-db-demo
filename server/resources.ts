@@ -33,6 +33,14 @@ export interface Resource {
   keyType: 'number' | 'text'
   columns: Columns
   search?: string[]
+  /**
+   * Extra whitelisted SQL expressions that may be sorted and searched by (list
+   * `sort`/`q`) but are not returned or filterable — e.g. a related row's name,
+   * so a page can be ordered by owner name without exposing a new column.
+   */
+  virtual?: Columns
+  /** numeric fields a list may total over all matching rows (`?sum=`) */
+  summable?: string[]
   defaultSort?: string
   /** null = any signed-in user */
   read: Permission | null
@@ -274,7 +282,9 @@ export const resources: Record<string, Resource> = {
       createdAt: t('created_at'),
       updatedAt: t('updated_at'),
     },
-    search: ['name', 'email', 'company'],
+    virtual: { owner: t('(SELECT users.name FROM users WHERE users.id = customers.owner_id)') },
+    search: ['name', 'email', 'company', 'owner'],
+    summable: ['mrr', 'seats'],
     defaultSort: '-createdAt',
     read: 'customers:read',
     create: 'customers:write',
@@ -434,7 +444,9 @@ export const resources: Record<string, Resource> = {
       dueAt: t('due_at'),
       paidAt: t('paid_at'),
     },
-    search: ['number'],
+    virtual: { customer: t('(SELECT customers.company FROM customers WHERE customers.id = invoices.customer_id)') },
+    search: ['number', 'customer'],
+    summable: ['amount'],
     defaultSort: '-issuedAt',
     read: 'billing:read',
     update: 'billing:write',

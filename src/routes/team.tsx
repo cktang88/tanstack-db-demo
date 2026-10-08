@@ -100,8 +100,8 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
               className="input w-28"
               aria-label={`Role for ${u.name}`}
               value={u.role}
-              // owners can't be demoted here, and nobody changes their own role
-              disabled={u.role === 'owner' || u.id === me.user.id || !canManage}
+              // same rule as the server: nobody changes their own role, only an owner touches an owner
+              disabled={!canManage || u.id === me.user.id || (u.role === 'owner' && !meOwner)}
               onChange={(e) =>
                 usersCollection
                   .update(u.id, (d) => void (d.role = e.target.value as Role))
