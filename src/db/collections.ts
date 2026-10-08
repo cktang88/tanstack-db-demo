@@ -145,9 +145,7 @@ const SERVER_FIELDS: Record<string, ReadonlySet<string>> = {
 
 const writable = (entity: string, o: Record<string, unknown>) =>
   Object.fromEntries(
-    Object.entries(o).filter(
-      ([k]) => !DERIVED_FIELDS.has(k) && !SERVER_FIELDS['*']!.has(k) && !SERVER_FIELDS[entity]?.has(k),
-    ),
+    Object.entries(o).filter(([k]) => !DERIVED_FIELDS.has(k) && !SERVER_FIELDS['*']!.has(k) && !SERVER_FIELDS[entity]?.has(k)),
   )
 const meta = (m: PendingMutation<any>) => (m.metadata ?? {}) as { cascade?: boolean; derived?: boolean }
 const keyOf = (k: unknown) => (typeof k === 'number' ? k : String(k))
@@ -256,7 +254,8 @@ export async function persist(mutations: ReadonlyArray<PendingMutation<any>>) {
       ...results.map((r) => r.entity),
       ...mutations.flatMap((m) => ENTITY_OF.get(m.collection as AnyCollection) ?? []),
     ])
-    await Promise.all([...entities].map((entity) => utilsOf(entity)?.refetch().catch(() => {})))
+    const syncing = [...entities].flatMap((entity) => utilsOf(entity) ?? [])
+    await Promise.all(syncing.map((utils) => utils.refetch().catch(() => {})))
   }
 }
 

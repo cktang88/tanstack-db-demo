@@ -152,7 +152,16 @@ describe('batch op mapping', () => {
       m({
         type: 'insert',
         key: 9,
-        modified: { id: 9, invoiceId: 7, customerId: 3, amount: 100, method: 'card', reference: '', receivedAt: 'now', recordedBy: 1 },
+        modified: {
+          id: 9,
+          invoiceId: 7,
+          customerId: 3,
+          amount: 100,
+          method: 'card',
+          reference: '',
+          receivedAt: 'now',
+          recordedBy: 1,
+        },
         collection: paymentsCollection as never,
       }),
       m({ type: 'delete', key: '1:4', collection: teamMembersCollection as never }),
@@ -167,9 +176,9 @@ describe('batch op mapping', () => {
   it('refuses updates/deletes of append-only resources and any write to read-only ones before sending', () => {
     // inside an ambient transaction collection.update() doesn't check for handlers — toBatchOps does
     const comment = { collection: commentsCollection as never }
-    expect(toBatchOps([m({ type: 'insert', key: 1, modified: { id: 1, taskId: 2, body: 'hi', authorId: 5 }, ...comment })])).toEqual([
-      { entity: 'task-comments', op: 'insert', data: { id: 1, taskId: 2, body: 'hi' } },
-    ])
+    expect(
+      toBatchOps([m({ type: 'insert', key: 1, modified: { id: 1, taskId: 2, body: 'hi', authorId: 5 }, ...comment })]),
+    ).toEqual([{ entity: 'task-comments', op: 'insert', data: { id: 1, taskId: 2, body: 'hi' } }])
     expect(() => toBatchOps([m({ type: 'update', key: 1, changes: { body: 'edited' }, ...comment })])).toThrow(
       UnsupportedMutationError,
     )
@@ -179,7 +188,9 @@ describe('batch op mapping', () => {
     )
     // a provisional (derived) row in a read-only collection is never sent, so it is fine
     expect(
-      toBatchOps([m({ type: 'insert', key: 1, modified: { id: 1 }, metadata: { derived: true }, collection: eventsCollection as never })]),
+      toBatchOps([
+        m({ type: 'insert', key: 1, modified: { id: 1 }, metadata: { derived: true }, collection: eventsCollection as never }),
+      ]),
     ).toEqual([])
   })
 
@@ -252,8 +263,19 @@ describe('persist', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {})
     await expect(
       persist([
-        m({ type: 'insert', key: 9, modified: { id: 9, invoiceId: 7, amount: 1, method: 'card' }, collection: paymentsCollection as never }),
-        m({ type: 'update', key: 7, changes: { status: 'paid' }, metadata: { derived: true }, collection: invoicesCollection as never }),
+        m({
+          type: 'insert',
+          key: 9,
+          modified: { id: 9, invoiceId: 7, amount: 1, method: 'card' },
+          collection: paymentsCollection as never,
+        }),
+        m({
+          type: 'update',
+          key: 7,
+          changes: { status: 'paid' },
+          metadata: { derived: true },
+          collection: invoicesCollection as never,
+        }),
       ]),
     ).resolves.toBeUndefined()
     expect(fetch).toHaveBeenCalledTimes(2)
