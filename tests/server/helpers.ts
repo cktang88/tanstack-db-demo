@@ -2,8 +2,10 @@ import { makeApp } from '../../server/app.ts'
 
 export type Role = 'owner' | 'admin' | 'billing' | 'member' | 'viewer'
 
-export function testApp(opts: { latencyMs?: number; failRate?: number } = {}) {
+export function testApp(opts: { latencyMs?: number; failRate?: number; demo?: boolean; secureCookies?: boolean } = {}) {
   const { app, runtime } = makeApp({
+    demo: opts.demo,
+    secureCookies: opts.secureCookies,
     db: {
       file: ':memory:',
       seed: true,

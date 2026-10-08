@@ -18,7 +18,7 @@ import { markOverdue, rebuildMrrSnapshots } from './db/jobs.ts'
 import { parseListParams } from './db/params.ts'
 import { lookup } from './db/sql.ts'
 import { events as eventsRepo, metrics } from './db/repo.ts'
-import { DEMO_USERS, seed } from './db/seed.ts'
+import { DEMO_PASSWORD, DEMO_USERS, seed } from './db/seed.ts'
 import type { DB } from './db/schema.ts'
 import * as H from './handlers.ts'
 import { resources } from './resources.ts'
@@ -42,7 +42,22 @@ import {
 export interface AppOptions {
   db: SqliteConfig
   chaos?: { latencyMs: number; failRate: number }
+  /**
+   * Demo features: public /auth/demo-users (with the shared password), /dev/*
+   * (chaos, reset) and reseeding the database on a schema-version mismatch.
+   * Default: on, unless NODE_ENV=production (then only with DEMO_MODE=1).
+   */
+  demo?: boolean
+  /** Mark the session cookie Secure (default: NODE_ENV=production). */
+  secureCookies?: boolean
 }
+
+const isProduction = () => process.env.NODE_ENV === 'production'
+export const demoModeFromEnv = () => !isProduction() || process.env.DEMO_MODE === '1'
+
+/** Failed sign-ins per email before /auth/login answers 429 for the rest of the window. */
+const LOGIN_MAX_FAILURES = 10
+const LOGIN_WINDOW_MS = 15 * 60_000
 
 type Vars = { Variables: { me: Principal | null; requestId: string; sessionId: string | null } }
 type Ctx = HonoContext<Vars>
@@ -54,7 +69,9 @@ export const toPrincipal = (me: Me): Principal => ({
 })
 
 export function makeApp(opts: AppOptions) {
-  const sqliteLayer = Sqlite.layer(opts.db)
+  const demo = opts.demo ?? demoModeFromEnv()
+  const secureCookies = opts.secureCookies ?? isProduction()
+  const sqliteLayer = Sqlite.layer({ ...opts.db, demo })
   const layer = Layer.mergeAll(
     sqliteLayer,
     Writer.layer.pipe(Layer.provide(sqliteLayer)),
@@ -160,9 +177,12 @@ export function makeApp(opts: AppOptions) {
   const app = new Hono<Vars>().basePath('/api')
 
   // ---------------- request id + authentication ----------------
-  const PUBLIC = new Set(['/api/auth/login', '/api/auth/demo-users', '/api/health'])
+  const PUBLIC = new Set(['/api/auth/login', '/api/health', ...(demo ? ['/api/auth/demo-users'] : [])])
   app.use('*', async (c, next) => {
-    c.set('requestId', c.req.header('x-request-id') ?? randomUUID())
+    // always server-generated: a client-chosen id could forge or collide audit trails
+    const requestId = randomUUID()
+    c.set('requestId', requestId)
+    c.header('x-request-id', requestId)
     const path = new URL(c.req.url).pathname
     const bearer = c.req.header('authorization')?.match(/^Bearer (.+)$/)?.[1]
     const sid = bearer ?? getCookie(c, SESSION_COOKIE) ?? null
@@ -190,18 +210,43 @@ export function makeApp(opts: AppOptions) {
   app.get('/health', (c) => c.json({ ok: true }))
 
   // ---------------- auth ----------------
-  app.get('/auth/demo-users', (c) =>
-    c.json(DEMO_USERS.map(({ email, name, role, title }) => ({ email, name, role, title, password: 'password' }))),
-  )
+  const notFound = (c: Ctx) =>
+    c.json({ error: 'NotFound', message: `No route for ${c.req.method} ${new URL(c.req.url).pathname}` }, 404)
+  if (demo)
+    app.get('/auth/demo-users', (c) =>
+      c.json(DEMO_USERS.map(({ email, name, role, title }) => ({ email, name, role, title, password: DEMO_PASSWORD }))),
+    )
+  else app.get('/auth/demo-users', notFound)
+
+  // per-email failed-login throttle (in memory, per process)
+  const loginFailures = new Map<string, { count: number; resetAt: number }>()
+  const throttled = (email: string) => {
+    const f = loginFailures.get(email)
+    if (f && f.resetAt <= Date.now()) loginFailures.delete(email)
+    return (loginFailures.get(email)?.count ?? 0) >= LOGIN_MAX_FAILURES
+  }
+  const recordFailure = (email: string) => {
+    if (loginFailures.size > 10_000) for (const [k, v] of loginFailures) if (v.resetAt <= Date.now()) loginFailures.delete(k)
+    const f = loginFailures.get(email) ?? { count: 0, resetAt: Date.now() + LOGIN_WINDOW_MS }
+    f.count++
+    loginFailures.set(email, f)
+  }
   app.post('/auth/login', async (c) => {
     const input = await readJson(c)
     return runtime.runPromise(
       Effect.gen(function* () {
         const creds = yield* decodeInput(LoginInput, input)
+        const key = creds.email.trim().toLowerCase()
+        if (throttled(key))
+          return c.json({ error: 'TooManyRequests', message: 'Too many failed sign-in attempts; try again later' }, 429)
         const d = yield* database
         const writer = yield* Writer
         const user = yield* sql(() => authenticate(d, creds.email, creds.password))
-        if (!user) return yield* new Unauthorized({ message: 'Invalid email or password' })
+        if (!user) {
+          recordFailure(key)
+          return yield* new Unauthorized({ message: 'Invalid email or password' })
+        }
+        loginFailures.delete(key)
         const sid = yield* writer.transaction(
           Effect.gen(function* () {
             const sid = yield* sql(() => createSession(d, user.id, c.req.header('user-agent')))
@@ -215,7 +260,13 @@ export function makeApp(opts: AppOptions) {
             return sid
           }),
         )
-        setCookie(c, SESSION_COOKIE, sid, { httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 7 * 24 * 3600 })
+        setCookie(c, SESSION_COOKIE, sid, {
+          httpOnly: true,
+          sameSite: 'Lax',
+          path: '/',
+          maxAge: 7 * 24 * 3600,
+          secure: secureCookies,
+        })
         return c.json({ ...loadMe(d, user), token: sid })
       }).pipe(
         Effect.catchTags({
@@ -239,7 +290,7 @@ export function makeApp(opts: AppOptions) {
         const sid = c.get('sessionId')
         if (sid) yield* sql(() => deleteSession(d, sid))
         yield* H.audit('logout', 'sessions', null)
-        deleteCookie(c, SESSION_COOKIE, { path: '/' })
+        deleteCookie(c, SESSION_COOKIE, { path: '/', secure: secureCookies })
         return null
       }),
       { status: 204, write: true },
@@ -457,7 +508,8 @@ export function makeApp(opts: AppOptions) {
     ),
   )
 
-  // ---------------- dev tools ----------------
+  // ---------------- dev tools (demo mode only) ----------------
+  if (!demo) app.all('/dev/*', notFound)
   app.get('/dev/chaos', (c) =>
     run(
       c,
