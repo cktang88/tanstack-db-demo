@@ -205,7 +205,7 @@ test('debounced autosave: many keystrokes, one request', async ({ page }) => {
   await expect(page.getByLabel('Project description')).toHaveValue('Rolled out to every region')
 })
 
-test('on-demand collections push filters, order and windows down to the API', async ({ page }) => {
+test('on-demand windows over a cursor-only feed (createCursorPager) and push-down to the API', async ({ page }) => {
   const requests = await apiRequestsDuring(page, async () => {
     await page.goto('/activity')
     await expect(page.getByTestId('activity-item')).toHaveCount(30)
@@ -214,12 +214,13 @@ test('on-demand collections push filters, order and windows down to the API', as
     await page.mouse.wheel(0, 20_000)
     await expect.poll(() => page.getByTestId('activity-item').count()).toBeGreaterThan(30)
   })
-  const events = requests.filter((r) => r.startsWith('GET /api/events?')).map((r) => decodeURIComponent(r))
-  expect(events).toContain('GET /api/events?sort=-id&limit=31')
-  expect(events).toContain('GET /api/events?sort=-id&limit=31&category[eq]=invoice')
-  // the next page is a delta load (offset), not a re-fetch of everything so far
-  expect(events).toContain('GET /api/events?sort=-id&limit=30&offset=31&category[eq]=invoice')
-  // never an unbounded load of the event log: the only un-limited requests are single-row boundary lookups
+  const events = requests.filter((r) => r.startsWith('GET /api/events')).map((r) => decodeURIComponent(r))
+  // unfiltered newest-first windows are served by createCursorPager from the keyset feed…
+  expect(events).toContain('GET /api/events/feed?limit=50')
+  expect(events).toContain('GET /api/events/feed?limit=50&type=invoice.')
+  // …and scrolling continues from the opaque cursor instead of an offset that drifts as events arrive
+  expect(events.some((r) => /^GET \/api\/events\/feed\?limit=50&cursor=\d+&type=invoice\.$/.test(r))).toBe(true)
+  // never an unbounded load of the event log
   expect(events.filter((r) => r.includes('limit=10000') && !r.includes('id[eq]='))).toEqual([])
 })
 

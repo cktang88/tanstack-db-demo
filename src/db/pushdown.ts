@@ -60,3 +60,13 @@ export function loadSubsetToSearch(opts: LoadSubsetOptions | undefined): URLSear
   if (opts.limit === undefined) sp.set('limit', '10000')
   return sp
 }
+
+/**
+ * A window that a keyset (cursor) feed can serve: no filter beyond the
+ * collection's fixed scope, newest-first by `id`, bounded.
+ */
+export function isNewestFirstWindow(opts: LoadSubsetOptions | undefined): opts is LoadSubsetOptions & { limit: number } {
+  if (!opts || opts.where || opts.limit === undefined) return false
+  const sorts = parseOrderByExpression(opts.orderBy)
+  return sorts.length === 1 && sorts[0]!.direction === 'desc' && sorts[0]!.field.join('.') === 'id'
+}

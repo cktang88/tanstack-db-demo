@@ -21,7 +21,7 @@ import {
   usersCollection,
   withInvoiceDerived,
 } from '../../src/db/collections'
-import { loadSubsetToSearch, whereToParams } from '../../src/db/pushdown'
+import { isNewestFirstWindow, loadSubsetToSearch, whereToParams } from '../../src/db/pushdown'
 
 const ref = (field: string) => new IR.PropRef([field])
 const val = (v: unknown) => new IR.Value(v)
@@ -63,6 +63,20 @@ describe('predicate push-down', () => {
     expect(() => whereToParams(fn('or', fn('eq', ref('a'), val(1)), fn('eq', ref('b'), val(2))) as never)).toThrow()
     expect(() => whereToParams(fn('like', ref('a'), val('%x%')) as never)).toThrow()
     expect(() => whereToParams(fn('eq', new IR.PropRef(['a', 'b']), val(1)) as never)).toThrow(/Nested/)
+  })
+})
+
+describe('cursor feed windows', () => {
+  const byId = (direction: 'asc' | 'desc') => [
+    { expression: ref('id'), compareOptions: { direction, nulls: 'last' as const, stringSort: 'lexical' as const } },
+  ]
+  it('only routes unfiltered, bounded, newest-first windows to the cursor pager', () => {
+    expect(isNewestFirstWindow({ orderBy: byId('desc'), limit: 30, offset: 31 } as never)).toBe(true)
+    expect(isNewestFirstWindow({ orderBy: byId('asc'), limit: 30 } as never)).toBe(false)
+    expect(isNewestFirstWindow({ orderBy: byId('desc') } as never)).toBe(false)
+    expect(isNewestFirstWindow({ where: fn('eq', ref('customerId'), val(7)), orderBy: byId('desc'), limit: 20 } as never)).toBe(
+      false,
+    )
   })
 })
 

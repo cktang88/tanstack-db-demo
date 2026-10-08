@@ -115,7 +115,13 @@ export function CustomerDetailPage() {
         <Stat
           label="Plan"
           value={<Badge value={customer.plan} />}
-          hint={editable ? <SeatsSlider id={customer.id} seats={customer.seats} /> : `${customer.seats} seats`}
+          hint={
+            editable ? (
+              <SeatsSlider id={customer.id} seats={customer.seats} pending={!!customer.$hasPendingWrites} />
+            ) : (
+              `${customer.seats} seats`
+            )
+          }
         />
         <HealthStat customerId={customer.id} status={customer.status} />
         <Stat label="MRR" value={money(customer.mrr)} hint="Σ active subscriptions" testId="customer-mrr" />
@@ -166,7 +172,7 @@ export function CustomerDetailPage() {
  * (this page, KPIs, charts, tables) instantly, while the server receives at
  * most one write per 500ms.
  */
-function SeatsSlider({ id, seats }: { id: number; seats: number }) {
+function SeatsSlider({ id, seats, pending }: { id: number; seats: number; pending: boolean }) {
   const setSeats = usePacedMutations<number>({
     onMutate: (n) =>
       customersCollection.update(id, (d) => {
@@ -190,6 +196,12 @@ function SeatsSlider({ id, seats }: { id: number; seats: number }) {
       <span className="tabular-nums" data-testid="seats-value">
         {seats} seats
       </span>
+      {/* `base` = the authoritative synced row, without optimistic writes layered on top */}
+      {pending && (
+        <span className="text-xs text-amber-600" data-testid="seats-saved">
+          saved: {customersCollection.base.get(id)?.seats ?? '—'}
+        </span>
+      )}
     </label>
   )
 }
@@ -379,7 +391,8 @@ function BalanceStat({ customerId }: { customerId: number }) {
       q
         .from({ p: paymentsCollection })
         .where(({ p }) => eq(p.customerId, customerId))
-        .innerJoin({ i: invoicesCollection }, ({ p, i }) => eq(p.invoiceId, i.id))
+        // compound join condition (db 0.12): same invoice AND same customer
+        .innerJoin({ i: invoicesCollection }, ({ p, i }) => and(eq(p.invoiceId, i.id), eq(p.customerId, i.customerId)))
         .where(({ i }) => inArray(i.status, ['open', 'overdue']))
         .select(({ p }) => ({ paid: sum(p.amount) }))
         .findOne(),

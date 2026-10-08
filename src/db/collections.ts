@@ -7,7 +7,7 @@ import {
   type Collection,
   type PendingMutation,
 } from '@tanstack/react-db'
-import { queryCollectionOptions } from '@tanstack/query-db-collection'
+import { createCursorPager, queryCollectionOptions, type CursorPager } from '@tanstack/query-db-collection'
 import { Schema } from 'effect'
 import {
   TASK_PRIORITIES,
@@ -38,7 +38,7 @@ import {
 } from '../../shared/domain'
 import type { BatchOp } from '../../shared/schemas'
 import { api, HttpError, type QueryParams } from '../lib/api'
-import { loadSubsetToSearch } from './pushdown'
+import { isNewestFirstWindow, loadSubsetToSearch } from './pushdown'
 
 // ---------------------------------------------------------------------------
 // One QueryClient is still the cache + fetch engine underneath every
@@ -147,11 +147,16 @@ async function writeResults(results: BatchResult['results']) {
       if (!utils) return Promise.resolve()
       const derive = DERIVE[entity] ?? ((r: unknown) => r)
       const upserts = rs.filter((r) => r.op !== 'delete' && r.row)
+      // since query-db-collection 1.4 direct writes report validation failures by
+      // rejecting (not throwing), so every inner write promise is awaited too
+      const inner: Array<Promise<void>> = []
       return Promise.all([
         upserts.length
-          ? utils.writeBatch(() => {
-              for (const r of upserts) void utils.writeUpsert(derive(r.row))
-            })
+          ? utils
+              .writeBatch(() => {
+                for (const r of upserts) inner.push(utils.writeUpsert(derive(r.row)))
+              })
+              .then(() => Promise.all(inner))
           : Promise.resolve(),
         // the SSE echo may already have removed the row; that's fine
         ...rs.filter((r) => r.op === 'delete').map((r) => utils.writeDelete(r.id).catch(() => {})),
@@ -237,7 +242,14 @@ function serverCollection<T extends object, K extends string | number>(
 function onDemandCollection<T extends object, K extends string | number>(
   entity: string,
   getKey: (row: T) => K,
-  opts: { id?: string; scope?: Record<string, string>; mode?: 'append-only' | 'read-only'; map?: (row: any) => T } = {},
+  opts: {
+    id?: string
+    scope?: Record<string, string>
+    mode?: 'append-only' | 'read-only'
+    map?: (row: any) => T
+    /** serves unfiltered newest-first windows from a cursor-paginated endpoint instead */
+    pager?: CursorPager<T>
+  } = {},
 ) {
   const collection = createCollection(
     queryCollectionOptions({
@@ -250,7 +262,10 @@ function onDemandCollection<T extends object, K extends string | number>(
       staleTime: 10_000,
       ...indexing,
       queryFn: async (ctx) => {
-        const search = loadSubsetToSearch(ctx.meta?.loadSubsetOptions)
+        const subset = ctx.meta?.loadSubsetOptions
+        if (opts.pager && isNewestFirstWindow(subset))
+          return opts.pager.read({ offset: subset.offset, limit: subset.limit }, ctx.signal)
+        const search = loadSubsetToSearch(subset)
         for (const [k, v] of Object.entries(opts.scope ?? {})) search.set(k, v)
         const res = await fetch(`/api/${entity}?${search}`, { signal: ctx.signal })
         if (!res.ok) throw new HttpError(res.status, await res.json().catch(() => undefined))
@@ -356,17 +371,52 @@ export const auditCollection = onDemandCollection<AuditEntry, number>('audit-log
 
 export const EVENT_CATEGORIES = ['customer', 'invoice', 'task', 'payment', 'subscription', 'comment'] as const
 export type EventCategory = (typeof EVENT_CATEGORIES)[number]
+/**
+ * The activity log only grows at the head, so offset windows drift (a new event
+ * shifts every page by one). The server's keyset feed (`/events/feed?cursor=`)
+ * doesn't, but it only speaks opaque cursors. `createCursorPager` bridges the
+ * two: live queries still ask for `offset/limit` windows; the pager serves them
+ * from cached cursor pages owned by TanStack Query. Filtered windows (e.g. one
+ * customer's events) still go to the regular list endpoint.
+ */
+const FEED_PAGE = 50
+const feedPager = (type?: string) =>
+  createCursorPager<ActivityEvent>({
+    queryClient,
+    // its own root key: manual writes to the row collections update their whole prefix
+    queryKey: ['event-feed-pages', type ?? 'all'],
+    staleTime: 30_000,
+    fetchPage: async (cursor, signal) => {
+      const page = await api.get<{ data: ActivityEvent[]; nextCursor: number | null }>(
+        '/events/feed',
+        { limit: FEED_PAGE, ...(cursor && { cursor }), ...(type && { type }) },
+        signal,
+      )
+      return { rows: page.data, nextCursor: page.nextCursor === null ? null : String(page.nextCursor) }
+    },
+  })
+export const FEED_PAGERS: Array<CursorPager<ActivityEvent>> = []
+const withPager = (type?: string) => {
+  const pager = feedPager(type)
+  FEED_PAGERS.push(pager)
+  return pager
+}
+
 /** The whole activity log (on-demand). */
-export const eventsCollection = onDemandCollection<ActivityEvent, number>('events', (e) => e.id)
+export const eventsCollection = onDemandCollection<ActivityEvent, number>('events', (e) => e.id, { pager: withPager() })
 /**
  * Business-scoped collection factory: one on-demand collection per category.
  * The scope is a fixed part of every request, so live queries over it need no
- * `where` and their windows push down as a plain `sort + limit (+ offset)`.
+ * `where` and their windows are served by that category's cursor feed.
  */
 export const eventsByCategory = Object.fromEntries(
   EVENT_CATEGORIES.map((c) => [
     c,
-    onDemandCollection<ActivityEvent, number>('events', (e) => e.id, { id: `events:${c}`, scope: { 'category[eq]': c } }),
+    onDemandCollection<ActivityEvent, number>('events', (e) => e.id, {
+      id: `events:${c}`,
+      scope: { 'category[eq]': c },
+      pager: withPager(`${c}.`), // the feed filters by type prefix: "invoice." = the invoice category
+    }),
   ]),
 ) as Record<EventCategory, typeof eventsCollection>
 
@@ -418,6 +468,7 @@ export const preloadAll = () => Promise.all(CORE.map((c) => c.preload()))
 export async function resetServerCollections() {
   const all = [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)]
   await Promise.all(all.map((c) => c.cleanup()))
+  for (const p of FEED_PAGERS) p.reset()
   queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'auth' })
 }
 

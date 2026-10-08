@@ -2,6 +2,7 @@ import {
   BY_ENTITY,
   eventsByCategory,
   queryClient,
+  FEED_PAGERS,
   withCustomerDerived,
   withInvoiceDerived,
   type EventCategory,
@@ -29,6 +30,7 @@ type Utils = {
 
 export function applyChange(change: Change) {
   if (change.kind === 'reset') {
+    for (const p of FEED_PAGERS) p.reset()
     void queryClient.invalidateQueries()
     return Promise.all(
       [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)].map((c) => (c.utils as Utils).refetch().catch(() => {})),
@@ -45,7 +47,8 @@ export function applyChange(change: Change) {
   // Rows may be unknown locally (not loaded yet / already removed): ignore those rejections.
   if (change.kind === 'delete') return utils.writeDelete(change.id).catch(() => {})
   const derive = DERIVE[change.entity] ?? ((r: unknown) => r)
-  return utils.writeUpsert(derive(change.row)).catch(() => {})
+  // an upsert that fails is a real problem (e.g. a schema rejection) — surface it
+  return utils.writeUpsert(derive(change.row)).catch((e: unknown) => console.error(`[live] ${change.entity}`, e))
 }
 
 let source: EventSource | undefined
