@@ -1,8 +1,17 @@
 import type { DB } from './schema.ts'
 
-/** Mark open invoices past their due date as overdue. Returns affected count. */
+/**
+ * Mark open invoices past their due date as overdue (archived customers' are
+ * left alone). Returns the changed invoices so callers can publish them.
+ */
 export function markOverdue(db: DB, now = new Date()) {
-  return db.prepare(`UPDATE invoices SET status = 'overdue' WHERE status = 'open' AND due_at < ?`).run(now.toISOString()).changes
+  return db
+    .prepare(
+      `UPDATE invoices SET status = 'overdue'
+       WHERE status = 'open' AND due_at < ? AND customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)
+       RETURNING id, customer_id AS customerId`,
+    )
+    .all(now.toISOString()) as Array<{ id: number; customerId: number }>
 }
 
 /**

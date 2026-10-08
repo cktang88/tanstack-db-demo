@@ -32,7 +32,7 @@ export type AppError =
 // ---------------------------------------------------------------------------
 // Sqlite: the database handle as a scoped resource (closed on dispose).
 // ---------------------------------------------------------------------------
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface SqliteConfig {
   file: string

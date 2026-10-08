@@ -8,6 +8,7 @@ import {
   SubscriptionInput,
   SubscriptionPatch,
   UsageEventInput,
+  toUtcIso,
 } from '../shared/schemas.ts'
 import { deleteRow, diff, getRow, insertRow, listRows, updateRow } from './db/query.ts'
 import { lookup, type ListParams } from './db/sql.ts'
@@ -393,15 +394,32 @@ const business: Record<string, Business> = {
     remove: (before) =>
       Effect.gen(function* () {
         const { db } = yield* ctx
-        // archiving cancels billing but keeps history (invoices, payments, audit)
+        // archiving cancels billing but keeps history (invoices, payments, audit);
+        // open receivables must not be stranded: unpaid ones are voided, partially paid ones block
+        const open = yield* sql(
+          () =>
+            db
+              .prepare(
+                `SELECT i.id, i.status, (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id) AS paid
+                 FROM invoices i WHERE i.customer_id = ? AND i.status IN ('open', 'overdue')`,
+              )
+              .all(before.id) as Array<{ id: number; status: string; paid: number }>,
+        )
+        if (open.some((i) => i.paid > 0))
+          return yield* new Conflict({
+            message: 'Customer has partially paid open invoices; settle or credit them before archiving',
+          })
         yield* sql(() => {
           const now = new Date().toISOString()
+          db.prepare(`UPDATE invoices SET status = 'void' WHERE customer_id = ? AND status IN ('open', 'overdue')`).run(before.id)
           db.prepare(`UPDATE customers SET deleted_at = ?, status = 'churned' WHERE id = ?`).run(now, before.id)
           db.prepare(
             `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
           ).run(now, before.id)
         })
+        for (const i of open) yield* audit('update', 'invoices', i.id, { status: i.status }, { status: 'void' })
         yield* touchSubscriptions(before.id)
+        yield* touchBalances(before.id)
         const invoices = yield* sql(() =>
           (db.prepare(`SELECT id FROM invoices WHERE customer_id = ?`).all(before.id) as Array<{ id: number }>).map((r) => r.id),
         )
@@ -502,14 +520,17 @@ const business: Record<string, Business> = {
             return yield* new Conflict({ message: `Invoices cannot be moved to "${patch.status}" manually` })
           if (before.status === 'paid')
             return yield* new Conflict({ message: 'Paid invoices cannot be voided; issue a credit instead' })
+          if ((yield* paidOn(before.id)) > 0)
+            return yield* new Conflict({ message: 'Partially paid invoices cannot be voided; issue a credit instead' })
         }
-        yield* sql(() =>
-          db
-            .prepare(`UPDATE invoices SET status = ?, due_at = ? WHERE id = ?`)
-            .run(patch.status ?? before.status, patch.dueAt ?? before.dueAt, before.id),
-        )
+        // a date-only due date means "by the end of that day" (UTC)
+        const dueAt = patch.dueAt !== undefined ? toUtcIso(patch.dueAt, { endOfDay: true }) : (before.dueAt as string)
+        let status = patch.status ?? (before.status as string)
+        // open <-> overdue follows the due date (moving it later re-opens an overdue invoice)
+        if (status === 'open' || status === 'overdue') status = dueAt < new Date().toISOString() ? 'overdue' : 'open'
+        yield* sql(() => db.prepare(`UPDATE invoices SET status = ?, due_at = ? WHERE id = ?`).run(status, dueAt, before.id))
         const after = (yield* touch('invoices', before.id))!
-        yield* touch('customer-balances', before.customerId)
+        yield* touchBalances(before.customerId)
         yield* audit('update', 'invoices', before.id, before, after)
         if (patch.status === 'void') yield* recordEvent('invoice.voided', before.customerId, `Invoice ${before.number} voided`)
         return after
@@ -601,6 +622,23 @@ const business: Record<string, Business> = {
   },
 }
 
+/** Σ payments recorded against an invoice */
+const paidOn = (invoiceId: number) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    return yield* sql(
+      () =>
+        (db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM payments WHERE invoice_id = ?`).get(invoiceId) as { s: number }).s,
+    )
+  })
+
+/** a customer's billing rollups: balances and the health view (overdue feeds it) */
+export const touchBalances = (customerId: number) =>
+  Effect.gen(function* () {
+    yield* touch('customer-balances', customerId)
+    yield* touch('customer-health', customerId)
+  })
+
 const touchProjectOfTask = (taskId: number) =>
   Effect.gen(function* () {
     const { db } = yield* ctx
@@ -618,11 +656,7 @@ export const recordPayment = (data: typeof PaymentInput.Type) =>
     const inv = yield* sql(() => getRow<Row>(db, resources.invoices!, data.invoiceId, resources.invoices!.scope!(me)))
     if (!inv) return yield* new NotFound({ entity: 'invoices', id: data.invoiceId })
     if (inv.status === 'void') return yield* new Conflict({ message: 'Cannot pay a void invoice' })
-    const paid = yield* sql(
-      () =>
-        (db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM payments WHERE invoice_id = ?`).get(inv.id) as { s: number }).s,
-    )
-    const remaining = inv.amount - paid
+    const remaining = inv.amount - (yield* paidOn(inv.id))
     if (remaining <= 0) return yield* new Conflict({ message: 'Invoice is already fully paid' })
     const amount = data.amount ?? remaining
     if (amount > remaining) return yield* new BadRequest({ message: `Overpayment: only ${remaining} cents outstanding` })
@@ -649,7 +683,7 @@ export const recordPayment = (data: typeof PaymentInput.Type) =>
     )
     const payment = (yield* touch('payments', id))!
     const invoice = (yield* touch('invoices', inv.id))!
-    yield* touch('customer-balances', inv.customerId)
+    yield* touchBalances(inv.customerId)
     yield* audit('create', 'payments', id, undefined, payment)
     yield* recordEvent(
       invoice.status === 'paid' ? 'invoice.paid' : 'payment.recorded',

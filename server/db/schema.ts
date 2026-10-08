@@ -348,17 +348,25 @@ CREATE TRIGGER IF NOT EXISTS trg_balance_inv_ins AFTER INSERT ON invoices BEGIN
   INSERT INTO customer_balances (customer_id, updated_at) VALUES (NEW.customer_id, NEW.issued_at)
   ON CONFLICT(customer_id) DO NOTHING;
 END;
+-- outstanding / overdue = what is still owed on open / overdue invoices (amount minus payments on them),
+-- the same definition /metrics/ar-aging uses
 CREATE TRIGGER IF NOT EXISTS trg_balance_inv_upd AFTER UPDATE OF amount, status ON invoices BEGIN
   UPDATE customer_balances SET
     invoiced = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status != 'void'),
-    outstanding = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status IN ('open', 'overdue')),
-    overdue = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status = 'overdue'),
+    outstanding = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+                   FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status IN ('open', 'overdue')),
+    overdue = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+               FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status = 'overdue'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   WHERE customer_id = NEW.customer_id;
 END;
 CREATE TRIGGER IF NOT EXISTS trg_balance_pay AFTER INSERT ON payments BEGIN
   UPDATE customer_balances SET
-    paid = paid + NEW.amount,
+    paid = (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE customer_id = NEW.customer_id),
+    outstanding = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+                   FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status IN ('open', 'overdue')),
+    overdue = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+               FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status = 'overdue'),
     updated_at = NEW.received_at
   WHERE customer_id = NEW.customer_id;
 END;

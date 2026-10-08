@@ -511,7 +511,10 @@ export function makeApp(opts: AppOptions) {
       Effect.gen(function* () {
         yield* requirePermission('billing:write')
         const d = yield* database
-        const changed = yield* sql(() => markOverdue(d))
+        const rows = yield* sql(() => markOverdue(d))
+        for (const r of rows) yield* H.touch('invoices', r.id)
+        for (const customerId of new Set(rows.map((r) => r.customerId))) yield* H.touchBalances(customerId)
+        const changed = rows.length
         yield* H.audit('update', 'jobs', null, undefined, { job: 'mark-overdue', changed })
         return { changed }
       }),
