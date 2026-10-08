@@ -51,6 +51,9 @@ function mutate(qc: QueryClient, key: string[], variables: unknown, result: () =
           listKey,
           (p) => p && { ...p, data: p.data.map((c) => (c.id === id ? { ...c, ...optimistic } : c)) },
         )
+      // like the real hooks: return a rollback snapshot, which makes query-core dispatch
+      // a second 'pending' (with the context) *after* the optimistic patch
+      return { snapshot: true }
     },
   })
   const done = m.execute(variables)

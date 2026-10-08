@@ -119,7 +119,10 @@ export function createCustomerAlerts(qc: QueryClient, notify: (a: CustomerAlert)
         if (e.type !== 'updated' || e.mutation.options.mutationKey?.[0] !== 'customers') return
         const m = e.mutation
         if (e.action.type === 'pending') {
-          // dispatched before onMutate runs: the cache still holds the pre-write rows
+          // query-core dispatches 'pending' twice: before onMutate (the cache still holds the
+          // pre-write rows) and again after it with the context — by then the optimistic patch
+          // is in the cache, so only the first capture is the real "before"
+          if (inFlight.has(m)) return
           inFlight.set(m, new Map(idsOf(e.action.variables).map((id) => [id, lastKnown(id)])))
         } else if (e.action.type === 'success') {
           const before = inFlight.get(m)
