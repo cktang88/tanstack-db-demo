@@ -18,7 +18,7 @@ import {
   usersQuery,
 } from './lib/queries'
 import { HttpError } from './lib/api'
-import { meQuery } from './lib/auth'
+import { isUnauthorized, meQuery } from './lib/auth'
 import { arAgingQuery, mrrSnapshotsQuery, productsQuery, projectStatsQuery } from './lib/queries'
 import { auditSearch, customersSearch, invoicesSearch } from './lib/search'
 import type { Me, Permission } from '../shared/domain'
@@ -65,9 +65,14 @@ const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: 'app',
   beforeLoad: async ({ context: { queryClient }, location }) => {
-    const me = await queryClient.query(meQuery()).catch(() => null)
-    if (!me) throw redirect({ to: '/login', search: { redirect: location.href } })
-    return { me }
+    try {
+      // 'static': a cached session never blocks navigation; the layout's useSuspenseQuery revalidates it
+      return { me: await queryClient.query({ ...meQuery(), staleTime: 'static' }) }
+    } catch (e) {
+      // only a 401 means "signed out"; anything else (5xx, network) is a real error
+      if (isUnauthorized(e)) throw redirect({ to: '/login', search: { redirect: location.href } })
+      throw e
+    }
   },
   component: Layout,
 })

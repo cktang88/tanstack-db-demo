@@ -18,15 +18,27 @@ const queryClient = new QueryClient({
       throwOnError: (error) => error instanceof HttpError && error.status === 403,
     },
   },
-  // a 401 anywhere means the session expired or was revoked: go to the login page
-  queryCache: new QueryCache({ onError: (e) => isUnauthorized(e) && void router.navigate({ to: '/login' }) }),
+  queryCache: new QueryCache({ onError: (e) => isUnauthorized(e) && signedOut() }),
   mutationCache: new MutationCache({
-    onError: (error) => {
-      if (isUnauthorized(error)) void router.navigate({ to: '/login' })
+    onError: (error, _v, _c, mutation) => {
+      // a wrong password is a 401 too, but that's the login form's business
+      if (isUnauthorized(error) && mutation.options.mutationKey?.[1] !== 'login') signedOut()
       else console.warn('[mutation failed]', error.message)
     },
   }),
 })
+
+/**
+ * A 401 anywhere means the session expired or was revoked. Drop every cached
+ * entry (so Back can't show the previous user's pages) and go to the login
+ * page, remembering where we were.
+ */
+function signedOut() {
+  const { pathname, href } = router.latestLocation
+  if (pathname === '/login') return
+  queryClient.clear()
+  void router.navigate({ to: '/login', search: { redirect: href }, replace: true })
+}
 
 const router = makeRouter(queryClient)
 startLiveUpdates(queryClient)

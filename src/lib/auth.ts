@@ -21,6 +21,12 @@ export const demoUsersQuery = () =>
 
 export const isUnauthorized = (e: unknown) => e instanceof HttpError && e.status === 401
 
+/** Only follow same-origin, in-app redirect targets (never `//evil.com` or back to /login). */
+export const safeRedirect = (target: unknown): string =>
+  typeof target === 'string' && target.startsWith('/') && !target.startsWith('//') && !target.startsWith('/login')
+    ? target
+    : '/'
+
 /** Current session (suspends; only used inside the authenticated layout). */
 export function useMe() {
   return useSuspenseQuery(meQuery()).data
@@ -41,15 +47,16 @@ export function useCan() {
   }
 }
 
-export function useLogin() {
+export function useLogin({ redirect }: { redirect?: string } = {}) {
   const qc = useQueryClient()
   const router = useRouter()
   return useMutation({
+    mutationKey: ['auth', 'login'],
     mutationFn: (creds: { email: string; password: string }) => api.post<Me & { token: string }>('/auth/login', creds),
     onSuccess: async ({ token: _token, ...me }) => {
       qc.clear() // never leak cached data between users
       qc.setQueryData(meQuery().queryKey, me)
-      await router.navigate({ to: '/' })
+      await router.navigate({ href: safeRedirect(redirect), replace: true })
     },
   })
 }
