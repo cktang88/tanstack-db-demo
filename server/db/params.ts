@@ -1,7 +1,7 @@
 import { BadQuery, type Filter, type FilterOp, type ListParams, type Sort } from './sql.ts'
 
 const OPS = new Set<FilterOp>(['eq', 'neq', 'in', 'gt', 'gte', 'lt', 'lte', 'like', 'isNull', 'notNull'])
-const RESERVED = new Set(['page', 'pageSize', 'limit', 'offset', 'sort', 'q'])
+const RESERVED = new Set(['page', 'pageSize', 'limit', 'offset', 'sort', 'q', 'sum'])
 const MAX_PAGE_SIZE = 10_000
 
 /**
@@ -13,6 +13,7 @@ const MAX_PAGE_SIZE = 10_000
  *   ?q=acme                        -> free text search
  *   ?status=active,trial           -> status IN (...)  (shorthand)
  *   ?mrr[gte]=1000&ownerId[isNull] -> explicit operators
+ *   ?sum=mrr,seats                 -> also total these fields over every matching row
  */
 export function parseListParams(query: URLSearchParams, defaults: { pageSize?: number } = {}): ListParams {
   const filters: Filter[] = []
@@ -55,5 +56,8 @@ export function parseListParams(query: URLSearchParams, defaults: { pageSize?: n
   }
   if (limit !== undefined) limit = Math.min(limit, MAX_PAGE_SIZE)
 
-  return { filters, sorts, search: query.get('q') || undefined, limit, offset }
+  const sums = (query.get('sum') ?? '').split(',').filter(Boolean)
+  for (const f of sums) if (!/^[A-Za-z]+$/.test(f)) throw new BadQuery(`Malformed sum field "${f}"`)
+
+  return { filters, sorts, search: query.get('q') || undefined, limit, offset, ...(sums.length && { sums }) }
 }
