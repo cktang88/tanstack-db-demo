@@ -16,10 +16,40 @@ import {
   TASK_STATUSES,
 } from './domain.ts'
 
-const Id = Schema.Int.check(Schema.isGreaterThan(0))
+/**
+ * Largest id a client may choose. Well below Number.MAX_SAFE_INTEGER so that
+ * SQLite's next autoincrement id (max + 1) and every id round-tripped through
+ * JSON stay exact; client id generators (≈ Date.now() * 1000) fit comfortably.
+ */
+export const MAX_ID = 2 ** 52
+const Id = Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(MAX_ID))
 const Email = Schema.String.check(Schema.isPattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, { message: 'Enter a valid email address' }))
 const Name = Schema.Trimmed.check(Schema.isMinLength(2, { message: 'Must be at least 2 characters' }), Schema.isMaxLength(120))
-const IsoDate = Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}/, { message: 'Expected an ISO date' }))
+
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/
+const DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/
+/** a real calendar day (no 2026-02-30) */
+const validDay = (y: string, m: string, d: string) => {
+  const date = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)))
+  return date.getUTCFullYear() === Number(y) && date.getUTCMonth() === Number(m) - 1 && date.getUTCDate() === Number(d)
+}
+/** `YYYY-MM-DD`, or a full ISO 8601 date-time with an explicit offset (`Z` or `±hh:mm`) */
+export const isIsoDate = (s: string) => {
+  const m = DATE_ONLY.exec(s) ?? DATE_TIME.exec(s)
+  return m !== null && validDay(m[1]!, m[2]!, m[3]!) && !Number.isNaN(Date.parse(s))
+}
+const IsoDate = Schema.String.check(
+  Schema.makeFilter((s: string) => isIsoDate(s), {
+    message: 'Expected an ISO date (YYYY-MM-DD) or date-time with offset',
+  }),
+)
+/**
+ * Normalise to a full UTC timestamp (`…Z`), so stored values compare correctly
+ * as text. A date-only value means the *end* of that day (`endOfDay`) for
+ * deadlines, or its start otherwise.
+ */
+export const toUtcIso = (s: string, opts: { endOfDay?: boolean } = {}) =>
+  DATE_ONLY.test(s) ? `${s}T${opts.endOfDay ? '23:59:59.999' : '00:00:00.000'}Z` : new Date(s).toISOString()
 
 export const CustomerInput = Schema.Struct({
   /** Optional client-generated id (lets optimistic clients avoid temp-id swaps). */
@@ -182,7 +212,9 @@ export const CommentInput = Schema.Struct({
 const Minutes = Schema.Int.check(
   Schema.isBetween({ minimum: 1, maximum: 1440 }, { message: 'Minutes must be between 1 and 1440' }),
 )
-const Day = Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/, { message: 'Expected YYYY-MM-DD' }))
+const Day = Schema.String.check(
+  Schema.makeFilter((s: string) => DATE_ONLY.test(s) && isIsoDate(s), { message: 'Expected YYYY-MM-DD' }),
+)
 export const TimeEntryInput = Schema.Struct({
   id: Schema.optionalKey(Id),
   taskId: Id,

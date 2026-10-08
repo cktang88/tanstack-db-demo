@@ -2,6 +2,10 @@ import { expect, test, type Page, type Request } from '@playwright/test'
 
 // Behaviour that only exists because of TanStack DB.
 
+const usdFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
+const usd = (n: number) => usdFmt.format(n)
+const dollars = (text: string) => Number(text.replace(/[^0-9.-]/g, ''))
+
 const setChaos = (page: Page, chaos: { latencyMs: number; failRate: number }) =>
   page.request.put('/api/dev/chaos', { data: chaos })
 
@@ -68,8 +72,13 @@ test('a write is reflected in every view instantly, with no refetches', async ({
     await page.getByRole('link', { name: 'Overview' }).click()
     await expect(page.getByTestId('kpi-mrr')).not.toHaveText(mrrBefore!)
   })
-  // exactly one write, no invalidation-driven refetches of lists/metrics
-  expect(requests.filter((r) => !r.startsWith('GET /api/events'))).toEqual(['POST /api/batch'])
+  // exactly one write…
+  expect(requests.filter((r) => !r.startsWith('GET '))).toEqual(['POST /api/batch'])
+  // …and no refetch of any list, detail or metric: every view above was updated from local data.
+  // The only reads allowed are server-computed rows nobody can derive locally: the customer's
+  // health (a SQL view the server re-announces) and the activity windows (new server events).
+  const reads = requests.filter((r) => r.startsWith('GET ')).map(decodeURIComponent)
+  expect(reads.filter((r) => !/^GET \/api\/(customer-health\?customerId\[eq\]=\d+&|events)/.test(r))).toEqual([])
 })
 
 test('changes made elsewhere stream in over SSE and update live queries', async ({ page }) => {
@@ -79,9 +88,13 @@ test('changes made elsewhere stream in over SSE and update live queries', async 
   const id = Number(href.split('/').pop())
   const current = await (await page.request.get(`/api/customers/${id}`)).json()
   const nextSeats = current.seats + 7
-  // another client writes directly to the API
-  await page.request.patch(`/api/customers/${id}`, { data: { seats: nextSeats } })
-  await expect(row.locator('td').nth(6)).toHaveText(String(nextSeats))
+  const requests = await apiRequestsDuring(page, async () => {
+    // another client writes directly to the API
+    await page.request.patch(`/api/customers/${id}`, { data: { seats: nextSeats } })
+    await expect(row.locator('td').nth(6)).toHaveText(String(nextSeats))
+  })
+  // the pushed row was written into the collection: the table did not refetch customers
+  expect(requests.filter((r) => r.startsWith('GET /api/customers'))).toEqual([])
 })
 
 test('localStorage collections sync across tabs (theme + pins)', async ({ page, context }) => {
@@ -127,11 +140,15 @@ test('multi-collection archive transaction rolls back customers AND their invoic
   await expect(page).toHaveURL(/\/customers$/)
   await page.getByLabel('Search customers').fill(company)
   await expect(page.getByRole('alert').filter({ hasText: 'Archive failed' })).toBeVisible()
-  // the customer is back, and so are its invoices
+  // the customer is back, and so are its invoices — checked in-app, without a reload, so this is the
+  // client's rollback of the cascaded invoice deletes and not a fresh fetch from the untouched server
   await expect(page.getByTestId('customers-table').getByText(company, { exact: true }).first()).toBeVisible()
-  await setChaos(page, { latencyMs: 120, failRate: 0 })
-  await page.goto(`/invoices?q=${encodeURIComponent(company)}&status=open`)
-  await expect(page.getByTestId('invoices-table').getByTestId('row').first()).toContainText(company)
+  const reads = await apiRequestsDuring(page, async () => {
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Invoices' }).click()
+    await page.getByLabel('Search invoices').fill(company)
+    await expect(page.getByTestId('invoices-table').getByTestId('row').first()).toContainText(company)
+  })
+  expect(reads.filter((r) => r.startsWith('GET /api/invoices'))).toEqual([])
 })
 
 test('staged transaction previews a reassignment, discard sends nothing, save sends one batch', async ({ page }) => {
@@ -247,9 +264,15 @@ test('a partial payment goes to the append-only ledger optimistically; the balan
   await setChaos(page, { latencyMs: 1500, failRate: 0 })
   await detail.getByLabel('Payment amount').fill('1')
   await detail.getByRole('button', { name: 'Record payment' }).click()
-  // the ledger row shows up before the server has answered
+  // the ledger row and the new balance show up before the server has answered
   await expect(detail.getByTestId('invoice-payments').getByText('$1', { exact: true })).toBeVisible({ timeout: 1000 })
-  await expect(balance).not.toHaveText(before!, { timeout: 1000 })
+  await expect(balance).toHaveText(usd(dollars(before!) - 1), { timeout: 1000 })
+  // once committed, the reference is the server's (the placeholder is never stored) …
+  await expect(detail.getByTestId('invoice-payments')).not.toContainText('pending', { timeout: 5000 })
+  // … and the live client-side balance agrees with the server's trigger-maintained rollup
+  const customerId = Number(new URL(page.url()).pathname.split('/').pop())
+  const rollup = (await (await page.request.get(`/api/customer-balances/${customerId}`)).json()) as { outstanding: number }
+  await expect(balance).toHaveText(usd(rollup.outstanding / 100))
 })
 
 test('many-to-many tag toggles and team membership are optimistic inserts/deletes on join tables', async ({ page }) => {
@@ -304,5 +327,24 @@ test('a viewer gets read-only UI driven by the same permissions the API enforces
   await expect(page.getByRole('button', { name: 'Edit' })).toBeDisabled()
   await page.goto('/customers')
   await expect(page.getByRole('button', { name: '+ New customer' })).toHaveCount(0)
+  await ctx.close()
+})
+
+test("a member's bulk action only sends the rows they may edit (no 403, no rollback)", async ({ browser, baseURL }) => {
+  const ctx = await browser.newContext({ baseURL, storageState: 'e2e/.auth/member.json' })
+  const page = await ctx.newPage()
+  const batches: number[] = []
+  page.on('response', (r) => {
+    if (r.url().endsWith('/api/batch')) batches.push(r.status())
+  })
+  await page.goto('/customers?status=active')
+  const table = page.getByTestId('customers-table')
+  await expect(table.getByTestId('row')).toHaveCount(25)
+  await table.getByLabel('Select all rows on page').check()
+  await page.getByRole('button', { name: 'Mark active' }).click()
+  // rows owned by other people are filtered out up front instead of failing the whole atomic batch
+  await expect(page.getByRole('status').filter({ hasText: /Skipped \d+ customers?/ })).toBeVisible()
+  await expect(page.getByRole('alert').filter({ hasText: 'rolled back' })).toHaveCount(0)
+  await expect.poll(() => batches.every((s) => s === 200)).toBe(true)
   await ctx.close()
 })

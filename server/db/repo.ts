@@ -17,13 +17,20 @@ export const events = {
   page: (db: DB, cursor: number | null, limit: number, type?: string): CursorPage<ActivityEvent> => {
     const clauses: string[] = []
     const params: unknown[] = []
-    if (cursor) {
+    if (cursor !== null) {
       clauses.push('id < ?')
       params.push(cursor)
     }
     if (type) {
-      clauses.push('type LIKE ?')
-      params.push(`${type}%`)
+      // exact, case-sensitive matching (no LIKE wildcards): "invoice." = the invoice category,
+      // "invoice" = that category or an exact type, "invoice.paid" = that type
+      if (type.endsWith('.')) {
+        clauses.push('substr(type, 1, length(?)) = ?')
+        params.push(type, type)
+      } else {
+        clauses.push('(type = ? OR substr(type, 1, length(?)) = ?)')
+        params.push(type, `${type}.`, `${type}.`)
+      }
     }
     const rows = db
       .prepare(

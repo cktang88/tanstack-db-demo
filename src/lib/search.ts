@@ -38,7 +38,8 @@ const list = <T extends string>(v: unknown, allowed: readonly T[]): T[] | undefi
   const out = arr.filter((x): x is T => allowed.includes(x as T))
   return out.length ? out : undefined
 }
-const sortRe = /^-?[a-zA-Z]+$/
+// one or more sort fields (shift-click multi-sort): "-createdAt,company"
+const sortRe = /^-?[a-zA-Z]+(?:,-?[a-zA-Z]+)*$/
 
 export const PAGE_SIZES = [10, 25, 50, 100] as const
 

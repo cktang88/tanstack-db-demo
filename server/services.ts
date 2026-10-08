@@ -32,12 +32,19 @@ export type AppError =
 // ---------------------------------------------------------------------------
 // Sqlite: the database handle as a scoped resource (closed on dispose).
 // ---------------------------------------------------------------------------
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface SqliteConfig {
   file: string
+  /** wipe and reseed with demo data on startup */
   seed?: boolean
   seedOptions?: Parameters<typeof seed>[1]
+  /**
+   * Demo mode (default: on unless NODE_ENV=production, or DEMO_MODE=1): a
+   * schema-version mismatch silently wipes and reseeds the demo database.
+   * Outside demo mode a mismatch on a non-empty database refuses to start.
+   */
+  demo?: boolean
 }
 
 export class Sqlite extends Context.Service<Sqlite, DB>()('app/Sqlite') {
@@ -48,8 +55,19 @@ export class Sqlite extends Context.Service<Sqlite, DB>()('app/Sqlite') {
         Effect.sync(() => {
           const db = openDatabase(config.file)
           const version = db.pragma('user_version', { simple: true }) as number
-          if (config.seed || version !== SCHEMA_VERSION) {
+          if (config.seed || (version !== SCHEMA_VERSION && config.demo !== false)) {
             seed(db, config.seedOptions)
+            db.pragma(`user_version = ${SCHEMA_VERSION}`)
+          } else if (version !== SCHEMA_VERSION) {
+            const users = (db.prepare(`SELECT COUNT(*) AS n FROM users`).get() as { n: number }).n
+            if (version !== 0 || users > 0) {
+              db.close()
+              throw new Error(
+                `Database schema version ${version} does not match ${SCHEMA_VERSION}; refusing to wipe it outside demo mode ` +
+                  `(migrate it, or start with RESEED=1 / DEMO_MODE=1 to replace it with demo data)`,
+              )
+            }
+            // a brand-new, empty database: openDatabase() already created the schema
             db.pragma(`user_version = ${SCHEMA_VERSION}`)
           }
           return db
@@ -67,10 +85,15 @@ export const sql = <A>(f: () => A) =>
       if (cause instanceof BadQuery) return new BadRequest({ message: cause.message })
       if (cause instanceof DomainError) return cause.error
       const code = String((cause as { code?: string })?.code)
-      const message = (cause as Error).message
-      if (code === 'SQLITE_CONSTRAINT_TRIGGER') return new Conflict({ message }) // append-only tables etc.
-      if (code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return new Conflict({ message })
-      if (code.startsWith('SQLITE_CONSTRAINT')) return new BadRequest({ message })
+      // raw SQLite messages name tables, columns and indexes: map them to generic ones
+      // (RAISE() messages from our own triggers are written for clients and kept)
+      if (code === 'SQLITE_CONSTRAINT_TRIGGER') return new Conflict({ message: (cause as Error).message }) // append-only tables etc.
+      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return new Conflict({ message: 'A record with this id already exists' })
+      if (code === 'SQLITE_CONSTRAINT_UNIQUE')
+        return new Conflict({ message: 'A record with the same unique value already exists' })
+      if (code === 'SQLITE_CONSTRAINT_FOREIGNKEY') return new BadRequest({ message: 'A referenced record does not exist' })
+      if (code === 'SQLITE_CONSTRAINT_NOTNULL') return new BadRequest({ message: 'A required field is missing' })
+      if (code.startsWith('SQLITE_CONSTRAINT')) return new BadRequest({ message: 'The value violates a constraint' })
       return new DbError({ cause })
     },
   })
@@ -83,29 +106,54 @@ export class DomainError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Writer: SQLite has one writer. All write programs run through a 1-permit
-// semaphore inside BEGIN IMMEDIATE ... COMMIT/ROLLBACK, so a multi-step Effect
-// (validate -> authorize -> write -> audit) is atomic and never interleaves
-// with another request's writes.
+// Writer: SQLite has one writer and this process shares one connection. A
+// write program runs inside BEGIN IMMEDIATE ... COMMIT/ROLLBACK and is executed
+// *synchronously* (no await between BEGIN and COMMIT), so nothing else on the
+// event loop - reads, logins, other writes - can ever observe or join an open
+// transaction. Request bodies must therefore be read and decoded *before* the
+// program is handed to the writer; an async step inside it fails loudly
+// (AsyncFiberError -> 500) instead of holding the lock across I/O.
 // ---------------------------------------------------------------------------
 export class Writer extends Context.Service<
   Writer,
-  { transaction: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R> }
+  {
+    transaction: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R>
+    /** run synchronously under the write lock without a transaction (e.g. schema resets, which toggle pragmas) */
+    exclusive: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R>
+  }
 >()('app/Writer') {
   static layer = Layer.effect(
     Writer,
     Effect.gen(function* () {
       const db = yield* Sqlite
       const lock = yield* Semaphore.make(1)
-      return Writer.of({
-        transaction: (program) =>
-          lock.withPermits(1)(
-            Effect.acquireUseRelease(
-              sql(() => db.exec('BEGIN IMMEDIATE')),
-              () => program,
-              (_, exit) => Effect.sync(() => db.exec(exit._tag === 'Success' ? 'COMMIT' : 'ROLLBACK')),
-            ),
+      const runSync = <A, E, R>(program: Effect.Effect<A, E, R>, tx: boolean) =>
+        lock.withPermits(1)(
+          Effect.flatMap(Effect.context<R>(), (context) =>
+            Effect.suspend((): Effect.Effect<A, E | AppError> => {
+              if (tx) {
+                try {
+                  db.exec('BEGIN IMMEDIATE')
+                } catch (cause) {
+                  return Effect.fail(new DbError({ cause }))
+                }
+              }
+              const exit = Effect.runSyncExitWith(context)(program)
+              if (tx) {
+                try {
+                  db.exec(exit._tag === 'Success' ? 'COMMIT' : 'ROLLBACK')
+                } catch (cause) {
+                  if (db.inTransaction) db.exec('ROLLBACK')
+                  return Effect.fail(new DbError({ cause }))
+                }
+              }
+              return exit
+            }),
           ),
+        )
+      return Writer.of({
+        transaction: (program) => runSync(program, true),
+        exclusive: (program) => runSync(program, false),
       })
     }),
   )
@@ -166,7 +214,8 @@ export class Chaos extends Context.Service<
 // ---------------------------------------------------------------------------
 export type ChangeMessage =
   | { kind: 'upsert'; entity: string; row: { id: number | string } & Record<string, unknown> }
-  | { kind: 'delete'; entity: string; id: number | string }
+  /** `ownerId` (server-internal, stripped before sending) addresses deletes of per-user rows to their owner only */
+  | { kind: 'delete'; entity: string; id: number | string; ownerId?: number }
   | { kind: 'reset' }
 
 export class ChangeFeed extends Context.Service<

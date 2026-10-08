@@ -2,7 +2,8 @@ import { afterAll, describe, expect, it } from 'vite-plus/test'
 import type { Customer, Invoice, Page, Payment, Subscription, Task } from '../../shared/domain.ts'
 import { testApp } from './helpers.ts'
 
-const { req, as, dispose } = testApp()
+const t = testApp()
+const { req, as, dispose } = t
 afterAll(dispose)
 const owner = as('owner')
 
@@ -153,10 +154,21 @@ describe('business rules', () => {
   })
   it('archiving a customer soft-deletes it, cancels billing and keeps history', async () => {
     const inv = (await owner.get<Page<Invoice>>('/invoices?status=paid&limit=1')).body.data[0]!
+    const payments = (await owner.get<Page<Payment>>(`/payments?customerId=${inv.customerId}`)).body.total
+    expect(payments).toBeGreaterThan(0)
     expect((await owner.del(`/customers/${inv.customerId}`)).status).toBe(204)
     expect((await owner.get(`/customers/${inv.customerId}`)).status).toBe(404)
-    expect((await owner.get<Page<Payment>>(`/payments?customerId=${inv.customerId}`)).body.total).toBeGreaterThan(0)
-    const subs = (await owner.get<Page<Subscription>>(`/subscriptions?customerId=${inv.customerId}`)).body.data
+    // the archived account's rows are no longer served by any child resource...
+    for (const r of ['payments', 'subscriptions', 'contacts', 'customer-tags', 'usage-events', 'usage-daily', 'invoices'])
+      expect((await owner.get<Page<unknown>>(`/${r}?customerId=${inv.customerId}`)).body.total, r).toBe(0)
+    expect((await owner.get(`/customer-balances/${inv.customerId}`)).status).toBe(404)
+    // ...but the history is kept, and billing was canceled
+    const db = t.db()
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM payments WHERE customer_id = ?`).get(inv.customerId)).toEqual({ n: payments })
+    const subs = db.prepare(`SELECT status FROM subscriptions WHERE customer_id = ?`).all(inv.customerId) as Array<{
+      status: string
+    }>
+    expect(subs.length).toBeGreaterThan(0)
     expect(subs.every((s) => s.status === 'canceled')).toBe(true)
   })
   it('task comments are permanent: tasks with comments cannot be deleted', async () => {

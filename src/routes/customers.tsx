@@ -157,7 +157,7 @@ export function CustomersPage() {
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
   const { rows, total, totalMrr } = useCustomerRows(search)
-  const { can, canEditCustomer } = useCan()
+  const { can, canEditCustomer, privileged } = useCan()
   const [creating, setCreating] = useState(false)
 
   // Selection lives in a local-only collection: it survives paging & filtering,
@@ -320,6 +320,7 @@ export function CustomersPage() {
       />
       <Dialog open={creating} onClose={() => setCreating(false)} title="New customer">
         <CustomerForm
+          canAssignOwner={privileged}
           submitLabel="Create customer"
           onSubmit={async (values) => {
             // the row is inserted locally with its final id and appears immediately…

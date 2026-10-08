@@ -61,7 +61,7 @@ export function CustomerDetailPage() {
   })
   const navigate = useNavigate()
   const [editing, setEditing] = useState(false)
-  const { can, canEditCustomer } = useCan()
+  const { can, canEditCustomer, privileged } = useCan()
   if (!data)
     return (
       <div className="card mx-auto mt-10 max-w-md p-6 text-center" role="alert">
@@ -153,6 +153,7 @@ export function CustomerDetailPage() {
       </div>
       <Dialog open={editing} onClose={() => setEditing(false)} title="Edit customer">
         <CustomerForm
+          canAssignOwner={privileged}
           initial={customer}
           submitLabel="Save changes"
           onSubmit={async (patch) => {
@@ -728,18 +729,21 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceRow }) {
               ))}
             </select>
             <button className="btn-secondary">Record payment</button>
-            <button
-              type="button"
-              className="btn-ghost text-red-600"
-              onClick={() =>
-                invoicesCollection
-                  .update(invoice.id, (d) => void (d.status = 'void'))
-                  .when('settled')
-                  .catch(fail)
-              }
-            >
-              Void
-            </button>
+            {/* the server refuses (409) to void an invoice that already has payments */}
+            {payments.length === 0 && (
+              <button
+                type="button"
+                className="btn-ghost text-red-600"
+                onClick={() =>
+                  invoicesCollection
+                    .update(invoice.id, (d) => void (d.status = 'void'))
+                    .when('settled')
+                    .catch(fail)
+                }
+              >
+                Void
+              </button>
+            )}
           </form>
         )}
       </div>

@@ -63,7 +63,9 @@ const toSqlValue = (v: unknown) => (typeof v === 'boolean' ? (v ? 1 : 0) : v)
 
 /** Insert using the resource's writable map; returns the new row's key. */
 export function insertRow(db: DB, r: Resource, data: Record<string, unknown>) {
-  const entries = Object.entries(data).filter(([k, v]) => v !== undefined && r.writable?.[k])
+  const entries = Object.entries(data).filter(
+    ([k, v]) => v !== undefined && r.writable !== undefined && Object.hasOwn(r.writable, k),
+  )
   const cols = entries.map(([k]) => r.writable![k]!)
   const res = db
     .prepare(`INSERT INTO ${r.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')}) RETURNING ${r.key} AS k`)
@@ -72,7 +74,9 @@ export function insertRow(db: DB, r: Resource, data: Record<string, unknown>) {
 }
 
 export function updateRow(db: DB, r: Resource, id: unknown, patch: Record<string, unknown>) {
-  const entries = Object.entries(patch).filter(([k, v]) => v !== undefined && r.writable?.[k])
+  const entries = Object.entries(patch).filter(
+    ([k, v]) => v !== undefined && r.writable !== undefined && Object.hasOwn(r.writable, k),
+  )
   if (!entries.length) return 0
   return db
     .prepare(`UPDATE ${r.table} SET ${entries.map(([k]) => `${r.writable![k]} = ?`).join(', ')} WHERE ${r.key} = ?`)

@@ -116,6 +116,40 @@ describe('CustomerForm (React 19 form actions)', () => {
     })
   })
 
+  it('keeps every field, selects included, after a validation error', async () => {
+    const onSubmit = vi.fn(async () => {})
+    render(withQuery(<CustomerForm submitLabel="Create" onSubmit={onSubmit} />))
+    await userEvent.type(screen.getByLabelText('Company'), 'Acme Inc ')
+    await userEvent.selectOptions(screen.getByLabelText('Plan'), 'enterprise')
+    await userEvent.selectOptions(screen.getByLabelText('Country'), 'DE')
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByText('Enter a valid email address')).toBeTruthy()
+    expect((screen.getByLabelText('Plan') as HTMLSelectElement).value).toBe('enterprise')
+    expect((screen.getByLabelText('Country') as HTMLSelectElement).value).toBe('DE')
+    expect((screen.getByLabelText('Company') as HTMLInputElement).value).toBe('Acme Inc')
+
+    // (the labels now also contain the error messages)
+    await userEvent.type(screen.getByLabelText(/^Contact name/), 'Wile E ')
+    await userEvent.type(screen.getByLabelText(/^Email/), ' wile@acme.test')
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        company: 'Acme Inc',
+        name: 'Wile E',
+        email: 'wile@acme.test',
+        plan: 'enterprise',
+        country: 'DE',
+      }),
+    )
+  })
+
+  it('locks the owner for users who may not assign it', () => {
+    render(withQuery(<CustomerForm submitLabel="Create" initial={{ ownerId: 7 }} canAssignOwner={false} onSubmit={vi.fn()} />))
+    expect((screen.getByLabelText('Account owner') as HTMLSelectElement).disabled).toBe(true)
+    expect((document.querySelector('input[type=hidden][name=ownerId]') as HTMLInputElement).value).toBe('7')
+  })
+
   it('surfaces server errors', async () => {
     render(
       withQuery(

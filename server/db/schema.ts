@@ -5,7 +5,7 @@ import { dirname } from 'node:path'
 export type DB = Database.Database
 
 /**
- * Saasly schema (27 tables + 2 views).
+ * Saasly schema (29 tables + 2 views).
  *
  *  identity & access   users, roles, permissions, role_permissions, sessions, teams, team_members
  *  CRM                 customers, contacts, tags, customer_tags
@@ -13,11 +13,14 @@ export type DB = Database.Database
  *  delivery            projects, tasks, task_comments (append-only), time_entries
  *  metering            usage_events (append-only)
  *  rollups             customer_balances, usage_daily (trigger-maintained), mrr_snapshots (job-maintained)
+ *  ledgers             mrr_movements (append-only, written by trigger on customers.mrr)
  *  logs                events (activity feed, append-only), audit_log (append-only), notifications
  *  views               project_stats, customer_health
  *
  * Business rules enforced *in the database* (so every write path obeys them):
  *  - customers.mrr is the sum of its active subscriptions (trigger)
+ *  - every change of customers.mrr appends an MRR movement (trigger); mrr_hold
+ *    lets one business operation (e.g. a plan change) record a single net movement
  *  - invoices.amount is the sum of its line items (trigger)
  *  - an invoice becomes `paid` once payments cover it (trigger)
  *  - customer_balances / usage_daily are rolled up incrementally (triggers)
@@ -91,6 +94,7 @@ CREATE TABLE IF NOT EXISTS customers (
   country     TEXT NOT NULL,
   seats       INTEGER NOT NULL,           -- denormalised from the base-plan subscription
   mrr         INTEGER NOT NULL DEFAULT 0, -- rollup of active subscriptions (trigger)
+  mrr_changed_at TEXT,                    -- effective time of the latest mrr change (internal, feeds mrr_movements)
   owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
   team_id     INTEGER REFERENCES teams(id) ON DELETE SET NULL,
   created_at  TEXT NOT NULL,
@@ -187,6 +191,7 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_payments_received ON payments(received_at DESC, id);  -- default sort
 
 -- rollup, maintained incrementally by triggers on invoices + payments
 CREATE TABLE IF NOT EXISTS customer_balances (
@@ -198,7 +203,28 @@ CREATE TABLE IF NOT EXISTS customer_balances (
   updated_at   TEXT NOT NULL
 );
 
--- rollup, rebuilt by a job (see rebuildMrrSnapshots)
+-- append-only ledger of MRR changes per customer (trigger on customers.mrr)
+CREATE TABLE IF NOT EXISTS mrr_movements (
+  id           INTEGER PRIMARY KEY,
+  customer_id  INTEGER NOT NULL REFERENCES customers(id),
+  at           TEXT NOT NULL,
+  kind         TEXT NOT NULL,       -- new | expansion | contraction | churn | reactivation
+  old_mrr      INTEGER NOT NULL,
+  new_mrr      INTEGER NOT NULL,
+  delta        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mrr_movements_customer ON mrr_movements(customer_id, at, id);
+CREATE INDEX IF NOT EXISTS idx_mrr_movements_at ON mrr_movements(at);
+
+-- while a row exists for a customer, mrr changes are not recorded one by one; deleting
+-- the row records one net movement (mrr_before -> current mrr) at its "at" time
+CREATE TABLE IF NOT EXISTS mrr_hold (
+  customer_id  INTEGER PRIMARY KEY REFERENCES customers(id),
+  mrr_before   INTEGER NOT NULL,
+  at           TEXT NOT NULL
+);
+
+-- rollup, rebuilt from mrr_movements by a job (see rebuildMrrSnapshots)
 CREATE TABLE IF NOT EXISTS mrr_snapshots (
   month              TEXT PRIMARY KEY,  -- YYYY-MM
   mrr                INTEGER NOT NULL,
@@ -235,7 +261,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, position, id);  -- a board column, in order
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -259,6 +285,7 @@ CREATE TABLE IF NOT EXISTS time_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_time_entries_task ON time_entries(task_id);
 CREATE INDEX IF NOT EXISTS idx_time_entries_user ON time_entries(user_id);
+CREATE INDEX IF NOT EXISTS idx_time_entries_spent ON time_entries(spent_on DESC, id);  -- default sort
 
 -- ============================== metering ==============================
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -266,10 +293,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
   customer_id  INTEGER NOT NULL REFERENCES customers(id),
   metric       TEXT NOT NULL,       -- api_calls | storage_gb | active_seats
   quantity     INTEGER NOT NULL,
-  occurred_at  TEXT NOT NULL,
-  idempotency_key TEXT UNIQUE
+  occurred_at  TEXT NOT NULL,       -- UTC (…Z): usage_daily buckets by its first 10 characters
+  idempotency_key TEXT,
+  UNIQUE (customer_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_customer ON usage_events(customer_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_occurred ON usage_events(occurred_at DESC, id);  -- default sort
 
 -- rollup, maintained incrementally by trigger on usage_events
 CREATE TABLE IF NOT EXISTS usage_daily (
@@ -285,7 +314,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS events (
   id           INTEGER PRIMARY KEY,
   type         TEXT NOT NULL,
-  actor_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  actor_id     INTEGER REFERENCES users(id),  -- no SET NULL: rows are immutable (users are deactivated, not deleted)
   customer_id  INTEGER,
   message      TEXT NOT NULL,
   created_at   TEXT NOT NULL
@@ -299,11 +328,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   actor_id    INTEGER REFERENCES users(id),
   action      TEXT NOT NULL,        -- create | update | delete | login | logout | denied
   entity      TEXT NOT NULL,
-  entity_id   INTEGER,
-  changes     TEXT NOT NULL DEFAULT '{}',  -- JSON {field: [before, after]}
+  entity_id   INTEGER,                     -- numeric keys (kept for compatibility)
+  entity_key  TEXT,                        -- every key as text, incl. composite ones ("12:3")
+  changes     TEXT NOT NULL DEFAULT '{}',  -- JSON {field: [before, after]}; deletes: [before, null]
   request_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity_key ON audit_log(entity, entity_key);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -320,14 +351,41 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at);
 
 -- ============================== triggers: denormalisation & rollups ==============================
--- customers.mrr = Σ active subscriptions
+-- customers.mrr = Σ active subscriptions (trials contribute nothing until they convert)
 CREATE TRIGGER IF NOT EXISTS trg_sub_mrr_ins AFTER INSERT ON subscriptions BEGIN
   UPDATE customers SET mrr = (SELECT COALESCE(SUM(quantity * unit_price), 0) FROM subscriptions
-    WHERE customer_id = NEW.customer_id AND status IN ('active', 'past_due')) WHERE id = NEW.customer_id;
+    WHERE customer_id = NEW.customer_id AND status IN ('active', 'past_due')),
+    mrr_changed_at = NEW.started_at
+  WHERE id = NEW.customer_id;
 END;
 CREATE TRIGGER IF NOT EXISTS trg_sub_mrr_upd AFTER UPDATE ON subscriptions BEGIN
   UPDATE customers SET mrr = (SELECT COALESCE(SUM(quantity * unit_price), 0) FROM subscriptions
-    WHERE customer_id = NEW.customer_id AND status IN ('active', 'past_due')) WHERE id = NEW.customer_id;
+    WHERE customer_id = NEW.customer_id AND status IN ('active', 'past_due')),
+    mrr_changed_at = CASE WHEN NEW.canceled_at IS NOT NULL AND OLD.canceled_at IS NULL THEN NEW.canceled_at
+                          ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END
+  WHERE id = NEW.customer_id;
+END;
+
+-- MRR movements ledger: one row per change of customers.mrr (unless held, see mrr_hold)
+CREATE TRIGGER IF NOT EXISTS trg_mrr_movement AFTER UPDATE OF mrr ON customers
+WHEN NEW.mrr != OLD.mrr AND NOT EXISTS (SELECT 1 FROM mrr_hold WHERE customer_id = NEW.id)
+BEGIN
+  INSERT INTO mrr_movements (customer_id, at, kind, old_mrr, new_mrr, delta)
+  VALUES (NEW.id, COALESCE(NEW.mrr_changed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CASE WHEN NEW.mrr > 0 AND OLD.mrr = 0
+         THEN CASE WHEN EXISTS (SELECT 1 FROM mrr_movements WHERE customer_id = NEW.id) THEN 'reactivation' ELSE 'new' END
+       WHEN NEW.mrr = 0 THEN 'churn' WHEN NEW.mrr > OLD.mrr THEN 'expansion' ELSE 'contraction' END,
+    OLD.mrr, NEW.mrr, NEW.mrr - OLD.mrr);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mrr_hold_release AFTER DELETE ON mrr_hold
+WHEN (SELECT mrr FROM customers WHERE id = OLD.customer_id) != OLD.mrr_before
+BEGIN
+  INSERT INTO mrr_movements (customer_id, at, kind, old_mrr, new_mrr, delta)
+  SELECT c.id, OLD.at, CASE WHEN c.mrr > 0 AND OLD.mrr_before = 0
+         THEN CASE WHEN EXISTS (SELECT 1 FROM mrr_movements WHERE customer_id = c.id) THEN 'reactivation' ELSE 'new' END
+       WHEN c.mrr = 0 THEN 'churn' WHEN c.mrr > OLD.mrr_before THEN 'expansion' ELSE 'contraction' END,
+    OLD.mrr_before, c.mrr, c.mrr - OLD.mrr_before
+  FROM customers c WHERE c.id = OLD.customer_id;
 END;
 
 -- invoices.amount = Σ line items
@@ -348,17 +406,25 @@ CREATE TRIGGER IF NOT EXISTS trg_balance_inv_ins AFTER INSERT ON invoices BEGIN
   INSERT INTO customer_balances (customer_id, updated_at) VALUES (NEW.customer_id, NEW.issued_at)
   ON CONFLICT(customer_id) DO NOTHING;
 END;
+-- outstanding / overdue = what is still owed on open / overdue invoices (amount minus payments on them),
+-- the same definition /metrics/ar-aging uses
 CREATE TRIGGER IF NOT EXISTS trg_balance_inv_upd AFTER UPDATE OF amount, status ON invoices BEGIN
   UPDATE customer_balances SET
     invoiced = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status != 'void'),
-    outstanding = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status IN ('open', 'overdue')),
-    overdue = (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE customer_id = NEW.customer_id AND status = 'overdue'),
+    outstanding = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+                   FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status IN ('open', 'overdue')),
+    overdue = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+               FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status = 'overdue'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   WHERE customer_id = NEW.customer_id;
 END;
 CREATE TRIGGER IF NOT EXISTS trg_balance_pay AFTER INSERT ON payments BEGIN
   UPDATE customer_balances SET
-    paid = paid + NEW.amount,
+    paid = (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE customer_id = NEW.customer_id),
+    outstanding = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+                   FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status IN ('open', 'overdue')),
+    overdue = (SELECT COALESCE(SUM(i.amount - (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id)), 0)
+               FROM invoices i WHERE i.customer_id = NEW.customer_id AND i.status = 'overdue'),
     updated_at = NEW.received_at
   WHERE customer_id = NEW.customer_id;
 END;
@@ -380,6 +446,9 @@ CREATE TRIGGER IF NOT EXISTS trg_comments_no_delete BEFORE DELETE ON task_commen
 CREATE TRIGGER IF NOT EXISTS trg_usage_no_update BEFORE UPDATE ON usage_events BEGIN SELECT RAISE(ABORT, 'usage_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_usage_no_delete BEFORE DELETE ON usage_events BEGIN SELECT RAISE(ABORT, 'usage_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_mrr_movements_no_update BEFORE UPDATE ON mrr_movements BEGIN SELECT RAISE(ABORT, 'mrr_movements is an append-only ledger'); END;
+CREATE TRIGGER IF NOT EXISTS trg_mrr_movements_no_delete BEFORE DELETE ON mrr_movements BEGIN SELECT RAISE(ABORT, 'mrr_movements is an append-only ledger'); END;
 
 -- ============================== views ==============================
 CREATE VIEW IF NOT EXISTS project_stats AS
@@ -436,6 +505,8 @@ export const TABLES = [
   'invoice_line_items',
   'payments',
   'customer_balances',
+  'mrr_movements',
+  'mrr_hold',
   'mrr_snapshots',
   'projects',
   'tasks',

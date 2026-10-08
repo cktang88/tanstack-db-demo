@@ -1,5 +1,6 @@
 import { field } from '../lib/format'
 import { useQuery } from '@tanstack/react-query'
+import { useSearch } from '@tanstack/react-router'
 import { useActionState } from 'react'
 import { useFormStatus } from 'react-dom'
 import { Badge } from '../components/ui'
@@ -14,17 +15,28 @@ function Submit() {
   )
 }
 
+type LoginState = { error: string | null; email: string }
+
 export function LoginPage() {
-  const login = useLogin()
+  // where the auth guard sent us from (/login?redirect=/customers)
+  const { redirect } = useSearch({ from: '/login' })
+  const login = useLogin({ redirect })
   const { data: demo = [] } = useQuery(demoUsersQuery())
-  const [error, action] = useActionState(async (_: string | null, form: FormData) => {
-    try {
-      await login.mutateAsync({ email: field(form, 'email'), password: field(form, 'password') })
-      return null
-    } catch (e) {
-      return (e as Error).message
-    }
-  }, null)
+  // React resets uncontrolled forms after an action: keep the submitted email in the
+  // action state (fed back as defaultValue) so a failed attempt doesn't revert the
+  // field to the demo default and sign in as someone else on the next submit
+  const [{ error, email }, action] = useActionState<LoginState, FormData>(
+    async (_prev, form) => {
+      const email = field(form, 'email')
+      try {
+        await login.mutateAsync({ email, password: field(form, 'password') })
+        return { error: null, email }
+      } catch (e) {
+        return { error: (e as Error).message, email }
+      }
+    },
+    { error: null, email: 'owner@saasly.dev' },
+  )
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-zinc-50 p-6 dark:bg-zinc-950">
@@ -37,11 +49,17 @@ export function LoginPage() {
         <form action={action} className="space-y-3">
           <label className="block">
             <span className="label">Email</span>
-            <input name="email" type="email" className="input" autoComplete="username" defaultValue="owner@saasly.dev" />
+            <input name="email" type="email" className="input" autoComplete="username" defaultValue={email} />
           </label>
           <label className="block">
             <span className="label">Password</span>
-            <input name="password" type="password" className="input" autoComplete="current-password" defaultValue="password" />
+            <input
+              name="password"
+              type="password"
+              className="input"
+              autoComplete="current-password"
+              defaultValue={error ? '' : 'password'}
+            />
           </label>
           {error && (
             <p className="text-sm text-red-600" role="alert">

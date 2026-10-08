@@ -48,8 +48,18 @@ export interface Resource {
   ownerField?: string
   /** extra WHERE applied to every read (row-level security / soft delete) */
   scope?: (me: Principal) => ScopeSql | undefined
-  /** row-level write check against the current row (update/delete) or the new row (create) */
-  canWrite?: (me: Principal, row: Record<string, any>, db: DB, op: 'create' | 'update' | 'delete') => string | undefined
+  /**
+   * Row-level write check against the current row (update/delete) or the new row (create).
+   * Updates are checked twice: against the stored row, then against the merged
+   * row (stored + patch) with `before` set to the stored row.
+   */
+  canWrite?: (
+    me: Principal,
+    row: Record<string, any>,
+    db: DB,
+    op: 'create' | 'update' | 'delete',
+    before?: Record<string, any>,
+  ) => string | undefined
   /** values used when the client omits them */
   defaults?: (me: Principal) => Record<string, unknown>
   /** fields the server always sets on create, overriding the client (e.g. author = caller) */
@@ -63,6 +73,9 @@ export interface Resource {
 const n = (sql: string) => ({ sql, type: 'number' as const })
 const t = (sql: string) => ({ sql, type: 'text' as const })
 const b = (sql: string) => ({ sql, type: 'bool' as const })
+
+/** rows of archived (soft-deleted) customers are history: kept, but not served */
+const liveCustomer = (): ScopeSql => ({ sql: 'customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)', params: [] })
 
 const own =
   (column: string) =>
@@ -80,13 +93,50 @@ const projectTeam = (db: DB, projectId: unknown) =>
     | { teamId: number | null; ownerId: number | null }
     | undefined
 
+/** members may work on projects they own or that belong to one of their teams */
+const projectAccess = (me: Principal, p: { teamId: number | null; ownerId: number | null }) =>
+  me.privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId))
+    ? undefined
+    : 'Members can only modify projects owned by one of their teams'
+
 const canTouchProject = (me: Principal, db: DB, projectId: unknown) => {
   if (me.privileged) return undefined
   const p = projectTeam(db, projectId)
-  if (!p) return undefined // 404 is reported elsewhere
-  return p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId))
-    ? undefined
-    : 'Members can only modify projects owned by one of their teams'
+  if (!p) return undefined // 404 / FK violation is reported elsewhere
+  return projectAccess(me, p)
+}
+
+const canWriteProject: Resource['canWrite'] = (me, row, _db, op, before) => {
+  if (me.privileged) return undefined
+  const teamId = (row.teamId ?? null) as number | null
+  const ownerId = (row.ownerId ?? null) as number | null
+  if (op === 'create') {
+    if (teamId === null || !me.teamIds.includes(teamId)) return 'Create projects for your own team'
+    if (ownerId !== null && ownerId !== me.user.id) return 'Members can only make themselves the project owner'
+    return undefined
+  }
+  if (before) {
+    // the patched row: no moving projects to other teams, no handing them to someone else
+    if (teamId !== (before.teamId ?? null) && (teamId === null || !me.teamIds.includes(teamId)))
+      return 'Members can only move projects to one of their teams'
+    if (ownerId !== (before.ownerId ?? null) && ownerId !== me.user.id)
+      return 'Members can only make themselves the project owner'
+  }
+  return projectAccess(me, { teamId, ownerId })
+}
+
+/** what a task's assignee may change on a task outside their teams' projects */
+const ASSIGNEE_FIELDS = new Set(['status', 'position', 'updatedAt'])
+
+const canWriteTask: Resource['canWrite'] = (me, row, db, op, before) => {
+  if (op !== 'update') return canTouchProject(me, db, row.projectId)
+  if (!before) return row.assigneeId === me.user.id ? undefined : canTouchProject(me, db, row.projectId)
+  // the patched row: moving a task needs access to both projects
+  if (row.projectId !== before.projectId)
+    return canTouchProject(me, db, before.projectId) ?? canTouchProject(me, db, row.projectId)
+  const changed = Object.keys(row).filter((k) => JSON.stringify(row[k]) !== JSON.stringify(before[k]))
+  if (before.assigneeId === me.user.id && changed.every((k) => ASSIGNEE_FIELDS.has(k))) return undefined
+  return canTouchProject(me, db, row.projectId)
 }
 
 export const resources: Record<string, Resource> = {
@@ -257,6 +307,7 @@ export const resources: Record<string, Resource> = {
     update: 'customers:write',
     remove: 'customers:write',
     mode: 'crud',
+    scope: liveCustomer,
     writable: {
       id: 'id',
       customerId: 'customer_id',
@@ -303,6 +354,7 @@ export const resources: Record<string, Resource> = {
     create: 'customers:write',
     remove: 'customers:write',
     mode: 'crud',
+    scope: liveCustomer,
     writable: { customerId: 'customer_id', tagId: 'tag_id', taggedAt: 'tagged_at' },
     createSchema: S.CustomerTagInput,
     defaults: () => ({ taggedAt: new Date().toISOString() }),
@@ -365,6 +417,7 @@ export const resources: Record<string, Resource> = {
     create: 'billing:write',
     update: 'billing:write',
     mode: 'crud', // create/update via business logic in handlers.ts
+    scope: liveCustomer,
   },
   invoices: {
     name: 'invoices',
@@ -386,7 +439,7 @@ export const resources: Record<string, Resource> = {
     read: 'billing:read',
     update: 'billing:write',
     mode: 'crud', // status transitions via business logic in handlers.ts
-    scope: () => ({ sql: 'customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)', params: [] }),
+    scope: liveCustomer,
   },
   'invoice-line-items': {
     name: 'invoice-line-items',
@@ -426,6 +479,7 @@ export const resources: Record<string, Resource> = {
     read: 'billing:read',
     create: 'billing:write',
     mode: 'append-only', // ledger: corrections are new rows, never edits (create via handlers.ts)
+    scope: liveCustomer,
   },
   'customer-balances': {
     name: 'customer-balances',
@@ -444,6 +498,28 @@ export const resources: Record<string, Resource> = {
     defaultSort: '-outstanding',
     read: 'billing:read',
     mode: 'read-only', // rollup maintained by triggers
+    scope: liveCustomer,
+  },
+  'mrr-movements': {
+    name: 'mrr-movements',
+    table: 'mrr_movements',
+    key: 'id',
+    keyType: 'number',
+    columns: {
+      id: n('id'),
+      customerId: n('customer_id'),
+      at: t('at'),
+      month: t('substr(at, 1, 7)'),
+      kind: t('kind'),
+      oldMrr: n('old_mrr'),
+      newMrr: n('new_mrr'),
+      delta: n('delta'),
+    },
+    defaultSort: '-id',
+    read: 'billing:read',
+    // ledger: written by a trigger on customers.mrr, never by clients. Like mrr-snapshots it is revenue
+    // history and keeps archived customers' movements.
+    mode: 'read-only',
   },
   'mrr-snapshots': {
     name: 'mrr-snapshots',
@@ -503,12 +579,7 @@ export const resources: Record<string, Resource> = {
     createSchema: S.ProjectInput,
     patchSchema: S.ProjectPatch,
     defaults: () => ({ createdAt: new Date().toISOString() }),
-    canWrite: (me, row, db, op) =>
-      op === 'create'
-        ? me.privileged || (row.teamId && me.teamIds.includes(row.teamId))
-          ? undefined
-          : 'Create projects for your own team'
-        : canTouchProject(me, db, row.id),
+    canWrite: canWriteProject,
   },
   'project-stats': {
     name: 'project-stats',
@@ -567,7 +638,7 @@ export const resources: Record<string, Resource> = {
     patchSchema: S.TaskPatch,
     // new cards go to the bottom of their column
     defaults: () => ({ createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), position: Date.now() / 1000 }),
-    canWrite: (me, row, db) => (row.assigneeId === me.user.id ? undefined : canTouchProject(me, db, row.projectId)),
+    canWrite: canWriteTask,
   },
   'task-comments': {
     name: 'task-comments',
@@ -637,6 +708,7 @@ export const resources: Record<string, Resource> = {
     read: 'usage:read',
     create: 'usage:write',
     mode: 'append-only',
+    scope: liveCustomer,
     writable: {
       id: 'id',
       customerId: 'customer_id',
@@ -663,6 +735,7 @@ export const resources: Record<string, Resource> = {
     defaultSort: 'day',
     read: 'usage:read',
     mode: 'read-only', // rollup maintained by trigger
+    scope: liveCustomer,
   },
   'customer-health': {
     name: 'customer-health',
@@ -713,6 +786,7 @@ export const resources: Record<string, Resource> = {
       action: t('action'),
       entity: t('entity'),
       entityId: n('entity_id'),
+      entityKey: t('entity_key'),
       changes: t('changes'),
       requestId: t('request_id'),
     },
@@ -752,4 +826,4 @@ export const resources: Record<string, Resource> = {
 export const RESOURCE_NAMES = Object.keys(resources)
 
 /** Which permission is needed to *receive* change-feed messages for an entity. */
-export const readPermissionOf = (entity: string) => resources[entity]?.read
+export const readPermissionOf = (entity: string) => (Object.hasOwn(resources, entity) ? resources[entity]!.read : undefined)
