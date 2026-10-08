@@ -1,14 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
+import { resetDemo } from './helpers'
 
 const setChaos = (page: Page, chaos: { latencyMs: number; failRate: number }) =>
   page.request.put('/api/dev/chaos', { data: chaos })
 
-test.beforeAll(async ({ playwright, baseURL }) => {
-  const owner = await playwright.request.newContext({ baseURL, storageState: 'e2e/.auth/owner.json' })
-  await owner.post('/api/dev/reset', { data: {} })
-  await owner.put('/api/dev/chaos', { data: { latencyMs: 120, failRate: 0 } })
-  await owner.dispose()
-})
+test.beforeAll(({ playwright, baseURL }) => resetDemo(playwright, baseURL))
 
 test.afterEach(async ({ page }) => {
   await setChaos(page, { latencyMs: 120, failRate: 0 })

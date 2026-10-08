@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test'
-import { pageAs } from './helpers'
+import { pageAs, resetDemo } from './helpers'
+
+test.beforeAll(({ playwright, baseURL }) => resetDemo(playwright, baseURL))
 
 test('billing records a partial payment, then settles the invoice', async ({ browser }) => {
   const page = await pageAs(browser, 'billing')

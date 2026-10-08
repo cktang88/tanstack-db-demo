@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test'
-import { pageAs } from './helpers'
+import { expectUnreadBadgeMatchesApi, pageAs, resetDemo } from './helpers'
+
+test.beforeAll(({ playwright, baseURL }) => resetDemo(playwright, baseURL))
 
 test.describe('authentication & authorization', () => {
   test.use({ storageState: { cookies: [], origins: [] } })
@@ -16,6 +18,25 @@ test.describe('authentication & authorization', () => {
     await expect(page).toHaveURL(/\/login/)
     await page.goto('/')
     await expect(page).toHaveURL(/\/login/)
+  })
+
+  test("switching users in one tab shows only the new user's data", async ({ page }) => {
+    await page.goto('/login')
+    await page.getByRole('button', { name: 'Sign in as member' }).click()
+    await expect(page.getByTestId('user-menu')).toContainText('Linus Torvalds')
+    await expectUnreadBadgeMatchesApi(page)
+    await page.getByRole('button', { name: 'Sign out' }).click()
+    await expect(page).toHaveURL(/\/login/)
+    // same tab, no reload: nothing cached for the member may show up for the viewer
+    await page.getByRole('button', { name: 'Sign in as viewer' }).click()
+    await expect(page.getByTestId('user-menu')).toContainText('Barbara Liskov')
+    await expectUnreadBadgeMatchesApi(page)
+    await page
+      .getByRole('link', { name: /Settings/ })
+      .first()
+      .click()
+    const sessions = (await (await page.request.get('/api/sessions?limit=0')).json()) as { total: number }
+    await expect(page.getByTestId('sessions').getByRole('listitem')).toHaveCount(sessions.total)
   })
 })
 

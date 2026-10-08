@@ -7,7 +7,8 @@ export default defineConfig({
   testDir: 'e2e',
   fullyParallel: false,
   workers: 1, // tests share one SQLite database
-  retries: process.env.CI ? 1 : 0,
+  // no retries: a retry re-runs against data the failed attempt already changed and hides real races
+  retries: 0,
   reporter: [['list']],
   timeout: 30_000,
   expect: { timeout: 7_000 },
