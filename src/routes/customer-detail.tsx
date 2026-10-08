@@ -10,15 +10,15 @@ import {
   inArray,
 } from '@tanstack/react-db'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Fragment, useActionState, useMemo, useState } from 'react'
+import { Fragment, useMemo, useState, type FormEvent } from 'react'
 import { CustomerForm } from '../components/CustomerForm'
 import { Avatar, Badge, Card, Dialog, Empty, PageHeader, Stat } from '../components/ui'
 import {
   addAddon,
+  applyBillingPatch,
   cancelSubscription,
   deleteCustomers,
   markInvoicePaid,
-  mrrOf,
   recordPayment,
   updateCustomers,
 } from '../db/actions'
@@ -174,11 +174,8 @@ export function CustomerDetailPage() {
  */
 function SeatsSlider({ id, seats, pending }: { id: number; seats: number; pending: boolean }) {
   const setSeats = usePacedMutations<number>({
-    onMutate: (n) =>
-      customersCollection.update(id, (d) => {
-        d.seats = n
-        d.mrr = mrrOf(d)
-      }),
+    // MRR moves by the base plan's sold price (see predictMrr); the server's value is read back on save
+    onMutate: (n) => customersCollection.update(id, (d) => applyBillingPatch(d, { seats: n })),
     mutationFn: async ({ transaction }) => persist(transaction.mutations),
     strategy: throttleStrategy({ wait: 500, trailing: true }),
   })
@@ -187,7 +184,8 @@ function SeatsSlider({ id, seats, pending }: { id: number; seats: number; pendin
       <input
         type="range"
         min={1}
-        max={300}
+        // never clamp a large account to the slider's range
+        max={Math.max(300, seats * 2)}
         value={seats}
         aria-label="Seats"
         onChange={(e) => setSeats(Number(e.target.value))}
@@ -252,7 +250,7 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
       title={`Invoices (${invoices.length})`}
       actions={
         <span className="text-xs text-zinc-500" data-testid="invoice-totals">
-          Lifetime {money(lifetime)} · Outstanding {money(totals?.outstanding ?? 0)}
+          Lifetime {money(lifetime)} · Open invoices {money(totals?.outstanding ?? 0)} (before payments)
         </span>
       }
     >
@@ -403,7 +401,7 @@ function BalanceStat({ customerId }: { customerId: number }) {
       label="Balance"
       testId="customer-balance"
       value={<span data-testid="balance-value">{money(by('open') + by('overdue') - (partial?.paid ?? 0))}</span>}
-      hint={`${money(by('overdue'))} overdue · ${money(by('paid'))} paid lifetime`}
+      hint={`open invoices net of partial payments · ${money(by('overdue'))} overdue (gross) · ${money(by('paid'))} paid lifetime`}
     />
   )
 }
@@ -490,24 +488,31 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
         .orderBy(({ c }) => c.isPrimary, 'desc')
         .orderBy(({ c }) => c.name),
   })
-  const [error, action] = useActionState((_: string | null, f: FormData) => {
-    const name = field(f, 'name').trim()
-    const email = field(f, 'email').trim()
-    if (name.length < 2 || !email.includes('@')) return 'Name and a valid email are required'
+  // controlled + onSubmit (a form action would reset the inputs) so a rejected entry stays editable
+  const empty = { name: '', email: '', title: '' }
+  const [draft, setDraft] = useState(empty)
+  const [error, setError] = useState<string | null>(null)
+  const set = (k: keyof typeof empty) => (e: { target: { value: string } }) => setDraft((d) => ({ ...d, [k]: e.target.value }))
+  const add = (e: FormEvent) => {
+    e.preventDefault()
+    const name = draft.name.trim()
+    const email = draft.email.trim()
+    if (name.length < 2 || !email.includes('@')) return setError('Name and a valid email are required')
     contactsCollection
       .insert({
         id: newId(),
         customerId,
         name,
         email,
-        title: field(f, 'title') || 'Contact',
+        title: draft.title.trim() || 'Contact',
         isPrimary: false,
         createdAt: new Date().toISOString(),
       })
       .when('settled')
       .catch((e: Error) => toast.error('Could not add contact — removed', e.message))
-    return null
-  }, null)
+    setDraft(empty)
+    setError(null)
+  }
   return (
     <Card title={`Contacts (${contacts.length})`}>
       <ul className="space-y-2 text-sm" data-testid="contacts">
@@ -537,10 +542,24 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
         ))}
       </ul>
       {editable && (
-        <form action={action} className="mt-3 grid grid-cols-2 gap-2">
-          <input name="name" className="input" placeholder="Name" aria-label="Contact name" />
-          <input name="email" className="input" placeholder="Email" aria-label="Contact email" />
-          <input name="title" className="input" placeholder="Title" aria-label="Contact title" />
+        <form onSubmit={add} className="mt-3 grid grid-cols-2 gap-2">
+          <input name="name" className="input" placeholder="Name" aria-label="Contact name" value={draft.name} onChange={set('name')} />
+          <input
+            name="email"
+            className="input"
+            placeholder="Email"
+            aria-label="Contact email"
+            value={draft.email}
+            onChange={set('email')}
+          />
+          <input
+            name="title"
+            className="input"
+            placeholder="Title"
+            aria-label="Contact title"
+            value={draft.title}
+            onChange={set('title')}
+          />
           <button className="btn-secondary">Add contact</button>
           {error && <p className="col-span-2 text-xs text-red-600">{error}</p>}
         </form>
@@ -663,7 +682,8 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceRow }) {
             <li key={p.id} className={`flex justify-between gap-2 ${p.$hasPendingWrites ? 'opacity-60' : ''}`}>
               <span>
                 {date(p.receivedAt)} · <Badge value={p.method} tone="zinc" />{' '}
-                <span className="font-mono text-xs">{p.reference}</span>
+                {/* the reference is generated by the server */}
+                <span className="font-mono text-xs">{p.reference || 'pending…'}</span>
               </span>
               <span className="tabular-nums">{money(p.amount)}</span>
             </li>
