@@ -157,7 +157,7 @@ export function CustomersPage() {
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
   const { rows, total, totalMrr } = useCustomerRows(search)
-  const { can } = useCan()
+  const { can, canEditCustomer } = useCan()
   const [creating, setCreating] = useState(false)
 
   // Selection lives in a local-only collection: it survives paging & filtering,
@@ -184,6 +184,26 @@ export function CustomersPage() {
   }
   const clearSelection = () => {
     if (selected.length) selectionCollection.delete(selected.map((s) => s.id))
+  }
+  /**
+   * Bulk actions only touch rows that still exist locally (a selection can
+   * outlive its rows — update/delete of a missing key throws) and that the
+   * user may change (members: accounts they own, as the server enforces).
+   */
+  const actionable = (ids: number[]) => {
+    const ok = ids.filter((id) => {
+      const c = customersCollection.get(id)
+      return c !== undefined && canEditCustomer(c)
+    })
+    const gone = ids.filter((id) => !customersCollection.has(id) && selectionCollection.has(id))
+    if (gone.length) selectionCollection.delete(gone)
+    const skipped = ids.length - ok.length
+    if (skipped)
+      toast.info(
+        `Skipped ${skipped} customer${skipped === 1 ? '' : 's'}`,
+        'Not found any more, or not yours to change',
+      )
+    return ok
   }
 
   return (
@@ -262,13 +282,15 @@ export function CustomersPage() {
                   key={s}
                   className="btn-secondary py-1 text-xs"
                   onClick={() => {
+                    const editable = actionable(ids)
+                    clearSelection()
+                    if (!editable.length) return
                     // one transaction for N rows -> one atomic /api/batch request
-                    const tx = updateCustomers(ids, { status: s })
+                    const tx = updateCustomers(editable, { status: s })
                     tx.when('settled').then(
-                      () => toast.success(`Updated ${ids.length} customers`),
+                      () => toast.success(`Updated ${editable.length} customers`),
                       (e: Error) => toast.error('Bulk update failed — rolled back', e.message),
                     )
-                    clearSelection()
                   }}
                 >
                   Mark {s}
@@ -279,10 +301,12 @@ export function CustomersPage() {
                   className="btn-danger py-1 text-xs"
                   onClick={() => {
                     if (!confirm(`Archive ${ids.length} customers?`)) return
-                    deleteCustomers(ids)
+                    const archivable = actionable(ids)
+                    if (!archivable.length) return
+                    deleteCustomers(archivable)
                       .when('settled')
                       .then(
-                        () => toast.success(`Archived ${ids.length} customer${ids.length === 1 ? '' : 's'}`),
+                        () => toast.success(`Archived ${archivable.length} customer${archivable.length === 1 ? '' : 's'}`),
                         (e: Error) => toast.error('Archive failed — rows restored', e.message),
                       )
                   }}
