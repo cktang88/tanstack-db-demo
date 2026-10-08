@@ -45,11 +45,13 @@ export const keys = {
     list: (p: CustomerListParams) => [...keys.customers.lists(), p] as const,
     detail: (id: number) => [...keys.customers.all, 'detail', id] as const,
     lookup: (q: string) => [...keys.customers.all, 'lookup', q] as const,
+    byIds: (ids: readonly number[]) => [...keys.customers.all, 'by-ids', ids] as const,
   },
   invoices: {
     all: ['invoices'] as const,
     list: (p: InvoiceListParams) => [...keys.invoices.all, 'list', p] as const,
     byCustomer: (customerId: number) => [...keys.invoices.all, 'customer', customerId] as const,
+    byIds: (ids: readonly number[]) => [...keys.invoices.all, 'by-ids', ids] as const,
   },
   projects: {
     all: ['projects'] as const,
@@ -102,6 +104,10 @@ export interface InvoiceListParams {
 
 const STALE = 30_000
 
+/** Distinct ids, sorted (a stable query key for "these rows"). */
+export const distinctIds = (ids: Iterable<number>) => [...new Set(ids)].sort((a, b) => a - b)
+const indexById = <T extends { id: number }>(p: Page<T>) => new Map(p.data.map((r) => [r.id, r]))
+
 // ----------------------------------------------------------------------------
 // Users
 // ----------------------------------------------------------------------------
@@ -146,6 +152,26 @@ export const customerQuery = (id: number) =>
     staleTime: STALE,
   })
 
+/**
+ * Batched lookup of the rows a table page references: ONE request
+ * (`/customers?id=1,2,3`, an IN filter) instead of one per row. Each row also
+ * seeds its detail cache entry, so following a link renders instantly.
+ */
+export const customersByIdsQuery = (ids: readonly number[]) =>
+  queryOptions({
+    queryKey: keys.customers.byIds(ids),
+    queryFn: async ({ signal, client }) => {
+      const page = await api.get<Page<Customer>>('/customers', { id: [...ids], limit: ids.length }, signal)
+      for (const c of page.data)
+        if (client.getQueryData(keys.customers.detail(c.id)) === undefined) client.setQueryData(keys.customers.detail(c.id), c)
+      return page
+    },
+    select: indexById,
+    enabled: ids.length > 0,
+    placeholderData: keepPreviousData,
+    staleTime: 5 * 60_000,
+  })
+
 export const customerLookupQuery = (q: string) =>
   queryOptions({
     queryKey: keys.customers.lookup(q),
@@ -176,6 +202,17 @@ export const invoicesListQuery = (p: InvoiceListParams) =>
         },
         signal,
       ),
+    placeholderData: keepPreviousData,
+    staleTime: STALE,
+  })
+
+/** Batched invoice lookup (`/invoices?id=1,2,3`), see customersByIdsQuery. */
+export const invoicesByIdsQuery = (ids: readonly number[]) =>
+  queryOptions({
+    queryKey: keys.invoices.byIds(ids),
+    queryFn: ({ signal }) => api.get<Page<Invoice>>('/invoices', { id: [...ids], limit: ids.length }, signal),
+    select: indexById,
+    enabled: ids.length > 0,
     placeholderData: keepPreviousData,
     staleTime: STALE,
   })
@@ -310,13 +347,6 @@ export const resourcePage = <T>(resource: string, params: QueryParams) =>
     queryKey: [resource, 'page', params] as const,
     queryFn: ({ signal }) => api.get<Page<T>>(`/${resource}`, params, signal),
     placeholderData: keepPreviousData,
-    staleTime: STALE,
-  })
-
-export const resourceItem = <T>(resource: string, id: number | string) =>
-  queryOptions({
-    queryKey: [resource, 'item', id] as const,
-    queryFn: ({ signal }) => api.get<T>(`/${resource}/${id}`, undefined, signal),
     staleTime: STALE,
   })
 

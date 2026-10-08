@@ -1,19 +1,20 @@
-import { noop, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { noop, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import { INVOICE_STATUSES, type Customer, type Invoice } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Badge, ChipFilter, PageHeader, Stat } from '../components/ui'
 import { date, money, number } from '../lib/format'
 import { useMarkInvoicePaid } from '../lib/mutations'
-import { customerQuery, invoicesListQuery, type InvoiceListParams } from '../lib/queries'
+import { customersByIdsQuery, distinctIds, invoicesListQuery, type InvoiceListParams } from '../lib/queries'
 import { formatSort, parseSort } from '../lib/search'
 import { invoicesRoute } from '../router'
 import { useCan } from '../lib/auth'
 
 const col = createColumnHelper<ServerFeatures, Invoice>()
 const EMPTY: Invoice[] = []
+const NO_CUSTOMERS = new Map<number, Customer>()
 
 export function InvoicesPage() {
   const search = invoicesRoute.useSearch()
@@ -24,17 +25,10 @@ export function InvoicesPage() {
   const canPay = useCan().can('billing:write')
   const rows = query.data?.data ?? EMPTY
 
-  // The invoice API only returns customerId. To show the company name we fan
-  // out one request per distinct customer on the page and stitch them together
-  // client-side (useQueries + combine). Cached per customer, but still N calls.
-  const customerIds = useMemo(() => [...new Set(rows.map((r) => r.customerId))], [rows])
-  const customers = useQueries({
-    queries: customerIds.map((id) => ({ ...customerQuery(id), staleTime: 5 * 60_000 })),
-    combine: useCallback(
-      (results: Array<{ data?: Customer }>) => new Map(results.flatMap((r) => (r.data ? [[r.data.id, r.data] as const] : []))),
-      [],
-    ),
-  })
+  // The invoice API only returns customerId: fetch the page's customers in one
+  // batched request (`?id=1,2,3`) and join them client-side.
+  const customerIds = useMemo(() => distinctIds(rows.map((r) => r.customerId)), [rows])
+  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(customerIds))
 
   const setSearch = (patch: Partial<InvoiceListParams>, resetPage = true) =>
     navigate({ search: (prev) => ({ ...prev, ...patch, ...(resetPage ? { page: 1 } : {}) }), replace: true })
@@ -87,7 +81,7 @@ export function InvoicesPage() {
       <div className="mb-4 grid gap-4 sm:grid-cols-3">
         <Stat label="Matching invoices" value={number(query.data?.total ?? 0)} />
         <Stat label="This page total" value={money(pageTotal)} hint="Totals for all matches need another endpoint" />
-        <Stat label="Customer lookups on this page" value={customerIds.length} hint="One request per distinct customer" />
+        <Stat label="Customers on this page" value={customerIds.length} hint="Joined client-side with one batched request" />
       </div>
       <DataTable
         testId="invoices-table"

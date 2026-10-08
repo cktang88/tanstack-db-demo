@@ -1,7 +1,7 @@
-import { useQuery, useQueries, useSuspenseQuery } from '@tanstack/react-query'
+import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
-import { useCallback, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { PAYMENT_METHODS, type Customer, type Invoice, type Payment } from '../../shared/domain'
 import { GroupedBars, HBarChart, RevenueChart } from '../components/charts'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
@@ -9,7 +9,14 @@ import { Badge, Card, ChipFilter, PageHeader, Stat } from '../components/ui'
 import { useCan } from '../lib/auth'
 import { date, money, moneyCompact, month, number } from '../lib/format'
 import { useRunJob } from '../lib/mutations'
-import { arAgingQuery, customerQuery, mrrSnapshotsQuery, resourceItem, resourcePage } from '../lib/queries'
+import {
+  arAgingQuery,
+  customersByIdsQuery,
+  distinctIds,
+  invoicesByIdsQuery,
+  mrrSnapshotsQuery,
+  resourcePage,
+} from '../lib/queries'
 
 const BUCKETS = ['current', '1-30', '31-60', '60+']
 
@@ -97,6 +104,8 @@ export function BillingPage() {
 
 const col = createColumnHelper<ServerFeatures, Payment>()
 const EMPTY: Payment[] = []
+const NO_INVOICES = new Map<number, Invoice>()
+const NO_CUSTOMERS = new Map<number, Customer>()
 
 function PaymentLedger() {
   const [page, setPage] = useState({ pageIndex: 0, pageSize: 10 })
@@ -110,23 +119,11 @@ function PaymentLedger() {
     }),
   )
   const rows = query.data?.data ?? EMPTY
-  // classic N+1: the ledger only has ids, so fetch each invoice and customer on the page
-  const invoiceIds = [...new Set(rows.map((r) => r.invoiceId))]
-  const customerIds = [...new Set(rows.map((r) => r.customerId))]
-  const invoices = useQueries({
-    queries: invoiceIds.map((id) => resourceItem<Invoice>('invoices', id)),
-    combine: useCallback(
-      (rs: Array<{ data?: Invoice }>) => new Map(rs.flatMap((r) => (r.data ? [[r.data.id, r.data] as const] : []))),
-      [],
-    ),
-  })
-  const customers = useQueries({
-    queries: customerIds.map((id) => ({ ...customerQuery(id), retry: false })),
-    combine: useCallback(
-      (rs: Array<{ data?: Customer }>) => new Map(rs.flatMap((r) => (r.data ? [[r.data.id, r.data] as const] : []))),
-      [],
-    ),
-  })
+  // the ledger only has ids: one batched request each for the page's invoices and customers
+  const invoiceIds = useMemo(() => distinctIds(rows.map((r) => r.invoiceId)), [rows])
+  const customerIds = useMemo(() => distinctIds(rows.map((r) => r.customerId)), [rows])
+  const { data: invoices = NO_INVOICES } = useQuery(invoicesByIdsQuery(invoiceIds))
+  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(customerIds))
   const columns = useMemo(
     () =>
       col.columns([
@@ -182,7 +179,7 @@ function PaymentLedger() {
         <div className="flex items-center gap-3">
           <span className="text-sm font-semibold">Payment ledger</span>
           <span className="text-xs text-zinc-500">
-            append-only · {invoiceIds.length + customerIds.length} lookups for this page
+            append-only · {invoiceIds.length} invoices, {customerIds.length} customers joined
           </span>
           <ChipFilter
             label="Method"
