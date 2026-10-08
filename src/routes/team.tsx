@@ -1,5 +1,5 @@
 import { caseWhen, count, eq, sum, toArray, useLiveQuery, type Transaction } from '@tanstack/react-db'
-import { Activity, useState } from 'react'
+import { Activity, useEffect, useState } from 'react'
 import { ROLES, type Role } from '../../shared/domain'
 import { Avatar, Badge, Card, Empty, PageHeader, Segmented } from '../components/ui'
 import { stageReassignment } from '../db/actions'
@@ -16,9 +16,22 @@ import { useCan } from '../lib/auth'
 import { date, titleCase } from '../lib/format'
 import { toast } from '../lib/toast'
 
+type Draft = { tx: Transaction; count: number }
+
 export function TeamPage() {
   const [tab, setTab] = useState<'members' | 'teams' | 'roles' | 'workload'>('members')
   const [selected, setSelected] = useState<number | null>(null)
+  // The staged reassignment lives here, not in <Rebalance>: that panel sits in
+  // an <Activity>, whose hidden mode runs effect cleanups. Leaving the page
+  // with a preview open rolls it back instead of leaving phantom assignments
+  // in the local store until reload.
+  const [draft, setDraft] = useState<Draft | null>(null)
+  useEffect(() => {
+    if (!draft) return
+    return () => {
+      if (draft.tx.state === 'pending') draft.tx.rollback()
+    }
+  }, [draft])
   return (
     <>
       <PageHeader
@@ -51,7 +64,7 @@ export function TeamPage() {
         <RolesMatrix />
       </Activity>
       <Activity mode={tab === 'workload' ? 'visible' : 'hidden'}>
-        <Workload />
+        <Workload draft={draft} setDraft={setDraft} />
       </Activity>
     </>
   )
@@ -59,7 +72,10 @@ export function TeamPage() {
 
 function Members({ selected, onSelect }: { selected: number | null; onSelect: (id: number) => void }) {
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
-  const canManage = useCan().can('team:manage')
+  const { can, me } = useCan()
+  const canManage = can('team:manage')
+  // only an owner can make someone an owner
+  const meOwner = me.user.role === 'owner'
   return (
     <Card title={`${users.length} members`}>
       <ul className="divide-y divide-zinc-100 dark:divide-zinc-800" data-testid="member-list">
@@ -84,7 +100,8 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
               className="input w-28"
               aria-label={`Role for ${u.name}`}
               value={u.role}
-              disabled={u.role === 'owner' || !canManage}
+              // owners can't be demoted here, and nobody changes their own role
+              disabled={u.role === 'owner' || u.id === me.user.id || !canManage}
               onChange={(e) =>
                 usersCollection
                   .update(u.id, (d) => void (d.role = e.target.value as Role))
@@ -92,7 +109,7 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
                   .catch((err: Error) => toast.error('Could not update teammate — rolled back', err.message))
               }
             >
-              {ROLES.map((r) => (
+              {ROLES.filter((r) => r !== 'owner' || meOwner || u.role === 'owner').map((r) => (
                 <option key={r} value={r}>
                   {titleCase(r)}
                 </option>
@@ -140,7 +157,7 @@ function MemberTasks({ userId }: { userId: number | null }) {
   )
 }
 
-function Workload() {
+function Workload({ draft, setDraft }: { draft: Draft | null; setDraft: (d: Draft | null) => void }) {
   // users ⨝ (tasks GROUP BY assignee) — the old app needed a dedicated /metrics/workload endpoint.
   const { data } = useLiveQuery({
     query: (q) => {
@@ -162,7 +179,9 @@ function Workload() {
     },
   })
   const max = Math.max(1, ...data.map((d) => (d.open ?? 0) + (d.done ?? 0)))
-  const canWrite = useCan().can('projects:write')
+  const { can, privileged } = useCan()
+  // reassigning across every project needs owner/admin (members may only edit their teams' projects)
+  const canRebalance = can('projects:write') && privileged
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <Card title="Open vs done tasks per member">
@@ -181,7 +200,7 @@ function Workload() {
           ))}
         </ul>
       </Card>
-      {canWrite && <Rebalance users={data} />}
+      {canRebalance && <Rebalance users={data} draft={draft} setDraft={setDraft} />}
     </div>
   )
 }
@@ -191,10 +210,17 @@ function Workload() {
  * is previewed live in the workload chart above, then saved atomically or
  * discarded with rollback().
  */
-function Rebalance({ users }: { users: Array<{ userId: number; name: string; open?: number }> }) {
+function Rebalance({
+  users,
+  draft,
+  setDraft,
+}: {
+  users: Array<{ userId: number; name: string; open?: number }>
+  draft: Draft | null
+  setDraft: (d: Draft | null) => void
+}) {
   const [from, setFrom] = useState<number | ''>('')
   const [to, setTo] = useState<number | ''>('')
-  const [draft, setDraft] = useState<{ tx: Transaction; count: number } | null>(null)
 
   const preview = () => {
     if (from === '' || to === '' || from === to) return
