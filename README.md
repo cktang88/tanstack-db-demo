@@ -262,14 +262,68 @@ Against `data/big.db` (production build, local API, owner): Overview MRR and the
 - A subset's rows are removed **as soon as nothing holds the subset** (`cleanupQueryInternal`). If a window had already
   shown such a row from local state while its own request was in flight, the ordered loader treats the removal as an
   ordering change and repairs with a **full-source load** — the where-only, unbounded request
-  (`OrderedSourceLoader.invalidateSourceOrdering` / `loadFullSource`, db `ordered-source-loader.ts`). Windows the user
-  moves are therefore kept alive 10 s after they are left (`WINDOW = { gcTime }`, also making "back" instant), and the
-  windows are never aborted mid-flight (an aborted acquisition counts as failed and is repaired the same way). An e2e
-  test walks every page and fails on any unbounded read of a big table.
+  (`OrderedSourceLoader.invalidateSourceOrdering` / `loadFullSource`, db `ordered-source-loader.ts`). This is not
+  limited to one table's paging: leaving a customer's page for Billing released their payments while the ledger window
+  (which had shown them) was loading, and the ledger came up empty (the guard refused the unbounded payments read).
+  Every live query over an on-demand collection is therefore kept alive 10 s after it is left
+  (`WINDOW = { gcTime }`, also making "back" instant), and windows are never aborted mid-flight (an aborted
+  acquisition counts as failed and is repaired the same way). Collection-level `gcTime` does not help: without
+  persistence the subset's rows are deleted on release regardless. An e2e test walks every page and fails on any
+  unbounded read of a big table.
+- The two above compound: a held query is still an _active_ subset, so it is re-read after every direct write too. A
+  3 s hold cut the journey's requests by a fifth but lost the race again (the fallback loaded every overdue invoice,
+  2.7 MB); 10 s never did in our runs. There is no "keep the rows, but stop refreshing them" mode.
 - Inner joins drive from whichever side has fewer rows _loaded_ (`getActiveAndLazySources`, db `joins.ts`), which can
   be the 250k-row on-demand side; queries that must drive from a small local collection use a left join.
 - A cursor boundary on a string sort is only pushed down with `stringSort: 'lexical'` (`canExpressCursorOrder`, db
   `utils/cursor.ts`); on-demand collections set it as their `defaultStringCollation`.
 
 `scripts/journey.mjs` replays the same 18-step signed-in user journey against either branch and reports requests/latency
-(`BASE=http://localhost:4173 node scripts/journey.mjs`).
+(`BASE=http://localhost:4173 node scripts/journey.mjs`; `RESET=0 LATENCY=0` against a big database you want to keep).
+
+### The journey on the big database
+
+`data/big.db` (250k customers, ~13M rows), production builds, both clients against their own copy of the database,
+`RESET=0 LATENCY=150`, median of 3 runs. Both are correct (same KPIs, counts and rows) and neither reads a big table
+whole; the difference is how much they refetch.
+
+| step                                   | Query (main) ms |    req |      kB | DB (this PR) ms |     req |       kB |
+| -------------------------------------- | --------------: | -----: | ------: | --------------: | ------: | -------: |
+| cold load /                            |            1370 |     16 |      23 |            1369 |      14 |      409 |
+| open Customers                         |             294 |      2 |      14 |             368 |       2 |        7 |
+| filter status=Active                   |             661 |      2 |      14 |             338 |       2 |        7 |
+| search "Labs"                          |             546 |      2 |      13 |             919 |       2 |        7 |
+| next page                              |              69 |      2 |       7 |             644 |       1 |       13 |
+| sort by MRR                            |             248 |      2 |      14 |             579 |       1 |        7 |
+| open customer detail                   |             532 |     11 |      10 |             839 |      14 |       14 |
+| edit seats (+5) -> MRR shown           |             380 |      8 |       9 |             228 |      23 |        9 |
+| back to Overview (KPIs reflect edit)   |              95 |      7 |       8 |            3919 |       8 |      110 |
+| Invoices: filter Overdue               |             332 |      4 |      18 |             590 |       4 |       18 |
+| mark first invoice paid                |              53 |      4 |      12 |             771 |      31 |       47 |
+| customer: expand invoice               |             424 |     10 |       3 |             900 |      16 |       37 |
+| toggle a tag (many-to-many)            |             394 |      3 |       1 |              57 |       3 |        1 |
+| Billing (MRR rollup, AR aging, ledger) |             827 |      5 |      11 |            1535 |      13 |       32 |
+| Projects -> board                      |             537 |      5 |     287 |             627 |       1 |      381 |
+| move a task right                      |              64 |      5 |       4 |              57 |       4 |        9 |
+| Team page                              |              79 |      0 |       0 |             251 |       2 |        7 |
+| Teams tab: add a member                |             250 |      5 |      13 |             116 |       3 |        0 |
+| **total**                              |        **7155** | **93** | **461** |       **14107** | **144** | **1115** |
+
+What it shows, honestly:
+
+- The first version of this branch loaded every table whole and won on the small demo database (4.7 s / 47 requests
+  vs 6.2 s / 94: filter, sort, search and page cost zero requests). It was silently wrong at scale (a 10,000-row
+  sample). With the big tables on-demand, which correctness requires, it is slower than `main` on the small database
+  too (median of 5: 7.4 s / 146 requests / 662 kB vs 5.7 s / 94 / 243 kB) and about 2x slower on the big one.
+- **Writes are where it costs.** "Back to Overview" right after a seat edit took 3.9 s: the SSE echoes of the edit
+  (customer, subscription, audit, event rows) are direct writes, each makes the customers/invoices/events collections
+  re-read every active window (the ones on screen _and_ the ones held for 10 s, e.g. the 1.1 s `?q=labs&limit=50`
+  search page), and SQLite serves them one at a time. TanStack Query only refetches what is mounted; held queries
+  are inactive there.
+- Paging and sorting are slower because TanStack DB counts offsets over local rows: page 2 is `limit=50`, not
+  `offset=25&limit=25`.
+- Cold load is heavier (409 kB) because the eager small tables (tasks, time entries) load whole; it is still bounded.
+- Where the data is bounded (tags, tasks, teams) the DB branch is still the faster and simpler one.
+
+The SQL work that made both usable at this size (indexes, FTS5, the revenue rollup) is in **Scale: millions of rows**
+above and is the same on both branches.
