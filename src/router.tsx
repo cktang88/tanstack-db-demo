@@ -80,7 +80,8 @@ const requires =
       throw new HttpError(403, { error: 'Forbidden', message: `You need the "${permission}" permission to view this page` })
   }
 
-// Loaders use `ensureQueryData` so navigations render instantly from cache and
+// Loaders use `queryClient.query()` (5.102+, replaces the deprecated ensureQueryData/fetchQuery)
+// so navigations render instantly from cache and
 // data starts loading in parallel with the route's JS, not in a useEffect waterfall.
 const overviewRoute = createRoute({
   getParentRoute: () => appRoute,
