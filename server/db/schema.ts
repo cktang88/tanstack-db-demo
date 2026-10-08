@@ -1,4 +1,6 @@
 import Database from 'better-sqlite3'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 export type DB = Database.Database
 
@@ -407,6 +409,8 @@ WHERE c.deleted_at IS NULL;
 `
 
 export function openDatabase(file: string): DB {
+  // a fresh checkout (e.g. CI) has no ./data directory yet; SQLite won't create it
+  if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true })
   const db = new Database(file)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
