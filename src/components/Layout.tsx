@@ -3,10 +3,11 @@ import { useIsFetching, useIsMutating, useQuery, useQueryClient } from '@tanstac
 import { useEffect, useRef, useState } from 'react'
 import type { Permission } from '../../shared/domain'
 import { useCan, useLogout } from '../lib/auth'
-import { relative } from '../lib/format'
+import { createCustomerAlerts } from '../lib/alerts'
+import { number, relative } from '../lib/format'
 import { startLiveUpdates } from '../lib/live'
 import { useMarkNotificationsRead } from '../lib/mutations'
-import { notificationsQuery } from '../lib/queries'
+import { notificationsQuery, rowCountQuery } from '../lib/queries'
 import { useSettings } from '../lib/settings'
 import { Avatar, Badge, cx, Spinner, Toaster } from './ui'
 
@@ -122,10 +123,54 @@ function GlobalStatus() {
   )
 }
 
-/** Server-sent change feed for the signed-in user; reopened when the user changes. */
+/** Live row counts: `limit=0` totals, kept fresh by the change feed's invalidations. */
+const COUNTED = [
+  ['customers', 'customers:read'],
+  ['invoices', 'billing:read'],
+  ['tasks', 'projects:read'],
+  ['projects', 'projects:read'],
+  ['users', undefined],
+] as const satisfies ReadonlyArray<readonly [Parameters<typeof rowCountQuery>[0], Permission | undefined]>
+
+function DbStats() {
+  const { can } = useCan()
+  return (
+    <dl className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5" data-testid="db-stats">
+      {COUNTED.map(([name, permission]) => (
+        <RowCount key={name} name={name} enabled={!permission || can(permission)} />
+      ))}
+    </dl>
+  )
+}
+
+function RowCount({ name, enabled }: { name: (typeof COUNTED)[number][0]; enabled: boolean }) {
+  const { data, isPending, isError } = useQuery({ ...rowCountQuery(name), enabled })
+  return (
+    <>
+      <dt>{name}</dt>
+      <dd className="text-right tabular-nums">
+        {!enabled || isError ? '—' : isPending ? <Spinner className="size-2.5" /> : number(data)}
+      </dd>
+    </>
+  )
+}
+
+/**
+ * Server-sent change feed for the signed-in user; reopened when the user changes.
+ * Live alerts (a customer churned / became a $20k+ account) compare the rows it
+ * pushes, and our own customer mutations' results, with what we had cached.
+ */
 function useLiveUpdates(userId: number) {
   const qc = useQueryClient()
-  useEffect(() => startLiveUpdates(qc), [qc, userId])
+  useEffect(() => {
+    const alerts = createCustomerAlerts(qc)
+    const stopAlerts = alerts.watchMutations()
+    const stopLive = startLiveUpdates(qc, { onChange: alerts.onChange })
+    return () => {
+      stopLive()
+      stopAlerts()
+    }
+  }, [qc, userId])
 }
 
 export function Layout() {
@@ -154,8 +199,11 @@ export function Layout() {
             </Link>
           ))}
         </nav>
-        <div className="mt-auto mb-14 px-2 text-[11px] leading-relaxed text-zinc-400">
-          Data layer: <b>TanStack Query</b>
+        <div className="mt-auto mb-14 space-y-2 px-2 text-[11px] leading-relaxed text-zinc-400">
+          <div>
+            Data layer: <b>TanStack Query</b>
+          </div>
+          <DbStats />
         </div>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">

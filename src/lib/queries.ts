@@ -25,9 +25,11 @@ import type {
   Invoice,
   OverviewMetrics,
   Page,
+  Plan,
   Project,
   RevenuePoint,
   SignupPoint,
+  SummedPage,
   Task,
   User,
 } from '../../shared/domain'
@@ -75,7 +77,7 @@ export const keys = {
     overview: () => [...keys.metrics.all, 'overview'] as const,
     revenue: (months: number) => [...keys.metrics.all, 'revenue', months] as const,
     signups: (months: number) => [...keys.metrics.all, 'signups', months] as const,
-    breakdown: (by: string) => [...keys.metrics.all, 'breakdown', by] as const,
+    breakdown: (by: string, plan?: string) => [...keys.metrics.all, 'breakdown', by, ...(plan ? [plan] : [])] as const,
     workload: () => [...keys.metrics.all, 'workload'] as const,
   },
 }
@@ -126,9 +128,10 @@ export const customersListQuery = (p: CustomerListParams) =>
   queryOptions({
     queryKey: keys.customers.list(p),
     queryFn: ({ signal }) =>
-      api.get<Page<Customer>>(
+      api.get<SummedPage<Customer, 'mrr'>>(
         '/customers',
         {
+          sum: 'mrr', // total MRR over every match, not just this page
           page: p.page,
           pageSize: p.pageSize,
           sort: p.sort,
@@ -188,9 +191,10 @@ export const invoicesListQuery = (p: InvoiceListParams) =>
   queryOptions({
     queryKey: keys.invoices.list(p),
     queryFn: ({ signal }) =>
-      api.get<Page<Invoice>>(
+      api.get<SummedPage<Invoice, 'amount'>>(
         '/invoices',
         {
+          sum: 'amount', // total over every match, not just this page
           page: p.page,
           pageSize: p.pageSize,
           sort: p.sort,
@@ -312,10 +316,10 @@ export const signupsQuery = (months: number) =>
     staleTime: STALE,
   })
 
-export const breakdownQuery = (by: 'plan' | 'country' | 'status') =>
+export const breakdownQuery = (by: 'plan' | 'country' | 'status', plan?: Plan) =>
   queryOptions({
-    queryKey: keys.metrics.breakdown(by),
-    queryFn: ({ signal }) => api.get<BreakdownPoint[]>('/metrics/breakdown', { by }, signal),
+    queryKey: keys.metrics.breakdown(by, plan),
+    queryFn: ({ signal }) => api.get<BreakdownPoint[]>('/metrics/breakdown', { by, plan }, signal),
     staleTime: STALE,
   })
 
@@ -402,3 +406,15 @@ export const notificationsQuery = () =>
 
 export const sessionsQuery = () =>
   resourceList<{ id: number; userId: number; createdAt: string; expiresAt: string; userAgent: string | null }>('sessions')
+
+// ----------------------------------------------------------------------------
+// Row counts (sidebar stats): `limit=0` returns just the total. Keyed under
+// the resource so the SSE feed / mutations invalidate them with everything else.
+// ----------------------------------------------------------------------------
+export const rowCountQuery = (resource: 'customers' | 'invoices' | 'tasks' | 'projects' | 'users') =>
+  queryOptions({
+    queryKey: [resource, 'count'] as const,
+    queryFn: ({ signal }) => api.get<Page<never>>(`/${resource}`, { limit: 0 }, signal),
+    select: (p) => p.total,
+    staleTime: STALE,
+  })

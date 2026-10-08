@@ -7,12 +7,21 @@ import { ENTITIES, invalidateEntities, isEntity, mutating, type Entity } from '.
 
 const MAX_BACKOFF = 30_000
 
+/** A change message as the server streams it. */
+export interface LiveChange {
+  kind: 'upsert' | 'delete' | 'reset'
+  entity?: string
+  row?: unknown
+  id?: number
+}
+
 /**
  * Open the change feed for the signed-in user. Call it from an effect keyed on
  * the user id and return the cleanup, so the stream follows sign-in/out and
- * user switches.
+ * user switches. `onChange` sees every message (e.g. to compare a pushed row
+ * with the cached one, see alerts.ts) before it is turned into invalidations.
  */
-export function startLiveUpdates(qc: QueryClient) {
+export function startLiveUpdates(qc: QueryClient, opts: { onChange?: (msg: LiveChange) => void } = {}) {
   if (typeof EventSource === 'undefined') return () => {}
   let source: EventSource | undefined
   let stopped = false
@@ -31,7 +40,12 @@ export function startLiveUpdates(qc: QueryClient) {
   }
 
   const onChange = (e: MessageEvent<string>) => {
-    const msg = JSON.parse(e.data) as { kind: string; entity?: string }
+    const msg = JSON.parse(e.data) as LiveChange
+    try {
+      opts.onChange?.(msg)
+    } catch (err) {
+      console.error(err) // a listener must never break cache invalidation
+    }
     if (msg.kind === 'reset') {
       void qc.invalidateQueries()
       return
