@@ -53,6 +53,7 @@ export function CustomerDetailPage() {
   const { customerId } = customerDetailRoute.useParams()
   // Suspense-friendly live query; a join gives us the owner in the same row.
   const { data } = useLiveSuspenseQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ c: customersCollection })
@@ -231,6 +232,7 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
   // On-demand: pushed down as customerId[eq]=… (a customer has a few dozen invoices at most);
   // the open-invoice total below is covered by the same load (subset dedupe), no extra request.
   const { data: invoices } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ i: invoicesCollection })
@@ -238,6 +240,7 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
         .orderBy(({ i }) => i.issuedAt, 'desc'),
   })
   const { data: totals } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ i: invoicesCollection })
@@ -352,6 +355,7 @@ function CustomerActivity({ customerId }: { customerId: number }) {
 /** Status + health: health comes from a SQL view (on-demand, one row pushed down by customerId). */
 function HealthStat({ customerId, status }: { customerId: number; status: string }) {
   const { data: health } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ h: customerHealthCollection })
@@ -382,6 +386,7 @@ function HealthStat({ customerId, status }: { customerId: number; status: string
  */
 function BalanceStat({ customerId }: { customerId: number }) {
   const { data: invoiced } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ i: invoicesCollection })
@@ -390,6 +395,7 @@ function BalanceStat({ customerId }: { customerId: number }) {
         .select(({ i }) => ({ status: i.status, amount: sum(i.amount) })),
   })
   const { data: partial } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ p: paymentsCollection })
@@ -415,6 +421,7 @@ function BalanceStat({ customerId }: { customerId: number }) {
 function Subscriptions({ customerId, churned, seats }: { customerId: number; churned: boolean; seats: number }) {
   const { can } = useCan()
   const { data: subs } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ s: subscriptionsCollection })
@@ -487,6 +494,7 @@ function Subscriptions({ customerId, churned, seats }: { customerId: number; chu
 
 function Contacts({ customerId, editable }: { customerId: number; editable: boolean }) {
   const { data: contacts } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ c: contactsCollection })
@@ -584,6 +592,7 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
 function Tags({ customerId, editable }: { customerId: number; editable: boolean }) {
   // many-to-many: tags LEFT JOIN customer_tags (for this customer) -> "applied" flag per tag
   const { data: tags } = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
       const mine = q.from({ ct: customerTagsCollection }).where(({ ct }) => eq(ct.customerId, customerId))
       return q
@@ -630,6 +639,7 @@ function Tags({ customerId, editable }: { customerId: number; editable: boolean 
 function Usage({ customerId }: { customerId: number }) {
   // on-demand: pushes customerId[eq]=…&metric[eq]=api_calls&sort=day
   const { data, isLoading } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ u: usageDailyCollection })
@@ -654,6 +664,7 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceRow }) {
   const { me, can } = useCan()
   // both on-demand: immutable line items and the append-only ledger, fetched for this invoice only
   const { data: lines } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ l: lineItemsCollection })
@@ -661,6 +672,7 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceRow }) {
         .orderBy(({ l }) => l.id),
   })
   const { data: payments } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ p: paymentsCollection })

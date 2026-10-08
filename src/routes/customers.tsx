@@ -149,6 +149,7 @@ export function CustomersPage() {
   // (`id[in]=…`). (An inner join lets TanStack DB pick the side with fewer *loaded* rows as the
   // driver, which can be the 250k-row on-demand collection.) count/sum skip unmatched rows.
   const { data: selectionSummary, isReady: selectionLoaded } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ s: selectionCollection })

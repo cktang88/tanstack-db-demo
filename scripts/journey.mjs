@@ -1,5 +1,6 @@
 // Scripted user journey used for the Query-vs-DB comparison in the PR.
 //   BASE=http://localhost:5173 node scripts/journey.mjs
+//   RESET=0 LATENCY=0 BASE=… node scripts/journey.mjs   (against a big database, keep its data)
 import { chromium } from '@playwright/test'
 const base = process.env.BASE ?? 'http://localhost:5173'
 const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? '/opt/pw-browsers/chromium' })
@@ -7,8 +8,9 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
 // the session cookie set here is shared with the page
 const login = await page.request.post(`${base}/api/auth/login`, { data: { email: 'owner@saasly.dev', password: 'password' } })
 if (!login.ok()) throw new Error(`login failed: ${login.status()}`)
-await page.request.post(`${base}/api/dev/reset`, { data: {} })
-await page.request.put(`${base}/api/dev/chaos`, { data: { latencyMs: 150, failRate: 0 } })
+// RESET=0 keeps the current data (e.g. a big database from `pnpm db:big` — reset re-seeds the small one)
+if (process.env.RESET !== '0') await page.request.post(`${base}/api/dev/reset`, { data: {} })
+await page.request.put(`${base}/api/dev/chaos`, { data: { latencyMs: Number(process.env.LATENCY ?? 150), failRate: 0 } })
 
 let reqs = []
 let bytes = 0
@@ -139,13 +141,16 @@ await step('Projects -> board', async () => {
   await page.getByTestId('task-card').first().waitFor()
 })
 await step('move a task right', async () => {
-  const col = page.getByTestId('column-in_progress').getByTestId('column-count')
-  const before = await col.textContent()
-  await page.getByTestId('column-todo').getByTestId('task-card').first().getByLabel('Move right').click()
-  await page.waitForFunction(
-    (b) => document.querySelector('[data-testid=column-in_progress] [data-testid=column-count]').textContent !== b,
-    before,
-  )
+  // the first column that still has a task (repeated RESET=0 runs drain "todo")
+  const [from, to] = await page.evaluate(() => {
+    const cols = ['todo', 'in_progress', 'review', 'done']
+    const i = cols.findIndex((c) => document.querySelector(`[data-testid=column-${c}] [data-testid=task-card]`))
+    return [cols[i], cols[i + 1]]
+  })
+  const sel = `[data-testid=column-${to}] [data-testid=column-count]`
+  const before = await page.locator(sel).textContent()
+  await page.getByTestId(`column-${from}`).getByTestId('task-card').first().getByLabel('Move right').click()
+  await page.waitForFunction(([sel, b]) => document.querySelector(sel).textContent !== b, [sel, before])
 })
 await step('Team page', async () => {
   await nav('Team')

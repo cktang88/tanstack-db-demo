@@ -236,6 +236,7 @@ function PinnedAccounts() {
   // Pins live in localStorage; only the pinned customers and their open invoices are loaded
   // (?id[in]=… and ?customerId[in]=…&status[in]=open,overdue), then joined with the pins locally.
   const { data = [] } = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
       if (!ids.length) return undefined
       const openByCustomer = q

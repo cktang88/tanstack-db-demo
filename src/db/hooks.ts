@@ -41,13 +41,21 @@ export function useWindow<T>(result: { data: T[] | undefined; isReady: boolean }
 }
 
 /**
- * Live-query options for an on-demand window that the user moves (filters,
- * sort, paging). The previous window stays subscribed for a few seconds after
- * the UI moved on, so the rows the next window already shows from local state
- * are not garbage-collected from under it before its own request lands: the
- * query collection drops a subset's rows as soon as nothing holds it, and
- * TanStack DB treats the removal of rows a window already showed as an
- * ordering change it can only repair by loading every match (a where-only,
- * unbounded request). It also makes going back to a window instant.
+ * Live-query options for EVERY live query over an on-demand collection. A
+ * query stays subscribed for a few seconds after the UI moved on (another
+ * window, another page), so rows that the next query already shows from local
+ * state are not garbage-collected from under it before its own request lands:
+ * the query collection drops a subset's rows as soon as nothing holds it, and
+ * TanStack DB treats the removal of rows an ordered window already showed as
+ * an ordering change it can only repair by loading every match (a where-only,
+ * unbounded request). Navigating from a customer's page to the billing ledger
+ * hits exactly that (their payments are in both), so this is not only for list
+ * windows. It also makes going back instant.
+ *
+ * The cost: a held query is still an *active* subset, and every direct write
+ * into an on-demand collection (persist, the SSE feed) makes query-db-collection
+ * re-read all of its active subsets, held ones included. A shorter hold (3 s)
+ * cut that work by a fifth but lost the race again on the big database (the
+ * fallback loaded every overdue invoice, 2.7 MB), so correctness wins here.
  */
 export const WINDOW = { gcTime: 10_000 } as const
