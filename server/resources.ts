@@ -74,6 +74,9 @@ const n = (sql: string) => ({ sql, type: 'number' as const })
 const t = (sql: string) => ({ sql, type: 'text' as const })
 const b = (sql: string) => ({ sql, type: 'bool' as const })
 
+/** rows of archived (soft-deleted) customers are history: kept, but not served */
+const liveCustomer = (): ScopeSql => ({ sql: 'customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)', params: [] })
+
 const own =
   (column: string) =>
   (me: Principal): ScopeSql => ({ sql: `${column} = ?`, params: [me.user.id] })
@@ -304,6 +307,7 @@ export const resources: Record<string, Resource> = {
     update: 'customers:write',
     remove: 'customers:write',
     mode: 'crud',
+    scope: liveCustomer,
     writable: {
       id: 'id',
       customerId: 'customer_id',
@@ -350,6 +354,7 @@ export const resources: Record<string, Resource> = {
     create: 'customers:write',
     remove: 'customers:write',
     mode: 'crud',
+    scope: liveCustomer,
     writable: { customerId: 'customer_id', tagId: 'tag_id', taggedAt: 'tagged_at' },
     createSchema: S.CustomerTagInput,
     defaults: () => ({ taggedAt: new Date().toISOString() }),
@@ -412,6 +417,7 @@ export const resources: Record<string, Resource> = {
     create: 'billing:write',
     update: 'billing:write',
     mode: 'crud', // create/update via business logic in handlers.ts
+    scope: liveCustomer,
   },
   invoices: {
     name: 'invoices',
@@ -433,7 +439,7 @@ export const resources: Record<string, Resource> = {
     read: 'billing:read',
     update: 'billing:write',
     mode: 'crud', // status transitions via business logic in handlers.ts
-    scope: () => ({ sql: 'customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)', params: [] }),
+    scope: liveCustomer,
   },
   'invoice-line-items': {
     name: 'invoice-line-items',
@@ -473,6 +479,7 @@ export const resources: Record<string, Resource> = {
     read: 'billing:read',
     create: 'billing:write',
     mode: 'append-only', // ledger: corrections are new rows, never edits (create via handlers.ts)
+    scope: liveCustomer,
   },
   'customer-balances': {
     name: 'customer-balances',
@@ -491,6 +498,7 @@ export const resources: Record<string, Resource> = {
     defaultSort: '-outstanding',
     read: 'billing:read',
     mode: 'read-only', // rollup maintained by triggers
+    scope: liveCustomer,
   },
   'mrr-movements': {
     name: 'mrr-movements',
@@ -700,6 +708,7 @@ export const resources: Record<string, Resource> = {
     read: 'usage:read',
     create: 'usage:write',
     mode: 'append-only',
+    scope: liveCustomer,
     writable: {
       id: 'id',
       customerId: 'customer_id',
@@ -726,6 +735,7 @@ export const resources: Record<string, Resource> = {
     defaultSort: 'day',
     read: 'usage:read',
     mode: 'read-only', // rollup maintained by trigger
+    scope: liveCustomer,
   },
   'customer-health': {
     name: 'customer-health',
