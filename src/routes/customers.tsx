@@ -199,10 +199,7 @@ export function CustomersPage() {
     if (gone.length) selectionCollection.delete(gone)
     const skipped = ids.length - ok.length
     if (skipped)
-      toast.info(
-        `Skipped ${skipped} customer${skipped === 1 ? '' : 's'}`,
-        'Not found any more, or not yours to change',
-      )
+      toast.info(`Skipped ${skipped} customer${skipped === 1 ? '' : 's'}`, 'Not found any more, or not yours to change')
     return ok
   }
 
