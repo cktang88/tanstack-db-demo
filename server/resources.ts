@@ -39,6 +39,11 @@ export interface Resource {
    * so a page can be ordered by owner name without exposing a new column.
    */
   virtual?: Columns
+  /**
+   * Index-backed replacement for the `q` search (same matches as LIKE '%term%' over
+   * `search`); used for terms of 3+ characters, which the trigram index can answer.
+   */
+  fullText?: (term: string) => ScopeSql
   /** numeric fields a list may total over all matching rows (`?sum=`) */
   summable?: string[]
   defaultSort?: string
@@ -83,7 +88,15 @@ const t = (sql: string) => ({ sql, type: 'text' as const })
 const b = (sql: string) => ({ sql, type: 'bool' as const })
 
 /** rows of archived (soft-deleted) customers are history: kept, but not served */
-const liveCustomer = (): ScopeSql => ({ sql: 'customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)', params: [] })
+// Archived customers are the small set (partial index idx_customers_archived), so child rows are
+// hidden with NOT IN over them — `IN (every live customer)` would list 250k ids on every query.
+const liveCustomer = (): ScopeSql => ({
+  sql: 'customer_id NOT IN (SELECT id FROM customers WHERE deleted_at IS NOT NULL)',
+  params: [],
+})
+/** a full-text phrase for the trigram index: matches like LIKE '%term%' (case-insensitive) */
+const ftsPhrase = (term: string) => `"${term.replaceAll('"', '""')}"`
+const likeAny = (term: string) => `%${term.replace(/[\\%_]/g, (m) => `\\${m}`)}%`
 
 const own =
   (column: string) =>
@@ -284,6 +297,12 @@ export const resources: Record<string, Resource> = {
     },
     virtual: { owner: t('(SELECT users.name FROM users WHERE users.id = customers.owner_id)') },
     search: ['name', 'email', 'company', 'owner'],
+    // same matches as the LIKE search, answered by the trigram index + the (small) users table
+    fullText: (term) => ({
+      sql: `(customers.id IN (SELECT rowid FROM customers_fts WHERE customers_fts MATCH ?)
+             OR customers.owner_id IN (SELECT id FROM users WHERE name LIKE ? ESCAPE '\\'))`,
+      params: [ftsPhrase(term), likeAny(term)],
+    }),
     summable: ['mrr', 'seats'],
     defaultSort: '-createdAt',
     read: 'customers:read',
@@ -446,6 +465,10 @@ export const resources: Record<string, Resource> = {
     },
     virtual: { customer: t('(SELECT customers.company FROM customers WHERE customers.id = invoices.customer_id)') },
     search: ['number', 'customer'],
+    fullText: (term) => ({
+      sql: `(number LIKE ? ESCAPE '\\' OR customer_id IN (SELECT rowid FROM customers_fts WHERE customers_fts MATCH ?))`,
+      params: [likeAny(term), ftsPhrase(term)],
+    }),
     summable: ['amount'],
     defaultSort: '-issuedAt',
     read: 'billing:read',

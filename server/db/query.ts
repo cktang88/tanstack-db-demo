@@ -37,7 +37,10 @@ const sumColumns = (r: Resource, fields: string[]) =>
   })
 
 export function listRows<T>(db: DB, r: Resource, p: ListParams, scope?: ScopeSql): Page<T> & { sums?: Record<string, number> } {
-  const where = andScope(buildWhere(r.columns, p.filters, { term: p.search, fields: r.search ?? [] }, r.virtual), scope)
+  const where = andScope(
+    buildWhere(r.columns, p.filters, { term: p.search, fields: r.search ?? [], fullText: r.fullText }, r.virtual),
+    scope,
+  )
   const sorts = p.sorts.length
     ? p.sorts
     : r.defaultSort

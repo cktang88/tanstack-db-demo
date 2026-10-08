@@ -13,6 +13,7 @@ import type { DB } from './schema.ts'
 // (what a "classic" API offers for dashboards).
 
 const LIVE = 'deleted_at IS NULL'
+const ARCHIVED = 'SELECT id FROM customers WHERE deleted_at IS NOT NULL'
 
 export const events = {
   page: (db: DB, cursor: number | null, limit: number, type?: string): CursorPage<ActivityEvent> => {
@@ -57,9 +58,10 @@ export const metrics = {
       .get() as { mrr: number; active: number; trial: number; churned: number; total: number }
     const inv = db
       .prepare(
+        // archived customers are the small set: exclude them instead of joining every live one
         `SELECT COALESCE(SUM(b.outstanding), 0) AS outstanding,
-                (SELECT COUNT(*) FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE i.status = 'overdue' AND c.${LIVE}) AS overdue
-         FROM customer_balances b JOIN customers c ON c.id = b.customer_id WHERE c.${LIVE}`,
+                (SELECT COUNT(*) FROM invoices i WHERE i.status = 'overdue' AND i.customer_id NOT IN (${ARCHIVED})) AS overdue
+         FROM customer_balances b WHERE b.customer_id NOT IN (${ARCHIVED})`,
       )
       .get() as { outstanding: number; overdue: number }
     const t = db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE status != 'done'`).get() as { n: number }
@@ -80,17 +82,18 @@ export const metrics = {
     (
       db
         .prepare(
-          `SELECT substr(received_at, 1, 7) AS month, SUM(amount) AS revenue, COUNT(DISTINCT invoice_id) AS invoices
-           FROM payments WHERE substr(received_at, 1, 7) < strftime('%Y-%m', 'now')
-           GROUP BY month ORDER BY month DESC LIMIT ?`,
+          // complete months only, from the trigger-maintained rollup (not a GROUP BY over every payment)
+          `SELECT month, revenue, invoices FROM revenue_monthly
+           WHERE month >= substr(date('now', 'start of month', ?), 1, 7) AND month < strftime('%Y-%m', 'now')
+           ORDER BY month DESC`,
         )
-        .all(months) as RevenuePoint[]
+        .all(`-${months} months`) as RevenuePoint[]
     ).reverse(),
   signups: (db: DB, months: number): SignupPoint[] =>
     db
       .prepare(
         `SELECT substr(created_at, 1, 7) AS month, plan, COUNT(*) AS count FROM customers
-         WHERE ${LIVE} AND substr(created_at, 1, 7) >= (SELECT substr(date('now', ?), 1, 7))
+         WHERE ${LIVE} AND created_at >= date('now', 'start of month', ?)
          GROUP BY month, plan ORDER BY month`,
       )
       .all(`-${months - 1} months`) as SignupPoint[],
