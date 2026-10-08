@@ -1,31 +1,63 @@
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { and, caseWhen, count, eq, ilike, inArray, not, sum, toArray, useLiveQuery } from '@tanstack/react-db'
 import { Link } from '@tanstack/react-router'
-import { useDeferredValue, useMemo, useState } from 'react'
+import { useState } from 'react'
 import { PROJECT_STATUSES, type ProjectStatus } from '../../shared/domain'
 import { Avatar, Badge, ChipFilter, Empty, PageHeader } from '../components/ui'
+import { projectsCollection, tasksCollection, usersCollection } from '../db/collections'
 import { date } from '../lib/format'
-import { projectsQuery, usersQuery } from '../lib/queries'
 
 export function ProjectsPage() {
-  const { data: projects } = useSuspenseQuery(projectsQuery())
-  const { data: users = [] } = useQuery(usersQuery())
   const [q, setQ] = useState('')
   const [status, setStatus] = useState<ProjectStatus[]>([])
-  const deferredQ = useDeferredValue(q)
 
-  const filtered = useMemo(
-    () =>
-      projects.filter(
-        (p) =>
-          (!deferredQ || p.name.toLowerCase().includes(deferredQ.toLowerCase())) &&
-          (status.length === 0 || status.includes(p.status)),
-      ),
-    [projects, deferredQ, status],
-  )
+  // One live query: projects ⨝ owner ⨝ (tasks GROUP BY project) + a nested
+  // "next up" list per project via `includes`. Progress bars move the instant a
+  // task is moved on any board — no project re-fetch, no invalidation.
+  const { data: projects } = useLiveQuery({
+    query: (qb) => {
+      const progress = qb
+        .from({ t: tasksCollection })
+        .groupBy(({ t }) => t.projectId)
+        .select(({ t }) => ({
+          projectId: t.projectId,
+          total: count(t.id),
+          done: sum(caseWhen(eq(t.status, 'done'), 1, 0)),
+        }))
+      let base = qb
+        .from({ p: projectsCollection })
+        .leftJoin({ u: usersCollection }, ({ p, u }) => eq(p.ownerId, u.id))
+        .leftJoin({ s: progress }, ({ p, s }) => eq(p.id, s.projectId))
+      if (q || status.length)
+        base = base.where(({ p }) =>
+          q && status.length
+            ? and(ilike(p.name, `%${q}%`), inArray(p.status, status))
+            : q
+              ? ilike(p.name, `%${q}%`)
+              : inArray(p.status, status),
+        )
+      return base
+        .orderBy(({ p }) => p.name)
+        .select(({ p, u, s }) => ({
+          ...p,
+          ownerName: u?.name,
+          ownerColor: u?.avatarColor,
+          total: s?.total,
+          done: s?.done,
+          nextUp: toArray(
+            qb
+              .from({ t: tasksCollection })
+              .where(({ t }) => and(eq(t.projectId, p.id), not(eq(t.status, 'done'))))
+              .orderBy(({ t }) => t.position)
+              .limit(3)
+              .select(({ t }) => ({ id: t.id, title: t.title, priority: t.priority })),
+          ),
+        }))
+    },
+  })
 
   return (
     <>
-      <PageHeader title="Projects" description={`${projects.length} delivery projects across your accounts.`} />
+      <PageHeader title="Projects" description={`${projects.length} delivery projects — progress computed live from tasks.`} />
       <div className="mb-4 flex flex-wrap items-center gap-4">
         <input
           className="input max-w-xs"
@@ -36,13 +68,14 @@ export function ProjectsPage() {
         />
         <ChipFilter label="Status" options={PROJECT_STATUSES} value={status} onChange={setStatus} />
       </div>
-      {filtered.length === 0 ? (
+      {projects.length === 0 ? (
         <Empty>No projects match.</Empty>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3" data-testid="project-grid">
-          {filtered.map((p) => {
-            const owner = users.find((u) => u.id === p.ownerId)
-            const pct = p.taskCount ? Math.round((p.doneCount / p.taskCount) * 100) : 0
+          {projects.map((p) => {
+            const total = p.total ?? 0
+            const done = p.done ?? 0
+            const pct = total ? Math.round((done / total) * 100) : 0
             return (
               <Link
                 key={p.id}
@@ -56,16 +89,24 @@ export function ProjectsPage() {
                   <Badge value={p.status} />
                 </div>
                 <p className="mt-1 line-clamp-2 text-sm text-zinc-500">{p.description}</p>
+                <ul className="mt-3 space-y-1 text-xs text-zinc-600 dark:text-zinc-400">
+                  {p.nextUp.map((t) => (
+                    <li key={t.id} className="flex items-center justify-between gap-2">
+                      <span className="truncate">→ {t.title}</span>
+                      <Badge value={t.priority} />
+                    </li>
+                  ))}
+                </ul>
                 <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
-                  <div className="h-full rounded-full bg-brand-500" style={{ width: `${pct}%` }} />
+                  <div className="h-full rounded-full bg-brand-500 transition-all" style={{ width: `${pct}%` }} />
                 </div>
                 <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
                   <span data-testid="project-progress">
-                    {p.doneCount}/{p.taskCount} tasks · {pct}%
+                    {done}/{total} tasks · {pct}%
                   </span>
                   <span className="flex items-center gap-2">
                     {date(p.createdAt)}
-                    {owner && <Avatar name={owner.name} color={owner.avatarColor} size={20} />}
+                    {p.ownerName && <Avatar name={p.ownerName} color={p.ownerColor} size={20} />}
                   </span>
                 </div>
               </Link>

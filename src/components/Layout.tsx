@@ -1,6 +1,16 @@
+import { count, gt, useLiveQuery, useLiveQueryEffect, eq } from '@tanstack/react-db'
 import { Link, Outlet, useRouterState } from '@tanstack/react-router'
-import { useIsFetching, useIsMutating } from '@tanstack/react-query'
-import { useSettings } from '../lib/settings'
+import {
+  customersCollection,
+  invoicesCollection,
+  projectsCollection,
+  tasksCollection,
+  usersCollection,
+  type CustomerRow,
+} from '../db/collections'
+import { usePrefs } from '../db/hooks'
+import { money, number } from '../lib/format'
+import { toast } from '../lib/toast'
 import { cx, Spinner, Toaster } from './ui'
 
 const NAV = [
@@ -14,24 +24,64 @@ const NAV = [
   { to: '/settings', label: 'Settings', icon: '⚙' },
 ] as const
 
-function GlobalStatus() {
-  const fetching = useIsFetching()
-  const mutating = useIsMutating()
-  const loading = useRouterState({ select: (s) => s.status === 'pending' })
+/** Live row counts of the local database — these are reactive queries too. */
+function DbStats() {
+  const sizes = [
+    ['customers', customersCollection],
+    ['invoices', invoicesCollection],
+    ['tasks', tasksCollection],
+    ['projects', projectsCollection],
+    ['users', usersCollection],
+  ] as const
   return (
-    <div className="flex items-center gap-3 text-xs text-zinc-500" data-testid="global-status">
-      {(fetching > 0 || loading) && (
-        <span className="flex items-center gap-1.5">
-          <Spinner className="size-3" /> syncing {fetching > 0 ? `(${fetching})` : ''}
-        </span>
-      )}
-      {mutating > 0 && <span className="text-amber-600">saving {mutating}…</span>}
-    </div>
+    <dl className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5" data-testid="db-stats">
+      {sizes.map(([name, c]) => (
+        <CollectionSize key={name} name={name} collection={c} />
+      ))}
+    </dl>
   )
 }
 
+function CollectionSize({ name, collection }: { name: string; collection: unknown }) {
+  const { data, isReady } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ r: collection as typeof tasksCollection })
+        .select(({ r }) => ({ n: count(r.id) }))
+        .findOne(),
+  })
+  return (
+    <>
+      <dt>{name}</dt>
+      <dd className="text-right tabular-nums">{isReady ? number(data?.n ?? 0) : <Spinner className="size-2.5" />}</dd>
+    </>
+  )
+}
+
+/** Reactive alerts: fire when rows *enter* a query result, whoever changed them (this tab, another tab, the server). */
+function LiveAlerts() {
+  useLiveQueryEffect<CustomerRow, number>(
+    {
+      query: (q) => q.from({ c: customersCollection }).where(({ c }) => eq(c.status, 'churned')),
+      skipInitial: true,
+      onEnter: ({ value }) => void toast.info(`⚠ ${value.company} churned`, 'Detected by a live query effect'),
+    },
+    [],
+  )
+  useLiveQueryEffect<CustomerRow, number>(
+    {
+      query: (q) => q.from({ c: customersCollection }).where(({ c }) => gt(c.mrr, 2_000_000)),
+      skipInitial: true,
+      onEnter: ({ value }) => void toast.success(`🎉 ${value.company} is now a $20k+ MRR account`, money(value.mrr)),
+    },
+    [],
+  )
+  return null
+}
+
 export function Layout() {
-  const [settings, setSettings] = useSettings()
+  const [prefs] = usePrefs()
+  const loading = useRouterState({ select: (s) => s.status === 'pending' })
   return (
     <div className="flex min-h-screen">
       <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-zinc-200 bg-white px-3 py-4 md:flex dark:border-zinc-800 dark:bg-zinc-900">
@@ -53,8 +103,11 @@ export function Layout() {
             </Link>
           ))}
         </nav>
-        <div className="mt-auto mb-14 px-2 text-[11px] leading-relaxed text-zinc-400">
-          Data layer: <b>TanStack Query</b>
+        <div className="mt-auto mb-14 space-y-2 px-2 text-[11px] leading-relaxed text-zinc-400">
+          <div>
+            Data layer: <b>TanStack DB</b>
+          </div>
+          <DbStats />
         </div>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
@@ -66,20 +119,34 @@ export function Layout() {
               </Link>
             ))}
           </nav>
-          <GlobalStatus />
-          <button
-            className="btn-ghost ml-auto"
-            aria-label="Toggle theme"
-            onClick={() => setSettings({ theme: settings.theme === 'dark' ? 'light' : 'dark' })}
-          >
-            {settings.theme === 'dark' ? '☀' : '☾'}
-          </button>
+          <div className="text-xs text-zinc-500" data-testid="global-status">
+            {loading && (
+              <span className="flex items-center gap-1.5">
+                <Spinner className="size-3" /> loading
+              </span>
+            )}
+          </div>
+          <ThemeToggle />
         </header>
-        <main className={cx('mx-auto w-full flex-1 px-6 py-6', settings.compact ? 'max-w-[1600px]' : 'max-w-7xl')}>
+        <main className={cx('mx-auto w-full flex-1 px-6 py-6', prefs.compact ? 'max-w-[1600px]' : 'max-w-7xl')}>
           <Outlet />
         </main>
       </div>
+      <LiveAlerts />
       <Toaster />
     </div>
+  )
+}
+
+function ThemeToggle() {
+  const [prefs, update] = usePrefs()
+  return (
+    <button
+      className="btn-ghost ml-auto"
+      aria-label="Toggle theme"
+      onClick={() => update({ theme: prefs.theme === 'dark' ? 'light' : 'dark' })}
+    >
+      {prefs.theme === 'dark' ? '☀' : '☾'}
+    </button>
   )
 }

@@ -1,9 +1,9 @@
-import { useQuery } from '@tanstack/react-query'
+import { useLiveQuery } from '@tanstack/react-db'
 import { useActionState } from 'react'
 import { useFormStatus } from 'react-dom'
 import { COUNTRIES, CUSTOMER_STATUSES, PLANS, type Customer } from '../../shared/domain'
 import { titleCase } from '../lib/format'
-import { usersQuery } from '../lib/queries'
+import { usersCollection } from '../db/collections'
 import { decodeCustomerForm, type CustomerFormValues } from '../lib/validation'
 
 interface Props {
@@ -26,7 +26,7 @@ function SubmitButton({ label }: { label: string }) {
 }
 
 export function CustomerForm({ initial, submitLabel, onSubmit, onDone }: Props) {
-  const { data: users = [] } = useQuery(usersQuery())
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
   const [state, action] = useActionState<State, FormData>(
     async (_prev, form) => {
       const raw = Object.fromEntries(form) as Record<string, string>

@@ -1,104 +1,194 @@
-import { noop, useQuery, useQueryClient } from '@tanstack/react-query'
+import { and, count, eq, ilike, inArray, or, sum, useLiveQuery, type InitialQueryBuilder } from '@tanstack/react-db'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { createColumnHelper } from '@tanstack/react-table'
-import { useEffect, useMemo, useState } from 'react'
-import { COUNTRIES, CUSTOMER_STATUSES, PLANS, type Customer, type User } from '../../shared/domain'
+import { createColumnHelper, type RowSelectionState } from '@tanstack/react-table'
+import { useMemo, useState } from 'react'
+import { COUNTRIES, CUSTOMER_STATUSES, PLANS } from '../../shared/domain'
 import { CustomerForm } from '../components/CustomerForm'
 import { DataTable, selectColumn, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, ChipFilter, Dialog, PageHeader } from '../components/ui'
-import { date, money } from '../lib/format'
-import { useBulkUpdateCustomers, useCreateCustomer, useDeleteCustomers } from '../lib/mutations'
-import { customerQuery, customersListQuery, usersQuery, type CustomerListParams } from '../lib/queries'
-import { formatSort, parseSort } from '../lib/search'
+import { createCustomer, deleteCustomers, updateCustomers } from '../db/actions'
+import { customersCollection, selectionCollection, usersCollection } from '../db/collections'
+import { date, money, number } from '../lib/format'
+import { formatSort, parseSort, type CustomerListParams } from '../lib/search'
+import { toast } from '../lib/toast'
 import { customersRoute } from '../router'
 
-const col = createColumnHelper<ServerFeatures, Customer>()
-const EMPTY: Customer[] = []
+const like = (s: string) => `%${s}%`
 
-function useColumns(users: User[]) {
-  return useMemo(() => {
-    const byId = new Map(users.map((u) => [u.id, u]))
-    return col.columns([
-      selectColumn<Customer>(),
-      col.accessor('company', {
-        header: 'Company',
-        cell: (info) => (
-          <Link
-            to="/customers/$customerId"
-            params={{ customerId: info.row.original.id }}
-            className="font-medium hover:text-brand-600"
-            preload="intent"
-          >
-            {info.getValue()}
-          </Link>
-        ),
-      }),
-      col.accessor('name', {
-        header: 'Contact',
-        cell: (info) => (
-          <div>
-            <div>{info.getValue()}</div>
-            <div className="text-xs text-zinc-500">{info.row.original.email}</div>
-          </div>
-        ),
-      }),
-      col.accessor('plan', { header: 'Plan', cell: (i) => <Badge value={i.getValue()} /> }),
-      col.accessor('status', { header: 'Status', cell: (i) => <Badge value={i.getValue()} /> }),
-      col.accessor('country', { header: 'Country' }),
-      col.accessor('seats', { header: 'Seats', cell: (i) => <span className="tabular-nums">{i.getValue()}</span> }),
-      col.accessor('mrr', { header: 'MRR', cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span> }),
-      col.accessor('ownerId', {
-        header: 'Owner',
-        cell: (i) => {
-          const u = i.getValue() ? byId.get(i.getValue()!) : undefined
-          return u ? (
-            <span className="flex items-center gap-2">
-              <Avatar name={u.name} color={u.avatarColor} size={22} />
-              {u.name}
-            </span>
-          ) : (
-            <span className="text-zinc-400">—</span>
-          )
-        },
-      }),
-      col.accessor('createdAt', { header: 'Created', cell: (i) => date(i.getValue()) }),
-    ])
-  }, [users])
+/** Filters that only touch customer columns. */
+function customerFilters(s: CustomerListParams) {
+  return (c: any) =>
+    [
+      s.status ? inArray(c.status, s.status) : undefined,
+      s.plan ? inArray(c.plan, s.plan) : undefined,
+      s.country ? inArray(c.country, s.country) : undefined,
+      s.ownerId ? eq(c.ownerId, s.ownerId) : undefined,
+    ].filter((p) => p !== undefined)
 }
+const allOf = (parts: any[]) => (parts.length === 1 ? parts[0] : and(parts[0], parts[1], ...parts.slice(2)))
+
+/** customers ⨝ owner, filtered — needed when searching or sorting by the owner's name. */
+function joinedThenFiltered(q: InitialQueryBuilder, s: CustomerListParams) {
+  const base = q.from({ c: customersCollection }).leftJoin({ u: usersCollection }, ({ c, u }) => eq(c.ownerId, u.id))
+  const parts = (c: any, u: any) =>
+    [
+      ...customerFilters(s)(c),
+      // search spans the customer AND the joined owner — something the REST API couldn't do
+      s.q
+        ? or(ilike(c.name, like(s.q)), ilike(c.email, like(s.q)), ilike(c.company, like(s.q)), ilike(u?.name, like(s.q)))
+        : undefined,
+    ].filter((p) => p !== undefined)
+  if (!s.status && !s.plan && !s.country && !s.ownerId && !s.q) return base
+  return base.where(({ c, u }) => allOf(parts(c, u)))
+}
+
+/** customers only, filtered — cheaper when the owner isn't involved in filtering/sorting. */
+function filteredOnly(q: InitialQueryBuilder, s: CustomerListParams) {
+  const base = q.from({ c: customersCollection })
+  if (!s.status && !s.plan && !s.country && !s.ownerId) return base
+  return base.where(({ c }) => allOf(customerFilters(s)(c)))
+}
+
+const SORTABLE = new Set(['company', 'name', 'plan', 'status', 'country', 'seats', 'mrr', 'createdAt', 'owner'])
+
+function useCustomerRows(s: CustomerListParams) {
+  const [sort] = parseSort(s.sort)
+  const field = sort && SORTABLE.has(sort.id) ? sort.id : 'createdAt'
+  const direction = sort?.desc === false ? 'asc' : 'desc'
+  const joinFirst = field === 'owner' || !!s.q
+
+  // Path A: join first, because the filter/sort needs the owner (sorting by a joined column!).
+  const joined = useLiveQuery({
+    query: (q) =>
+      joinFirst
+        ? joinedThenFiltered(q, s)
+            .orderBy(({ c, u }) => (field === 'owner' ? u?.name : c[field as 'company']), { direction, nulls: 'last' })
+            .orderBy(({ c }) => c.id)
+            .limit(s.pageSize)
+            .offset((s.page - 1) * s.pageSize)
+            .select(({ c, u }) => ({ ...c, ownerName: u?.name, ownerColor: u?.avatarColor }))
+        : undefined, // disabled query
+  })
+  // Path B: page the customers first (index-backed orderBy+limit), then join just the visible rows.
+  const paged = useLiveQuery({
+    query: (q) => {
+      if (joinFirst) return undefined
+      const page = filteredOnly(q, s)
+        .orderBy(({ c }) => c[field as 'company'], { direction, nulls: 'last' })
+        .orderBy(({ c }) => c.id)
+        .limit(s.pageSize)
+        .offset((s.page - 1) * s.pageSize)
+      return q
+        .from({ c: page })
+        .leftJoin({ u: usersCollection }, ({ c, u }) => eq(c.ownerId, u.id))
+        .orderBy(({ c }) => c[field as 'company'], { direction, nulls: 'last' })
+        .orderBy(({ c }) => c.id)
+        .select(({ c, u }) => ({ ...c, ownerName: u?.name, ownerColor: u?.avatarColor }))
+    },
+  })
+  const total = useLiveQuery({
+    query: (q) =>
+      (s.q ? joinedThenFiltered(q, s) : filteredOnly(q, s)).select(({ c }) => ({ n: count(c.id), mrr: sum(c.mrr) })).findOne(),
+  })
+  const rows = (joinFirst ? joined.data : paged.data) ?? []
+  return { rows, total: total.data?.n ?? 0, totalMrr: total.data?.mrr ?? 0 }
+}
+
+type Row = ReturnType<typeof useCustomerRows>['rows'][number]
+const col = createColumnHelper<ServerFeatures, Row>()
+
+const columns = col.columns([
+  selectColumn<Row>(),
+  col.accessor('company', {
+    header: 'Company',
+    cell: (info) => (
+      <Link
+        to="/customers/$customerId"
+        params={{ customerId: info.row.original.id }}
+        className="font-medium hover:text-brand-600"
+      >
+        {info.getValue()}
+      </Link>
+    ),
+  }),
+  col.accessor('name', {
+    header: 'Contact',
+    cell: (info) => (
+      <div>
+        <div>{info.getValue()}</div>
+        <div className="text-xs text-zinc-500">{info.row.original.email}</div>
+      </div>
+    ),
+  }),
+  col.accessor('plan', { header: 'Plan', cell: (i) => <Badge value={i.getValue()} /> }),
+  col.accessor('status', { header: 'Status', cell: (i) => <Badge value={i.getValue()} /> }),
+  col.accessor('country', { header: 'Country' }),
+  col.accessor('seats', { header: 'Seats', cell: (i) => <span className="tabular-nums">{i.getValue()}</span> }),
+  col.accessor('mrr', { header: 'MRR', cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span> }),
+  col.accessor('ownerName', {
+    id: 'owner',
+    header: 'Owner',
+    cell: (i) =>
+      i.getValue() ? (
+        <span className="flex items-center gap-2">
+          <Avatar name={i.getValue()!} color={i.row.original.ownerColor} size={22} />
+          {i.getValue()}
+        </span>
+      ) : (
+        <span className="text-zinc-400">—</span>
+      ),
+  }),
+  col.accessor('createdAt', { header: 'Created', cell: (i) => date(i.getValue()) }),
+  col.display({
+    id: 'sync',
+    header: '',
+    enableHiding: false,
+    cell: ({ row }) =>
+      (row.original as { $hasPendingWrites?: boolean }).$hasPendingWrites ? (
+        <span className="text-xs text-amber-600" title="Optimistic change not yet confirmed by the server">
+          saving…
+        </span>
+      ) : null,
+  }),
+])
 
 export function CustomersPage() {
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
-  const qc = useQueryClient()
-  const { data: users = [] } = useQuery(usersQuery())
-  const query = useQuery(customersListQuery(search))
-  const columns = useColumns(users)
+  const { rows, total, totalMrr } = useCustomerRows(search)
   const [creating, setCreating] = useState(false)
-  const create = useCreateCustomer()
-  const bulk = useBulkUpdateCustomers()
-  const del = useDeleteCustomers()
+
+  // Selection lives in a local-only collection: it survives paging & filtering,
+  // and can be joined with customers for a live summary.
+  const { data: selected } = useLiveQuery({ query: (q) => q.from({ s: selectionCollection }) })
+  const rowSelection = useMemo<RowSelectionState>(() => Object.fromEntries(selected.map((s) => [String(s.id), true])), [selected])
+  const { data: selectionSummary } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ s: selectionCollection })
+        .innerJoin({ c: customersCollection }, ({ s, c }) => eq(s.id, c.id))
+        .select(({ c }) => ({ n: count(c.id), mrr: sum(c.mrr) }))
+        .findOne(),
+  })
 
   const setSearch = (patch: Partial<CustomerListParams>, resetPage = true) =>
     navigate({ search: (prev) => ({ ...prev, ...patch, ...(resetPage ? { page: 1 } : {}) }), replace: true })
 
-  // Prefetch the next page so paging forward is instant.
-  const pageCount = query.data?.pageCount ?? 1
-  useEffect(() => {
-    if (search.page < pageCount) void qc.query(customersListQuery({ ...search, page: search.page + 1 })).catch(noop)
-  }, [qc, search, pageCount])
-
-  // Debounced search box that writes to the URL.
-  const [q, setQ] = useState(search.q ?? '')
-  useEffect(() => {
-    const t = setTimeout(() => q !== (search.q ?? '') && setSearch({ q: q || undefined }), 250)
-    return () => clearTimeout(t)
-  }, [q])
+  const onRowSelectionChange = (next: RowSelectionState) => {
+    const add = Object.keys(next).filter((k) => next[k] && !rowSelection[k])
+    const remove = Object.keys(rowSelection).filter((k) => !next[k])
+    if (add.length) selectionCollection.insert(add.map((id) => ({ id: Number(id) })))
+    if (remove.length) selectionCollection.delete(remove.map(Number))
+  }
+  const clearSelection = () => {
+    if (selected.length) selectionCollection.delete(selected.map((s) => s.id))
+  }
 
   return (
     <>
       <PageHeader
         title="Customers"
-        description="Server-side pagination, sorting and filtering — every interaction is a new API request."
+        description={`${number(total)} matching · ${money(totalMrr)} MRR — filtering, sorting & paging run locally, no requests.`}
         actions={
           <button className="btn-primary" onClick={() => setCreating(true)}>
             + New customer
@@ -108,22 +198,25 @@ export function CustomersPage() {
       <DataTable
         testId="customers-table"
         columns={columns}
-        data={query.data?.data ?? EMPTY}
-        rowCount={query.data?.total ?? 0}
-        isFetching={query.isFetching}
-        isPlaceholder={query.isPlaceholderData}
+        data={rows}
+        rowCount={total}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
         onSortingChange={(s) => setSearch({ sort: formatSort(s) })}
-        onRowHover={(c) => void qc.query(customerQuery(c.id)).catch(noop)}
+        rowSelection={rowSelection}
+        onRowSelectionChange={onRowSelectionChange}
+        rowClassName={(r) =>
+          (r as { $hasPendingWrites?: boolean }).$hasPendingWrites ? 'bg-amber-50/50 dark:bg-amber-500/5' : undefined
+        }
         toolbar={
           <div className="flex flex-wrap items-center gap-3">
+            {/* no debounce needed: each keystroke re-runs an in-memory query */}
             <input
               className="input w-64"
-              placeholder="Search name, email, company…"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search name, email, company, owner…"
+              value={search.q ?? ''}
+              onChange={(e) => setSearch({ q: e.target.value || undefined })}
               aria-label="Search customers"
             />
             <ChipFilter
@@ -142,37 +235,34 @@ export function CustomersPage() {
               className="input w-28"
               aria-label="Country"
               value={search.country?.[0] ?? ''}
-              onChange={(e) =>
-                setSearch({ country: e.target.value ? [e.target.value as (typeof COUNTRIES)[number]] : undefined })
-              }
+              onChange={(e) => setSearch({ country: e.target.value ? [e.target.value] : undefined })}
             >
               <option value="">Country</option>
               {COUNTRIES.map((c) => (
                 <option key={c}>{c}</option>
               ))}
             </select>
-            <select
-              className="input w-40"
-              aria-label="Owner"
-              value={search.ownerId ?? ''}
-              onChange={(e) => setSearch({ ownerId: e.target.value ? Number(e.target.value) : undefined })}
-            >
-              <option value="">Any owner</option>
-              {users.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name}
-                </option>
-              ))}
-            </select>
+            <OwnerFilter value={search.ownerId} onChange={(ownerId) => setSearch({ ownerId })} />
           </div>
         }
-        bulkActions={(ids, clear) => (
+        bulkActions={(ids) => (
           <>
+            <span className="text-zinc-500" data-testid="selection-summary">
+              ({number(selectionSummary?.n ?? 0)} across all pages · {money(selectionSummary?.mrr ?? 0)} MRR)
+            </span>
             {CUSTOMER_STATUSES.map((s) => (
               <button
                 key={s}
                 className="btn-secondary py-1 text-xs"
-                onClick={() => bulk.mutate({ ids, patch: { status: s } }, { onSuccess: clear })}
+                onClick={() => {
+                  // one transaction for N rows -> one atomic /api/batch request
+                  const tx = updateCustomers(ids, { status: s })
+                  tx.when('settled').then(
+                    () => toast.success(`Updated ${ids.length} customers`),
+                    (e: Error) => toast.error('Bulk update failed — rolled back', e.message),
+                  )
+                  clearSelection()
+                }}
               >
                 Mark {s}
               </button>
@@ -180,17 +270,57 @@ export function CustomersPage() {
             <button
               className="btn-danger py-1 text-xs"
               onClick={() => {
-                if (confirm(`Delete ${ids.length} customers?`)) del.mutate(ids, { onSuccess: clear })
+                if (!confirm(`Delete ${ids.length} customers?`)) return
+                deleteCustomers(ids)
+                  .when('settled')
+                  .then(
+                    () => toast.success(`Deleted ${ids.length} customer${ids.length === 1 ? '' : 's'}`),
+                    (e: Error) => toast.error('Delete failed — rows restored', e.message),
+                  )
               }}
             >
               Delete
+            </button>
+            <button className="btn-ghost py-1 text-xs" onClick={clearSelection}>
+              Clear
             </button>
           </>
         )}
       />
       <Dialog open={creating} onClose={() => setCreating(false)} title="New customer">
-        <CustomerForm submitLabel="Create customer" onSubmit={(v) => create.mutateAsync(v)} onDone={() => setCreating(false)} />
+        <CustomerForm
+          submitLabel="Create customer"
+          onSubmit={async (values) => {
+            // the row is inserted locally with its final id and appears immediately…
+            const { tx } = createCustomer(values)
+            setCreating(false)
+            // …the server confirmation (or rollback) happens in the background
+            tx.when('settled').then(
+              () => toast.success('Customer created', values.company),
+              (e: Error) => toast.error('Could not create customer — removed', e.message),
+            )
+          }}
+        />
       </Dialog>
     </>
+  )
+}
+
+function OwnerFilter({ value, onChange }: { value?: number; onChange: (v?: number) => void }) {
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  return (
+    <select
+      className="input w-40"
+      aria-label="Owner"
+      value={value ?? ''}
+      onChange={(e) => onChange(e.target.value ? Number(e.target.value) : undefined)}
+    >
+      <option value="">Any owner</option>
+      {users.map((u) => (
+        <option key={u.id} value={u.id}>
+          {u.name}
+        </option>
+      ))}
+    </select>
   )
 }

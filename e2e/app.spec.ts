@@ -223,9 +223,10 @@ test.describe('team, activity, settings', () => {
     const row = page.getByTestId('member-row').nth(3)
     const select = row.getByRole('combobox')
     const next = (await select.inputValue()) === 'viewer' ? 'admin' : 'viewer'
+    const saved = page.waitForResponse((r) => r.request().method() !== 'GET' && /\/api\/(users|batch)/.test(r.url()))
     await select.selectOption(next)
     await expect(select).toHaveValue(next)
-    await page.waitForResponse((r) => r.url().includes('/api/users') && r.request().method() === 'GET')
+    await saved
     await page.reload()
     await expect(page.getByTestId('member-row').nth(3).getByRole('combobox')).toHaveValue(next)
 

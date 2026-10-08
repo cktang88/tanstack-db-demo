@@ -1,6 +1,27 @@
 import { CUSTOMER_STATUSES, INVOICE_STATUSES, PLANS, COUNTRIES } from '../../shared/domain'
 import type { SearchSchemaInput } from '@tanstack/react-router'
-import type { CustomerListParams, InvoiceListParams } from './queries'
+
+export interface CustomerListParams {
+  page: number
+  pageSize: number
+  sort?: string
+  q?: string
+  status?: string[]
+  plan?: string[]
+  country?: string[]
+  ownerId?: number
+}
+
+export interface InvoiceListParams {
+  page: number
+  pageSize: number
+  sort?: string
+  q?: string
+  status?: string[]
+  customerId?: number
+  issuedFrom?: string
+  issuedTo?: string
+}
 
 type Input<T> = { [K in keyof T]?: unknown } & SearchSchemaInput
 

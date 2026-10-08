@@ -83,6 +83,22 @@ export const UserPatch = Schema.Struct({
   active: Schema.optionalKey(Schema.Boolean),
 })
 
+export const BATCH_ENTITIES = ['customers', 'invoices', 'projects', 'tasks', 'users'] as const
+export type BatchEntity = (typeof BATCH_ENTITIES)[number]
+
+/** Atomic multi-entity write: all ops commit in one SQLite transaction or none do. */
+export const BatchRequest = Schema.Struct({
+  ops: Schema.Array(
+    Schema.Struct({
+      entity: Schema.Literals(BATCH_ENTITIES),
+      op: Schema.Literals(['insert', 'update', 'delete']),
+      id: Schema.optionalKey(Id),
+      data: Schema.optionalKey(Schema.Unknown),
+    }),
+  ).check(Schema.isMinLength(1), Schema.isMaxLength(1000)),
+})
+export type BatchOp = (typeof BatchRequest.Type)['ops'][number]
+
 export const ChaosConfig = Schema.Struct({
   latencyMs: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 10_000 })),
   failRate: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),

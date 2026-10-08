@@ -173,3 +173,54 @@ describe('chaos mode', () => {
     await dispose()
   })
 })
+
+describe('batch API', () => {
+  it('applies multi-entity ops atomically', async () => {
+    const r = await req<{ results: Array<{ entity: string; op: string; id: number; row?: any }> }>('POST', '/batch', {
+      ops: [
+        { entity: 'customers', op: 'insert', data: { ...newCustomer, id: 777_001 } },
+        { entity: 'customers', op: 'update', id: 777_001, data: { seats: 20 } },
+        {
+          entity: 'tasks',
+          op: 'insert',
+          data: {
+            id: 777_002,
+            projectId: 1,
+            title: 'Batch task',
+            status: 'todo',
+            priority: 'low',
+            assigneeId: null,
+            dueDate: null,
+          },
+        },
+      ],
+    })
+    expect(r.status).toBe(200)
+    expect(r.body.results.map((x) => `${x.entity}.${x.op}`)).toEqual(['customers.insert', 'customers.update', 'tasks.insert'])
+    expect(r.body.results[1]!.row.mrr).toBe(4900 * 20)
+  })
+
+  it('rolls back everything when one op fails', async () => {
+    const before = (await req<Page<Customer>>('GET', '/customers?limit=1')).body.total
+    const r = await req('POST', '/batch', {
+      ops: [
+        { entity: 'customers', op: 'insert', data: newCustomer },
+        { entity: 'tasks', op: 'update', id: 99_999_999, data: { status: 'done' } },
+      ],
+    })
+    expect(r.status).toBe(404)
+    expect((await req<Page<Customer>>('GET', '/customers?limit=1')).body.total).toBe(before)
+  })
+
+  it('validates every op before writing', async () => {
+    const r = await req('POST', '/batch', {
+      ops: [
+        { entity: 'customers', op: 'update', id: 2, data: { seats: 3 } },
+        { entity: 'customers', op: 'update', id: 3, data: { email: 'not-an-email' } },
+      ],
+    })
+    expect(r.status).toBe(400)
+    expect((await req('POST', '/batch', { ops: [] })).status).toBe(400)
+    expect((await req('POST', '/batch', { ops: [{ entity: 'invoices', op: 'delete', id: 1 }] })).status).toBe(400)
+  })
+})

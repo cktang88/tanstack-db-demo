@@ -110,6 +110,7 @@ export interface Task {
 export interface ActivityEvent {
   id: number
   type: EventType
+  category: string
   actorId: number | null
   customerId: number | null
   message: string

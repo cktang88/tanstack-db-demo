@@ -1,19 +1,20 @@
 # Saasly — TanStack fullstack SaaS dashboard
 
 A realistic SaaS admin dashboard (customers, billing, projects/kanban, team, activity, analytics) built to compare
-data-layer approaches. This branch (`main`) is the **"classic heavy TanStack Query"** baseline.
+data-layer approaches. `main` is the **"classic heavy TanStack Query"** baseline; this branch moves the client data
+layer to **TanStack DB** (collections + live queries + transactions) on top of the same Query client.
 
-| Layer | Tech |
-| --- | --- |
-| Toolchain | **Vite+** (`vp dev / build / test / lint / fmt / check`) — Vite 8 + Rolldown, Vitest 5, Oxlint, Oxfmt |
-| UI | React 19.3 (client components only): `useActionState`, `useFormStatus`, `useOptimistic`, `useTransition`, `useDeferredValue`, `useEffectEvent`, `<Activity>`, `<ViewTransition>`, document `<title>` |
-| Data | TanStack Query 5.104 (`queryOptions`, `infiniteQueryOptions`, suspense, `useSuspenseQueries`, `useQueries`+`combine`, `keepPreviousData`, `select`, polling, `queryClient.query()` prefetching, cache-based optimistic updates + rollback, `useMutationState`, mutation `scope`, devtools) |
-| Routing | TanStack Router (typed params, validated search params as table state, loaders, intent preloading, `stripSearchParams`) |
-| Tables | TanStack Table v9 (`tableFeatures`, server-side/manual pagination + sorting, row selection, column visibility, `table.FlexRender`) |
-| Charts | TanStack Charts 1.0 (`defineChart`, line/area, stacked/grouped bars, donut via `polar`, crosshair + tooltips) |
-| Server | Node + Hono + **Effect 4** (services/layers, typed errors, `Schema` validation, `ManagedRuntime`) + SQLite (better-sqlite3) |
-| Shared | Effect `Schema` definitions used for both server request validation and client form validation (Standard Schema) |
-| Tests | Vitest (server API against in-memory SQLite, client components with Testing Library) + Playwright E2E |
+| Layer     | Tech                                                                                                                                                                                                                                                                                       |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Toolchain | **Vite+** (`vp dev / build / test / lint / fmt / check`) — Vite 8 + Rolldown, Vitest 5, Oxlint, Oxfmt                                                                                                                                                                                      |
+| UI        | React 19.3 (client components only): `useActionState`, `useFormStatus`, `useOptimistic`, `useTransition`, `useDeferredValue`, `useEffectEvent`, `<Activity>`, `<ViewTransition>`, document `<title>`                                                                                       |
+| Data      | TanStack Query 5.104 (`queryOptions`, `infiniteQueryOptions`, suspense, `useSuspenseQueries`, `useQueries`+`combine`, `keepPreviousData`, `select`, polling, `queryClient.query()` prefetching, cache-based optimistic updates + rollback, `useMutationState`, mutation `scope`, devtools) |
+| Routing   | TanStack Router (typed params, validated search params as table state, loaders, intent preloading, `stripSearchParams`)                                                                                                                                                                    |
+| Tables    | TanStack Table v9 (`tableFeatures`, server-side/manual pagination + sorting, row selection, column visibility, `table.FlexRender`)                                                                                                                                                         |
+| Charts    | TanStack Charts 1.0 (`defineChart`, line/area, stacked/grouped bars, donut via `polar`, crosshair + tooltips)                                                                                                                                                                              |
+| Server    | Node + Hono + **Effect 4** (services/layers, typed errors, `Schema` validation, `ManagedRuntime`) + SQLite (better-sqlite3)                                                                                                                                                                |
+| Shared    | Effect `Schema` definitions used for both server request validation and client form validation (Standard Schema)                                                                                                                                                                           |
+| Tests     | Vitest (server API against in-memory SQLite, client components with Testing Library) + Playwright E2E                                                                                                                                                                                      |
 
 ## Running
 
@@ -42,3 +43,16 @@ optimistic updates and rollbacks.
 
 Plus CRUD (`POST/PATCH/DELETE`), `/api/events/feed` (cursor pagination), `/api/events/stream` (SSE change feed),
 `/api/metrics/*` (SQL aggregations), `/api/dev/{chaos,reset}`.
+
+## TanStack DB layer (this branch)
+
+```
+src/db/collections.ts  collections: users, customers, invoices, projects, tasks (eager), events (on-demand),
+                       prefs/pins (localStorage), selection (local-only); one atomic persist() for all handlers
+src/db/pushdown.ts     live-query predicate -> REST list grammar (where/orderBy/limit/offset)
+src/db/views.ts        materialized views (module-level live query collections) for dashboard aggregates
+src/db/actions.ts      intent-level mutations: optimistic action, multi-collection & staged transactions
+src/db/live.ts         SSE change feed -> direct writes (writeUpsert/writeDelete), no refetching
+```
+
+`scripts/journey.mjs` replays the same 14-step user journey against either branch and reports requests/latency.

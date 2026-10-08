@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useActionState } from 'react'
 import { Card, PageHeader, Segmented } from '../components/ui'
+import { applyChange } from '../db/live'
+import { usePrefs } from '../db/hooks'
+import { pinsCollection } from '../db/collections'
 import { api } from '../lib/api'
-import { useSettings } from '../lib/settings'
 import { toast } from '../lib/toast'
 
 interface Chaos {
@@ -11,10 +13,13 @@ interface Chaos {
 }
 
 export function SettingsPage() {
-  const [settings, setSettings] = useSettings()
+  const [prefs, setPrefs] = usePrefs()
   return (
     <>
-      <PageHeader title="Settings" description="Workspace preferences and developer tools." />
+      <PageHeader
+        title="Settings"
+        description="Preferences live in a localStorage collection — open two tabs and watch them sync."
+      />
       <div className="grid gap-6 lg:grid-cols-2">
         <Card title="Appearance">
           <div className="space-y-4">
@@ -22,29 +27,23 @@ export function SettingsPage() {
               <span className="text-sm">Theme</span>
               <Segmented
                 label="Theme"
-                value={settings.theme}
+                value={prefs.theme}
                 options={[
                   { value: 'light', label: 'Light' },
                   { value: 'dark', label: 'Dark' },
                 ]}
-                onChange={(theme) => setSettings({ theme })}
+                onChange={(theme) => setPrefs({ theme })}
               />
             </div>
             <label className="flex items-center justify-between text-sm">
               Wide layout
-              <input type="checkbox" checked={settings.compact} onChange={(e) => setSettings({ compact: e.target.checked })} />
+              <input type="checkbox" checked={prefs.compact} onChange={(e) => setPrefs({ compact: e.target.checked })} />
             </label>
             <label className="flex items-center justify-between text-sm">
-              Default rows per page
-              <select
-                className="input w-24"
-                value={settings.defaultPageSize}
-                onChange={(e) => setSettings({ defaultPageSize: Number(e.target.value) })}
-              >
-                {[10, 25, 50, 100].map((n) => (
-                  <option key={n}>{n}</option>
-                ))}
-              </select>
+              Clear pinned accounts
+              <button className="btn-secondary" onClick={() => pinsCollection.utils.clearStorage()}>
+                Clear
+              </button>
             </label>
           </div>
         </Card>
@@ -55,7 +54,8 @@ export function SettingsPage() {
   )
 }
 
-/** Simulated network conditions — lets you see optimistic updates + rollbacks in action. */
+// Non-entity server state (dev settings) stays on plain TanStack Query —
+// DB and Query coexist, so adoption can be incremental.
 function ChaosCard() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['dev', 'chaos'], queryFn: () => api.get<Chaos>('/dev/chaos') })
@@ -96,11 +96,10 @@ function ChaosCard() {
 }
 
 function ResetCard() {
-  const qc = useQueryClient()
   const reset = useMutation({
     mutationFn: () => api.post('/dev/reset', {}),
     onSuccess: async () => {
-      await qc.resetQueries()
+      await applyChange({ kind: 'reset' })
       toast.success('Database re-seeded')
     },
   })

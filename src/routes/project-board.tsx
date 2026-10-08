@@ -1,36 +1,57 @@
-import { useMutationState, useSuspenseQuery } from '@tanstack/react-query'
+import {
+  and,
+  debounceStrategy,
+  eq,
+  SchemaValidationError,
+  useLiveQuery,
+  useLiveSuspenseQuery,
+  usePacedMutations,
+} from '@tanstack/react-db'
 import { Link } from '@tanstack/react-router'
-import { useActionState, useMemo, useState, ViewTransition } from 'react'
-import { TASK_PRIORITIES, TASK_STATUSES, type Task, type TaskStatus, type User } from '../../shared/domain'
+import { useActionState, useState, ViewTransition } from 'react'
+import { TASK_PRIORITIES, TASK_STATUSES, type TaskStatus } from '../../shared/domain'
 import { Avatar, Badge, PageHeader } from '../components/ui'
+import { newId, persist, projectsCollection, tasksCollection, usersCollection, type TaskRow } from '../db/collections'
 import { date, titleCase } from '../lib/format'
-import { useCreateTask, useDeleteTask, useUpdateTask, type NewTask } from '../lib/mutations'
-import { projectQuery, projectTasksQuery, usersQuery } from '../lib/queries'
+import { toast } from '../lib/toast'
 import { projectBoardRoute } from '../router'
+
+const onRollback = (title: string) => (e: Error) => toast.error(title, e.message)
 
 export function ProjectBoardPage() {
   const { projectId } = projectBoardRoute.useParams()
-  const { data: project } = useSuspenseQuery(projectQuery(projectId))
-  const { data: tasks } = useSuspenseQuery(projectTasksQuery(projectId))
-  const { data: users } = useSuspenseQuery(usersQuery())
+  const { data: project } = useLiveSuspenseQuery({
+    query: (q) =>
+      q
+        .from({ p: projectsCollection })
+        .where(({ p }) => eq(p.id, projectId))
+        .findOne(),
+  })
   const [assignee, setAssignee] = useState<number | 'all'>('all')
-
-  // Pending creates are rendered "via the UI" from mutation state, in addition
-  // to the optimistic cache entry — shows how many moving parts are involved.
-  const pendingCreates = useMutationState({
-    filters: { mutationKey: ['tasks', 'create'], status: 'pending' },
-    select: (m) => m.state.variables as NewTask,
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  // tasks for this project ⨝ assignee, filtered by the (indexed) projectId
+  const { data: tasks } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ t: tasksCollection })
+        .leftJoin({ u: usersCollection }, ({ t, u }) => eq(t.assigneeId, u.id))
+        .where(({ t }) =>
+          assignee === 'all' ? eq(t.projectId, projectId) : and(eq(t.projectId, projectId), eq(t.assigneeId, assignee)),
+        )
+        .orderBy(({ t }) => t.position)
+        .orderBy(({ t }) => t.id)
+        .select(({ t, u }) => ({ ...t, assigneeName: u?.name, assigneeColor: u?.avatarColor })),
   })
 
-  const columns = useMemo(() => {
-    const visible = tasks.filter((t) => assignee === 'all' || t.assigneeId === assignee)
-    return TASK_STATUSES.map((status) => ({
-      status,
-      tasks: visible.filter((t) => t.status === status).sort((a, b) => a.position - b.position),
-    }))
-  }, [tasks, assignee])
+  if (!project)
+    return (
+      <div className="card mx-auto mt-10 max-w-md p-6 text-center" role="alert">
+        Not found
+      </div>
+    )
 
   const done = tasks.filter((t) => t.status === 'done').length
+  const saving = tasks.filter((t) => t.$hasPendingWrites).length
 
   return (
     <>
@@ -41,7 +62,7 @@ export function ProjectBoardPage() {
             <Link to="/projects" className="text-brand-600 hover:underline">
               Projects
             </Link>{' '}
-            / {done}/{tasks.length} done{pendingCreates.length > 0 && ` · saving ${pendingCreates.length}…`}
+            / {done}/{tasks.length} done{saving > 0 && ` · saving ${saving}…`}
           </>
         }
         actions={
@@ -60,17 +81,49 @@ export function ProjectBoardPage() {
           </select>
         }
       />
+      <DescriptionEditor projectId={project.id} value={project.description} />
       <div className="grid gap-4 lg:grid-cols-4" data-testid="board">
-        {columns.map((col) => (
-          <Column key={col.status} status={col.status} tasks={col.tasks} users={users} projectId={projectId} />
+        {TASK_STATUSES.map((status) => (
+          <Column key={status} status={status} tasks={tasks.filter((t) => t.status === status)} projectId={projectId} />
         ))}
       </div>
     </>
   )
 }
 
-function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks: Task[]; users: User[]; projectId: number }) {
-  const update = useUpdateTask()
+/** Autosave with a debounced paced mutation: instant local echo, one PATCH after typing stops. */
+function DescriptionEditor({ projectId, value }: { projectId: number; value: string }) {
+  const save = usePacedMutations<string>({
+    onMutate: (description) => projectsCollection.update(projectId, (d) => void (d.description = description)),
+    mutationFn: async ({ transaction }) => persist(transaction.mutations),
+    strategy: debounceStrategy({ wait: 600 }),
+  })
+  const { data: pending } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: projectsCollection })
+        .where(({ p }) => eq(p.id, projectId))
+        .select(({ p }) => ({ id: p.id, pending: p.$hasPendingWrites }))
+        .findOne(),
+  })
+  return (
+    <label className="mb-4 block">
+      <span className="label flex items-center gap-2">
+        Description <span className="text-amber-600">{pending?.pending ? 'saving…' : ''}</span>
+      </span>
+      <textarea
+        className="input min-h-14"
+        value={value}
+        aria-label="Project description"
+        onChange={(e) => save(e.target.value).when('settled').catch(onRollback('Could not save description'))}
+      />
+    </label>
+  )
+}
+
+type BoardTask = TaskRow & { assigneeName?: string; assigneeColor?: string; $hasPendingWrites?: boolean }
+
+function Column({ status, tasks, projectId }: { status: TaskStatus; tasks: BoardTask[]; projectId: number }) {
   const [over, setOver] = useState(false)
   return (
     <section
@@ -84,7 +137,7 @@ function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks
       onDrop={(e) => {
         setOver(false)
         const id = Number(e.dataTransfer.getData('text/task'))
-        if (id) update.mutate({ id, patch: { status } })
+        if (id) moveTask(id, status)
       }}
       className={`flex min-h-64 flex-col rounded-xl border p-3 ${over ? 'border-brand-500 bg-brand-50/50 dark:bg-brand-500/5' : 'border-zinc-200 bg-zinc-100/50 dark:border-zinc-800 dark:bg-zinc-900/50'}`}
     >
@@ -97,7 +150,7 @@ function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} users={users} />
+            <TaskCard task={t} />
           </ViewTransition>
         ))}
       </ul>
@@ -106,18 +159,25 @@ function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks
   )
 }
 
-function TaskCard({ task, users }: { task: Task; users: User[] }) {
-  const update = useUpdateTask()
-  const del = useDeleteTask()
-  const assignee = users.find((u) => u.id === task.assigneeId)
+function moveTask(id: number, status: TaskStatus) {
+  tasksCollection
+    .update(id, (d) => {
+      d.status = status
+      d.updatedAt = new Date().toISOString()
+    })
+    .when('settled')
+    .catch(onRollback('Task update failed — rolled back'))
+}
+
+function TaskCard({ task }: { task: BoardTask }) {
   const idx = TASK_STATUSES.indexOf(task.status)
-  const optimistic = task.id < 0
   return (
     <li
-      draggable={!optimistic}
+      draggable
       onDragStart={(e) => e.dataTransfer.setData('text/task', String(task.id))}
       data-testid="task-card"
-      className={`card group cursor-grab p-3 text-sm ${optimistic ? 'opacity-60' : ''}`}
+      data-pending={task.$hasPendingWrites ? 'true' : undefined}
+      className={`card group cursor-grab p-3 text-sm ${task.$hasPendingWrites ? 'ring-1 ring-amber-400/60' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
         <span className="font-medium" data-testid="task-title">
@@ -126,8 +186,7 @@ function TaskCard({ task, users }: { task: Task; users: User[] }) {
         <button
           className="text-xs text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-red-600"
           aria-label={`Delete ${task.title}`}
-          onClick={() => del.mutate(task.id)}
-          disabled={optimistic}
+          onClick={() => tasksCollection.delete(task.id).when('settled').catch(onRollback('Could not delete task — restored'))}
         >
           ✕
         </button>
@@ -136,23 +195,24 @@ function TaskCard({ task, users }: { task: Task; users: User[] }) {
         <div className="flex items-center gap-1.5">
           <Badge value={task.priority} />
           {task.dueDate && <span className="text-xs text-zinc-500">{date(task.dueDate)}</span>}
+          {task.$hasPendingWrites && <span className="text-xs text-amber-600">saving…</span>}
         </div>
-        {assignee && <Avatar name={assignee.name} color={assignee.avatarColor} size={20} />}
+        {task.assigneeName && <Avatar name={task.assigneeName} color={task.assigneeColor} size={20} />}
       </div>
       <div className="mt-2 flex justify-between">
         <button
           className="btn-ghost px-1.5 py-0.5 text-xs"
-          disabled={idx === 0 || optimistic}
+          disabled={idx === 0}
           aria-label="Move left"
-          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx - 1]! } })}
+          onClick={() => moveTask(task.id, TASK_STATUSES[idx - 1]!)}
         >
           ←
         </button>
         <button
           className="btn-ghost px-1.5 py-0.5 text-xs"
-          disabled={idx === TASK_STATUSES.length - 1 || optimistic}
+          disabled={idx === TASK_STATUSES.length - 1}
           aria-label="Move right"
-          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx + 1]! } })}
+          onClick={() => moveTask(task.id, TASK_STATUSES[idx + 1]!)}
         >
           →
         </button>
@@ -162,20 +222,30 @@ function TaskCard({ task, users }: { task: Task; users: User[] }) {
 }
 
 function NewTaskForm({ projectId }: { projectId: number }) {
-  const create = useCreateTask()
-  // React 19 form action + useActionState for validation errors
   const [error, action] = useActionState((_prev: string | null, form: FormData) => {
-    const title = (form.get('title') as string | null)?.trim() ?? ''
-    if (title.length < 3) return 'Title must be at least 3 characters'
-    create.mutate({
-      projectId,
-      title,
-      status: 'todo',
-      priority: (form.get('priority') as NewTask['priority']) ?? 'medium',
-      assigneeId: null,
-      dueDate: null,
-    })
-    return null
+    const now = new Date().toISOString()
+    try {
+      // The collection's Effect Schema validates this synchronously before it renders.
+      tasksCollection
+        .insert({
+          id: newId(),
+          projectId,
+          title: (form.get('title') as string | null) ?? '',
+          status: 'todo',
+          priority: (form.get('priority') as TaskRow['priority']) ?? 'medium',
+          assigneeId: null,
+          dueDate: null,
+          position: Date.now(),
+          createdAt: now,
+          updatedAt: now,
+        })
+        .when('settled')
+        .catch(onRollback('Could not create task — removed'))
+      return null
+    } catch (e) {
+      if (e instanceof SchemaValidationError) return e.issues[0]?.message ?? 'Invalid task'
+      throw e
+    }
   }, null)
   return (
     <form action={action} className="mt-3 space-y-2">

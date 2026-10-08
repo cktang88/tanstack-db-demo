@@ -78,6 +78,8 @@ export const taskColumns: Columns = {
 export const eventColumns: Columns = {
   id: { sql: 'id', type: 'number' },
   type: { sql: 'type', type: 'text' },
+  /** 'customer' | 'invoice' | 'task' | 'user' — prefix of `type`, filterable for on-demand clients */
+  category: { sql: "substr(type, 1, instr(type, '.') - 1)", type: 'text' },
   actorId: { sql: 'actor_id', type: 'number' },
   customerId: { sql: 'customer_id', type: 'number' },
   createdAt: { sql: 'created_at', type: 'text' },
@@ -302,7 +304,7 @@ export const events = {
     const data = rows.slice(0, limit)
     return { data, nextCursor: hasMore ? data[data.length - 1]!.id : null }
   },
-  record: (db: DB, e: Omit<ActivityEvent, 'id' | 'createdAt'>): ActivityEvent => {
+  record: (db: DB, e: Omit<ActivityEvent, 'id' | 'createdAt' | 'category'>): ActivityEvent => {
     const res = db
       .prepare(`INSERT INTO events (type, actor_id, customer_id, message, created_at) VALUES (?, ?, ?, ?, ?)`)
       .run(e.type, e.actorId, e.customerId, e.message, now())

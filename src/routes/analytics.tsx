@@ -1,42 +1,73 @@
-import { useSuspenseQueries } from '@tanstack/react-query'
+import { count, eq, sum, useLiveQuery } from '@tanstack/react-db'
 import { useState } from 'react'
 import { DonutChart, HBarChart, RevenueChart, SignupsChart } from '../components/charts'
 import { Card, PageHeader, Segmented } from '../components/ui'
+import { customersCollection } from '../db/collections'
 import { money, moneyCompact, number, percent, titleCase } from '../lib/format'
-import { breakdownQuery, overviewQuery, revenueQuery, signupsQuery } from '../lib/queries'
+import { useRevenue, useSignups } from './overview'
 
 export function AnalyticsPage() {
   const [mode, setMode] = useState<'stacked' | 'grouped'>('stacked')
   const [metric, setMetric] = useState<'mrr' | 'customers'>('mrr')
-  // Six server-side aggregation endpoints, fetched in parallel.
-  const [{ data: byCountry }, { data: byStatus }, { data: byPlan }, { data: signups }, { data: revenue }, { data: kpi }] =
-    useSuspenseQueries({
-      queries: [
-        breakdownQuery('country'),
-        breakdownQuery('status'),
-        breakdownQuery('plan'),
-        signupsQuery(12),
-        revenueQuery(18),
-        overviewQuery(),
-      ],
-    })
+  const [plan, setPlan] = useState<string>('all')
+
+  // Same breakdowns that used to be three server endpoints — now GROUP BY over
+  // the local customers collection, re-filterable instantly (try the plan filter).
+  const { data: byCountry } = useLiveQuery({
+    query: (q) => {
+      let base = q.from({ c: customersCollection })
+      if (plan !== 'all') base = base.where(({ c }) => eq(c.plan, plan))
+      return base
+        .groupBy(({ c }) => c.country)
+        .select(({ c }) => ({ key: c.country, mrr: sum(c.mrr), customers: count(c.id) }))
+        .orderBy(({ $selected }) => (metric === 'mrr' ? $selected.mrr : $selected.customers), 'desc')
+    },
+  })
+  const { data: byStatus } = useLiveQuery({
+    query: (q) => {
+      let base = q.from({ c: customersCollection })
+      if (plan !== 'all') base = base.where(({ c }) => eq(c.plan, plan))
+      return base.groupBy(({ c }) => c.status).select(({ c }) => ({ key: c.status, value: count(c.id) }))
+    },
+  })
+  const { data: byPlan } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ c: customersCollection })
+        .groupBy(({ c }) => c.plan)
+        .select(({ c }) => ({ key: c.plan, customers: count(c.id), mrr: sum(c.mrr) }))
+        .orderBy(({ $selected }) => $selected.mrr, 'desc'),
+  })
+  const signups = useSignups(12)
+  const revenue = useRevenue(18)
+  const totalMrr = byPlan.reduce((s, p) => s + p.mrr, 0)
   const fmt = metric === 'mrr' ? moneyCompact : number
 
   return (
     <>
       <PageHeader
         title="Analytics"
-        description="Breakdowns computed by SQL aggregations on the server."
+        description="GROUP BY / SUM / COUNT live queries over local collections — no aggregation endpoints."
         actions={
-          <Segmented
-            label="Metric"
-            value={metric}
-            onChange={setMetric}
-            options={[
-              { value: 'mrr', label: 'MRR' },
-              { value: 'customers', label: 'Customers' },
-            ]}
-          />
+          <>
+            <select className="input w-36" aria-label="Plan filter" value={plan} onChange={(e) => setPlan(e.target.value)}>
+              <option value="all">All plans</option>
+              {['free', 'starter', 'pro', 'enterprise'].map((p) => (
+                <option key={p} value={p}>
+                  {titleCase(p)}
+                </option>
+              ))}
+            </select>
+            <Segmented
+              label="Metric"
+              value={metric}
+              onChange={setMetric}
+              options={[
+                { value: 'mrr', label: 'MRR' },
+                { value: 'customers', label: 'Customers' },
+              ]}
+            />
+          </>
         }
       />
       <div className="mb-6 grid gap-6 lg:grid-cols-2">
@@ -44,7 +75,7 @@ export function AnalyticsPage() {
           <HBarChart label="By country" data={byCountry.map((d) => ({ key: d.key, value: d[metric] }))} format={fmt} />
         </Card>
         <Card title="Customers by status">
-          <DonutChart label="Status" data={byStatus.map((d) => ({ key: d.key, value: d.customers }))} height={300} />
+          <DonutChart label="Status" data={byStatus} height={300} />
         </Card>
       </div>
       <Card
@@ -84,7 +115,7 @@ export function AnalyticsPage() {
                   <td className="td">{titleCase(p.key)}</td>
                   <td className="td text-right tabular-nums">{number(p.customers)}</td>
                   <td className="td text-right tabular-nums">{money(p.mrr)}</td>
-                  <td className="td text-right tabular-nums">{percent(kpi.mrr ? p.mrr / kpi.mrr : 0)}</td>
+                  <td className="td text-right tabular-nums">{percent(totalMrr ? p.mrr / totalMrr : 0)}</td>
                 </tr>
               ))}
             </tbody>

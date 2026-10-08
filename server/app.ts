@@ -3,6 +3,8 @@ import { Hono, type Context as HonoContext } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { PLAN_PRICE, type Customer } from '../shared/domain.ts'
 import {
+  BatchRequest,
+  type BatchEntity,
   ChaosConfig,
   CustomerInput,
   CustomerPatch,
@@ -15,12 +17,13 @@ import {
 import * as repo from './db/repo.ts'
 import { parseListParams } from './db/params.ts'
 import type { DB } from './db/schema.ts'
-import type { ListParams } from './db/sql.ts'
+import { BadQuery, type ListParams } from './db/sql.ts'
 import { seed } from './db/seed.ts'
 import {
   BadRequest,
   Chaos,
   ChangeFeed,
+  DbError,
   NotFound,
   Sqlite,
   sql,
@@ -36,6 +39,15 @@ export interface AppOptions {
 }
 
 type Services = Sqlite | Chaos | ChangeFeed
+
+class NotFoundError extends Error {
+  constructor(
+    readonly entity: string,
+    readonly id: number,
+  ) {
+    super(`${entity} ${id} not found`)
+  }
+}
 
 export function makeApp(opts: AppOptions) {
   const layer = Layer.mergeAll(Sqlite.layer(opts.db), Chaos.layer(opts.chaos ?? { latencyMs: 0, failRate: 0 }), ChangeFeed.layer)
@@ -92,6 +104,39 @@ export function makeApp(opts: AppOptions) {
       const d = yield* db
       return repo.toPage(yield* sql(() => f(d, p)), p)
     })
+
+  /** Human-readable activity event for a batch op result. */
+  const describe = (
+    r: { entity: BatchEntity; op: string; id: number; row?: any },
+    data: Record<string, unknown> | undefined,
+  ): Parameters<typeof repo.events.record>[1] | undefined => {
+    const row = r.row
+    switch (`${r.entity}.${r.op}`) {
+      case 'customers.insert':
+        return { type: 'customer.created', actorId: 1, customerId: r.id, message: `New customer ${row.company}` }
+      case 'customers.update':
+        return {
+          type: 'customer.updated',
+          actorId: 1,
+          customerId: r.id,
+          message: `Updated ${row.company} (${Object.keys(data ?? {}).join(', ')})`,
+        }
+      case 'customers.delete':
+        return { type: 'customer.deleted', actorId: 1, customerId: null, message: `Deleted customer #${r.id}` }
+      case 'invoices.update':
+        return data?.status === 'paid'
+          ? { type: 'invoice.paid', actorId: 1, customerId: row.customerId, message: `Invoice ${row.number} marked paid` }
+          : undefined
+      case 'tasks.insert':
+        return { type: 'task.created', actorId: 1, customerId: null, message: `Created task "${row.title}"` }
+      case 'tasks.update':
+        return data?.status || data?.assigneeId !== undefined
+          ? { type: 'task.updated', actorId: 1, customerId: null, message: `Updated task "${row.title}"` }
+          : undefined
+      default:
+        return undefined
+    }
+  }
 
   const app = new Hono().basePath('/api')
 
@@ -301,6 +346,106 @@ export function makeApp(opts: AppOptions) {
         return null
       }),
       204,
+    ),
+  )
+
+  // ---------- batch (atomic multi-entity writes, used by TanStack DB transactions) ----------
+  app.post('/batch', (c) =>
+    run(
+      c,
+      Effect.gen(function* () {
+        const { ops } = yield* body(c, BatchRequest)
+        const d = yield* db
+        // validate every op up-front so nothing is written if any op is invalid
+        const decoded = yield* Effect.forEach(ops, (op) =>
+          Effect.gen(function* () {
+            if (op.op === 'delete') return { ...op, data: undefined }
+            const schema =
+              op.entity === 'customers'
+                ? op.op === 'insert'
+                  ? CustomerInput
+                  : CustomerPatch
+                : op.entity === 'tasks'
+                  ? op.op === 'insert'
+                    ? TaskInput
+                    : TaskPatch
+                  : op.entity === 'invoices' && op.op === 'update'
+                    ? InvoicePatch
+                    : op.entity === 'users' && op.op === 'update'
+                      ? UserPatch
+                      : op.entity === 'projects' && op.op === 'update'
+                        ? ProjectPatch
+                        : undefined
+            if (!schema) return yield* new BadRequest({ message: `Unsupported batch op ${op.op} on ${op.entity}` })
+            const data = (yield* Schema.decodeUnknownEffect(schema as Schema.Top)(op.data ?? {}) as Effect.Effect<
+              unknown,
+              Schema.SchemaError
+            >) as Record<string, unknown>
+            return { ...op, data }
+          }),
+        )
+        type Result = { entity: BatchEntity; op: 'insert' | 'update' | 'delete'; id: number; row?: { id: number } }
+        const results = yield* sql(() =>
+          d.transaction((): Result[] =>
+            decoded.map((op): Result => {
+              const id = op.id ?? 0
+              const fail = (): never => {
+                throw new NotFoundError(op.entity, id)
+              }
+              const data = op.data as never
+              switch (`${op.entity}.${op.op}`) {
+                case 'customers.insert': {
+                  const row = repo.customers.create(d, data, mrrOf(data))
+                  return { entity: op.entity, op: op.op, id: row.id, row }
+                }
+                case 'customers.update': {
+                  const current = repo.customers.get(d, id) ?? fail()
+                  const row = repo.customers.update(d, id, {
+                    ...(data as object),
+                    mrr: mrrOf({ ...current, ...(data as object) }),
+                  })!
+                  return { entity: op.entity, op: op.op, id, row }
+                }
+                case 'customers.delete':
+                  if (!repo.customers.remove(d, id)) fail()
+                  return { entity: op.entity, op: op.op, id }
+                case 'tasks.insert': {
+                  const row = repo.tasks.create(d, data)
+                  return { entity: op.entity, op: op.op, id: row.id, row }
+                }
+                case 'tasks.update':
+                  return { entity: op.entity, op: op.op, id, row: repo.tasks.update(d, id, data) ?? fail() }
+                case 'tasks.delete':
+                  if (!repo.tasks.remove(d, id)) fail()
+                  return { entity: op.entity, op: op.op, id }
+                case 'invoices.update':
+                  return { entity: op.entity, op: op.op, id, row: repo.invoices.update(d, id, data) ?? fail() }
+                case 'users.update':
+                  return { entity: op.entity, op: op.op, id, row: repo.users.update(d, id, data) ?? fail() }
+                case 'projects.update':
+                  return { entity: op.entity, op: op.op, id, row: repo.projects.update(d, id, data) ?? fail() }
+                default:
+                  throw new BadQuery(`Unsupported batch op ${op.op} on ${op.entity}`)
+              }
+            }),
+          )(),
+        ).pipe(
+          Effect.catchTag('DbError', (e): Effect.Effect<never, NotFound | DbError> =>
+            e.cause instanceof NotFoundError
+              ? Effect.fail(new NotFound({ entity: e.cause.entity, id: e.cause.id }))
+              : Effect.fail(e),
+          ),
+        )
+        for (const r of results) {
+          if (r.op === 'delete') yield* publish({ kind: 'delete', entity: r.entity, id: r.id })
+          else yield* upsert(r.entity, r.row!)
+        }
+        for (const r of results) {
+          const ev = describe(r, decoded.find((o) => o.id === r.id && o.entity === r.entity)?.data)
+          if (ev) yield* record(ev)
+        }
+        return { results }
+      }),
     ),
   )
 
