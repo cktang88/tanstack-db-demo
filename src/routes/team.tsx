@@ -73,7 +73,7 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
 }
 
 function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean; onSelect: () => void }) {
-  const update = useUpdateUser()
+  const update = useUpdateUser(user.id)
   const canManage = useCan().can('team:manage')
   // React 19 useOptimistic: the select shows the new role immediately during the transition
   const [role, setOptimisticRole] = useOptimistic(user.role)

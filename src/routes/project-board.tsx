@@ -1,6 +1,6 @@
 import { useMutationState, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { useActionState, useMemo, useState, ViewTransition } from 'react'
+import { useActionState, useMemo, useRef, useState, ViewTransition, type RefObject } from 'react'
 import { TASK_PRIORITIES, TASK_STATUSES, type Task, type TaskStatus, type User } from '../../shared/domain'
 import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
@@ -16,6 +16,10 @@ export function ProjectBoardPage() {
   const { data: users } = useSuspenseQuery(usersQuery())
   const [assignee, setAssignee] = useState<number | 'all'>('all')
   const [openId, setOpenId] = useState<number | null>(null)
+  // Drag & drop: the column records where a card was dropped and the card
+  // (on dragend) moves itself, so every write to a task goes through that
+  // task's own mutation scope and reaches the server in order.
+  const dropTarget = useRef<TaskStatus | null>(null)
 
   // Pending creates are rendered "via the UI" from mutation state, in addition
   // to the optimistic cache entry — shows how many moving parts are involved.
@@ -71,6 +75,7 @@ export function ProjectBoardPage() {
             tasks={col.tasks}
             users={users}
             projectId={projectId}
+            dropTarget={dropTarget}
             onOpen={(t) => setOpenId(t.id)}
           />
         ))}
@@ -84,15 +89,16 @@ function Column({
   tasks,
   users,
   projectId,
+  dropTarget,
   onOpen,
 }: {
   status: TaskStatus
   tasks: Task[]
   users: User[]
   projectId: number
+  dropTarget: RefObject<TaskStatus | null>
   onOpen: (t: Task) => void
 }) {
-  const update = useUpdateTask()
   const [over, setOver] = useState(false)
   return (
     <section
@@ -103,10 +109,9 @@ function Column({
         setOver(true)
       }}
       onDragLeave={() => setOver(false)}
-      onDrop={(e) => {
+      onDrop={() => {
         setOver(false)
-        const id = Number(e.dataTransfer.getData('text/task'))
-        if (id) update.mutate({ id, patch: { status } })
+        dropTarget.current = status
       }}
       className={`flex min-h-64 flex-col rounded-xl border p-3 ${over ? 'border-brand-500 bg-brand-50/50 dark:bg-brand-500/5' : 'border-zinc-200 bg-zinc-100/50 dark:border-zinc-800 dark:bg-zinc-900/50'}`}
     >
@@ -119,7 +124,7 @@ function Column({
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} users={users} onOpen={onOpen} />
+            <TaskCard task={t} users={users} dropTarget={dropTarget} onOpen={onOpen} />
           </ViewTransition>
         ))}
       </ul>
@@ -128,8 +133,18 @@ function Column({
   )
 }
 
-function TaskCard({ task, users, onOpen }: { task: Task; users: User[]; onOpen: (t: Task) => void }) {
-  const update = useUpdateTask()
+function TaskCard({
+  task,
+  users,
+  dropTarget,
+  onOpen,
+}: {
+  task: Task
+  users: User[]
+  dropTarget: RefObject<TaskStatus | null>
+  onOpen: (t: Task) => void
+}) {
+  const update = useUpdateTask(task.id)
   const del = useDeleteTask()
   const assignee = users.find((u) => u.id === task.assigneeId)
   const idx = TASK_STATUSES.indexOf(task.status)
@@ -137,7 +152,15 @@ function TaskCard({ task, users, onOpen }: { task: Task; users: User[]; onOpen: 
   return (
     <li
       draggable={!optimistic}
-      onDragStart={(e) => e.dataTransfer.setData('text/task', String(task.id))}
+      onDragStart={(e) => {
+        dropTarget.current = null
+        e.dataTransfer.setData('text/task', String(task.id))
+      }}
+      onDragEnd={() => {
+        const status = dropTarget.current
+        dropTarget.current = null
+        if (status && status !== task.status) update.mutate({ id: task.id, patch: { status } })
+      }}
       data-testid="task-card"
       className={`card group cursor-grab p-3 text-sm ${optimistic ? 'opacity-60' : ''}`}
     >

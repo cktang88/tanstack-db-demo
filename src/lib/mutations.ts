@@ -2,6 +2,7 @@ import { useMutation, useQueryClient, type QueryClient, type QueryKey } from '@t
 import type { Customer, Invoice, Page, Payment, Task, User } from '../../shared/domain'
 import { api } from './api'
 import { keys } from './queries'
+import { invalidateEntities, mutating, type Entity } from './sync'
 import { toast } from './toast'
 import type { CustomerFormValues } from './validation'
 
@@ -9,8 +10,17 @@ import type { CustomerFormValues } from './validation'
 // Helpers for the "classic" React Query optimistic-update dance.
 // The same entity can live in many cache entries (paged lists with different
 // filters, a detail entry, per-customer lists, ...). Every mutation has to
-// find & patch all of them by hand, snapshot them for rollback, and then
+// find & patch all of them by hand, remember enough to roll back, and then
 // invalidate whatever aggregates (metrics) might have changed.
+//
+// Concurrency rules (several optimistic writes can be in flight at once):
+// - mutation keys start with the entity: ['customers', 'update'], ...
+// - onSettled invalidates via invalidateEntities(), which skips entities that
+//   still have *other* writes in flight; the last one to settle refetches.
+// - updates roll back field by field (only fields still holding our value),
+//   never by restoring a whole-cache snapshot that would wipe other writes.
+// - writes to the same row share a mutation scope, so they reach the server
+//   in order.
 // ----------------------------------------------------------------------------
 
 type Snapshot = Array<[QueryKey, unknown]>
@@ -22,6 +32,23 @@ async function snapshot(qc: QueryClient, ...prefixes: QueryKey[]): Promise<Snaps
 
 function restore(qc: QueryClient, snap: Snapshot | undefined) {
   snap?.forEach(([key, data]) => qc.setQueryData(key, data))
+}
+
+/** Rows inside a cached `Page<T>`, `T[]` or `T`. */
+function rowsOf<T extends { id: number }>(data: unknown): T[] {
+  if (!data || typeof data !== 'object') return []
+  if (Array.isArray(data)) return data as T[]
+  if ('data' in data && Array.isArray(data.data)) return data.data as T[]
+  return 'id' in data ? [data as T] : []
+}
+
+/** The currently cached version of some rows (to roll an optimistic patch back). */
+function cachedRows<T extends { id: number }>(qc: QueryClient, prefix: QueryKey, ids: number[]) {
+  const want = new Set(ids)
+  const out = new Map<number, T>()
+  for (const [, data] of qc.getQueriesData({ queryKey: prefix }))
+    for (const row of rowsOf<T>(data)) if (want.has(row.id) && !out.has(row.id)) out.set(row.id, row)
+  return out
 }
 
 /** Patch an entity inside every cached `Page<T>`, `T[]` or `T` under a key prefix. */
@@ -40,11 +67,61 @@ function patchEverywhere<T extends { id: number }>(qc: QueryClient, prefix: Quer
   })
 }
 
+/** Apply `patch` optimistically to rows `ids`; returns what's needed to revert it. */
+async function optimisticPatch<T extends { id: number }>(qc: QueryClient, prefix: QueryKey, ids: number[], patch: Partial<T>) {
+  await qc.cancelQueries({ queryKey: prefix })
+  const previous = cachedRows<T>(qc, prefix, ids)
+  ids.forEach((id) => patchEverywhere<T>(qc, prefix, id, (t) => ({ ...t, ...patch })))
+  return { prefix, previous, patch }
+}
+
+/**
+ * Undo an optimistic patch, field by field, for the given rows: a field is
+ * only reverted if it still holds the value we wrote, so a later concurrent
+ * write to the same row (or other rows) survives our rollback.
+ */
+function revertPatch<T extends { id: number }>(
+  qc: QueryClient,
+  ctx: { prefix: QueryKey; previous: Map<number, T>; patch: Partial<T> } | undefined,
+  ids?: number[],
+) {
+  if (!ctx) return
+  for (const [id, prev] of ctx.previous) {
+    if (ids && !ids.includes(id)) continue
+    patchEverywhere<T>(qc, ctx.prefix, id, (cur) => {
+      const next = { ...cur }
+      for (const k of Object.keys(ctx.patch) as Array<keyof T>) if (cur[k] === ctx.patch[k]) next[k] = prev[k]
+      return next
+    })
+  }
+}
+
+/** True when the calling mutation is the only write to `entity` still in flight. */
+const lastWrite = (qc: QueryClient, entity: Entity) => mutating(qc, entity) === 1
+
+/** Run one request per id; succeed if at least one did (partial success is reported, not thrown). */
+async function settleEach<R>(ids: number[], fn: (id: number) => Promise<R>) {
+  const results = await Promise.allSettled(ids.map(fn))
+  const ok: Array<{ id: number; value: R }> = []
+  const failed: Array<{ id: number; error: Error }> = []
+  results.forEach((r, i) =>
+    r.status === 'fulfilled' ? ok.push({ id: ids[i]!, value: r.value }) : failed.push({ id: ids[i]!, error: r.reason as Error }),
+  )
+  if (!ok.length && failed[0]) throw failed[0].error
+  return { ok, failed }
+}
+
+const partialFailure = (what: string, total: number, failed: Array<{ error: Error }>) =>
+  toast.error(`${what} ${total - failed.length} of ${total}`, `${failed.length} failed: ${failed[0]!.error.message}`)
+
 const onError = (title: string) => (err: Error) => toast.error(title, err.message)
 
 // ----------------------------------------------------------------------------
 // Customers
 // ----------------------------------------------------------------------------
+
+// a customer write can change its subscriptions (churn cancels them), MRR, health and the feed
+const CUSTOMER_WRITE: Entity[] = ['customers', 'subscriptions', 'events']
 
 export function useCreateCustomer() {
   const qc = useQueryClient()
@@ -58,41 +135,28 @@ export function useCreateCustomer() {
       toast.success('Customer created', customer.company)
     },
     onError: onError('Could not create customer'),
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.customers.lists() }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-        qc.invalidateQueries({ queryKey: keys.events.all }),
-      ]),
+    onSettled: () => invalidateEntities(qc, CUSTOMER_WRITE, { self: 'customers' }),
   })
 }
 
-export function useUpdateCustomer() {
+/** Pass the customer id so that edits of the same customer run serially, in order. */
+export function useUpdateCustomer(customerId?: number) {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['customers', 'update'],
-    // updates to the same customer run serially, in order
-    scope: { id: 'customer-update' },
+    scope: customerId === undefined ? undefined : { id: `customer-${customerId}` },
     mutationFn: ({ id, patch }: { id: number; patch: Partial<CustomerFormValues> }) =>
       api.patch<Customer>(`/customers/${id}`, patch),
-    onMutate: async ({ id, patch }) => {
-      const snap = await snapshot(qc, keys.customers.all)
-      patchEverywhere<Customer>(qc, keys.customers.all, id, (c) => ({ ...c, ...patch, updatedAt: new Date().toISOString() }))
-      return { snap }
-    },
+    onMutate: ({ id, patch }) => optimisticPatch<Customer>(qc, keys.customers.all, [id], patch as Partial<Customer>),
     onError: (err, _vars, ctx) => {
-      restore(qc, ctx?.snap)
+      revertPatch(qc, ctx)
       onError('Update failed — changes rolled back')(err)
     },
     onSuccess: (customer) => {
-      patchEverywhere<Customer>(qc, keys.customers.all, customer.id, () => customer)
+      // server-computed fields (mrr, updatedAt) — unless another write would be overwritten
+      if (lastWrite(qc, 'customers')) patchEverywhere<Customer>(qc, keys.customers.all, customer.id, () => customer)
     },
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.customers.lists() }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-        qc.invalidateQueries({ queryKey: keys.events.all }),
-      ]),
+    onSettled: () => invalidateEntities(qc, CUSTOMER_WRITE, { self: 'customers' }),
   })
 }
 
@@ -100,25 +164,27 @@ export function useDeleteCustomers() {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['customers', 'delete'],
-    mutationFn: (ids: number[]) => Promise.all(ids.map((id) => api.delete(`/customers/${id}`))),
+    mutationFn: (ids: number[]) => settleEach(ids, (id) => api.delete(`/customers/${id}`)),
     onMutate: async (ids) => {
       const snap = await snapshot(qc, keys.customers.all)
       ids.forEach((id) => patchEverywhere<Customer>(qc, keys.customers.all, id, () => null))
       return { snap }
     },
     onError: (err, _ids, ctx) => {
-      restore(qc, ctx?.snap)
-      onError('Delete failed — rows restored')(err)
+      // Re-inserting rows into paged lists needs the snapshot; if other writes
+      // are in flight the final invalidation brings the rows back instead.
+      if (lastWrite(qc, 'customers')) restore(qc, ctx?.snap)
+      onError('Archive failed — rows restored')(err)
     },
-    onSuccess: (_r, ids) => toast.success(`Deleted ${ids.length} customer${ids.length === 1 ? '' : 's'}`),
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.customers.all }),
-        qc.invalidateQueries({ queryKey: keys.invoices.all }),
-        qc.invalidateQueries({ queryKey: keys.projects.all }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-        qc.invalidateQueries({ queryKey: keys.events.all }),
-      ]),
+    onSuccess: ({ ok, failed }, ids, ctx) => {
+      if (!failed.length) return toast.success(`Archived ${ids.length} customer${ids.length === 1 ? '' : 's'}`)
+      if (lastWrite(qc, 'customers')) {
+        restore(qc, ctx.snap)
+        ok.forEach(({ id }) => patchEverywhere<Customer>(qc, keys.customers.all, id, () => null))
+      }
+      partialFailure('Archived', ids.length, failed)
+    },
+    onSettled: () => invalidateEntities(qc, [...CUSTOMER_WRITE, 'invoices', 'projects'], { self: 'customers' }),
   })
 }
 
@@ -127,19 +193,25 @@ export function useBulkUpdateCustomers() {
   return useMutation({
     mutationKey: ['customers', 'bulk-update'],
     mutationFn: ({ ids, patch }: { ids: number[]; patch: Partial<CustomerFormValues> }) =>
-      Promise.all(ids.map((id) => api.patch<Customer>(`/customers/${id}`, patch))),
-    onMutate: async ({ ids, patch }) => {
-      const snap = await snapshot(qc, keys.customers.all)
-      ids.forEach((id) => patchEverywhere<Customer>(qc, keys.customers.all, id, (c) => ({ ...c, ...patch })))
-      return { snap }
-    },
+      settleEach(ids, (id) => api.patch<Customer>(`/customers/${id}`, patch)),
+    onMutate: ({ ids, patch }) => optimisticPatch<Customer>(qc, keys.customers.all, ids, patch as Partial<Customer>),
     onError: (err, _v, ctx) => {
-      restore(qc, ctx?.snap)
+      revertPatch(qc, ctx)
       onError('Bulk update failed — rolled back')(err)
     },
-    onSuccess: (rows) => toast.success(`Updated ${rows.length} customers`),
-    onSettled: () =>
-      Promise.all([qc.invalidateQueries({ queryKey: keys.customers.all }), qc.invalidateQueries({ queryKey: keys.metrics.all })]),
+    onSuccess: ({ ok, failed }, { ids }, ctx) => {
+      // roll back only the rows the server refused
+      revertPatch(
+        qc,
+        ctx,
+        failed.map((f) => f.id),
+      )
+      if (lastWrite(qc, 'customers'))
+        ok.forEach(({ value }) => patchEverywhere<Customer>(qc, keys.customers.all, value.id, () => value))
+      if (failed.length) partialFailure('Updated', ids.length, failed)
+      else toast.success(`Updated ${ok.length} customer${ok.length === 1 ? '' : 's'}`)
+    },
+    onSettled: () => invalidateEntities(qc, CUSTOMER_WRITE, { self: 'customers' }),
   })
 }
 
@@ -147,30 +219,20 @@ export function useBulkUpdateCustomers() {
 // Invoices
 // ----------------------------------------------------------------------------
 
+const PAYMENT_WRITE: Entity[] = ['invoices', 'payments', 'customer-balances', 'events']
+
 export function useMarkInvoicePaid() {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['invoices', 'mark-paid'],
     // paying = appending a payment to the ledger for the outstanding remainder
     mutationFn: (id: number) => api.post(`/invoices/${id}/pay`, { method: 'card' }),
-    onMutate: async (id) => {
-      const snap = await snapshot(qc, keys.invoices.all)
-      patchEverywhere<Invoice>(qc, keys.invoices.all, id, (i) => ({ ...i, status: 'paid', paidAt: new Date().toISOString() }))
-      return { snap }
-    },
+    onMutate: (id) => optimisticPatch<Invoice>(qc, keys.invoices.all, [id], { status: 'paid', paidAt: new Date().toISOString() }),
     onError: (err, _id, ctx) => {
-      restore(qc, ctx?.snap)
+      revertPatch(qc, ctx)
       onError('Could not mark invoice paid')(err)
     },
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.invoices.all }),
-        qc.invalidateQueries({ queryKey: ['payments'] }),
-        qc.invalidateQueries({ queryKey: ['customer-balances'] }),
-        qc.invalidateQueries({ queryKey: ['customer-health'] }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-        qc.invalidateQueries({ queryKey: keys.events.all }),
-      ]),
+    onSettled: () => invalidateEntities(qc, PAYMENT_WRITE, { self: 'invoices' }),
   })
 }
 
@@ -183,7 +245,8 @@ export function useMarkInvoicePaid() {
 export function useApiAction<V, R = unknown>(opts: {
   key: string[]
   fn: (v: V) => Promise<R>
-  invalidate: ReadonlyArray<readonly unknown[]>
+  /** entities this write may change (see ENTITY_KEYS); key[0] should be the entity written */
+  invalidate: readonly Entity[]
   success?: string | ((r: R, v: V) => string)
   error: string
 }) {
@@ -193,21 +256,11 @@ export function useApiAction<V, R = unknown>(opts: {
     mutationFn: opts.fn,
     onSuccess: (r, v) => opts.success && toast.success(typeof opts.success === 'function' ? opts.success(r, v) : opts.success),
     onError: onError(opts.error),
-    onSettled: () => Promise.all(opts.invalidate.map((queryKey) => qc.invalidateQueries({ queryKey: [...queryKey] }))),
+    onSettled: () => invalidateEntities(qc, opts.invalidate, { self: opts.key[0] }),
   })
 }
 
-const BILLING_KEYS = [
-  ['invoices'],
-  ['payments'],
-  ['customer-balances'],
-  ['customer-health'],
-  ['subscriptions'],
-  ['customers'],
-  ['mrr-snapshots'],
-  ['metrics'],
-  ['events'],
-] as const
+const BILLING_KEYS: Entity[] = [...PAYMENT_WRITE, 'subscriptions', 'customers', 'mrr-snapshots']
 
 export const useRecordPayment = () =>
   useApiAction({
@@ -250,7 +303,7 @@ export const useAddContact = () =>
   useApiAction({
     key: ['contacts', 'create'],
     fn: (v: { customerId: number; name: string; email: string; title: string; isPrimary: boolean }) => api.post('/contacts', v),
-    invalidate: [['contacts']],
+    invalidate: ['contacts', 'events'],
     success: 'Contact added',
     error: 'Could not add contact',
   })
@@ -259,7 +312,7 @@ export const useDeleteContact = () =>
   useApiAction({
     key: ['contacts', 'delete'],
     fn: (id: number) => api.delete(`/contacts/${id}`),
-    invalidate: [['contacts']],
+    invalidate: ['contacts', 'events'],
     error: 'Could not remove contact',
   })
 
@@ -267,7 +320,7 @@ export const useTagCustomer = () =>
   useApiAction({
     key: ['customer-tags', 'create'],
     fn: (v: { customerId: number; tagId: number }) => api.post('/customer-tags', v),
-    invalidate: [['customer-tags']],
+    invalidate: ['customer-tags', 'events'],
     error: 'Could not tag customer',
   })
 
@@ -275,7 +328,7 @@ export const useUntagCustomer = () =>
   useApiAction({
     key: ['customer-tags', 'delete'],
     fn: (id: string) => api.delete(`/customer-tags/${id}`),
-    invalidate: [['customer-tags']],
+    invalidate: ['customer-tags', 'events'],
     error: 'Could not remove tag',
   })
 
@@ -283,7 +336,7 @@ export const useAddComment = () =>
   useApiAction({
     key: ['task-comments', 'create'],
     fn: (v: { taskId: number; body: string }) => api.post('/task-comments', v),
-    invalidate: [['task-comments'], ['notifications'], ['events']],
+    invalidate: ['task-comments', 'notifications', 'events'],
     error: 'Could not post comment',
   })
 
@@ -292,7 +345,7 @@ export const useLogTime = () =>
     key: ['time-entries', 'create'],
     fn: (v: { taskId: number; minutes: number; spentOn: string; billable: boolean; note: string }) =>
       api.post('/time-entries', v),
-    invalidate: [['time-entries'], ['project-stats']],
+    invalidate: ['time-entries'],
     success: 'Time logged',
     error: 'Could not log time',
   })
@@ -301,7 +354,7 @@ export const useDeleteTime = () =>
   useApiAction({
     key: ['time-entries', 'delete'],
     fn: (id: number) => api.delete(`/time-entries/${id}`),
-    invalidate: [['time-entries'], ['project-stats']],
+    invalidate: ['time-entries'],
     error: 'Could not delete time entry',
   })
 
@@ -312,7 +365,7 @@ export const useMarkNotificationsRead = () =>
       id === 'all'
         ? api.post('/notifications/read-all', {})
         : api.patch(`/notifications/${id}`, { readAt: new Date().toISOString() }),
-    invalidate: [['notifications']],
+    invalidate: ['notifications'],
     error: 'Could not update notifications',
   })
 
@@ -323,7 +376,7 @@ export const useTeamMembership = () =>
       v.member
         ? api.delete(`/team-members/${v.teamId}:${v.userId}`)
         : api.post('/team-members', { teamId: v.teamId, userId: v.userId }),
-    invalidate: [['team-members'], ['auth']],
+    invalidate: ['team-members', 'events'],
     error: 'Could not change membership',
   })
 
@@ -332,7 +385,7 @@ export const useUpdateProduct = () =>
     key: ['products', 'update'],
     fn: ({ id, patch }: { id: number; patch: { unitPrice?: number; active?: boolean; name?: string } }) =>
       api.patch(`/products/${id}`, patch),
-    invalidate: [['products']],
+    invalidate: ['products', 'events'],
     success: 'Product updated',
     error: 'Could not update product',
   })
@@ -350,7 +403,7 @@ export const useRevokeSession = () =>
   useApiAction({
     key: ['sessions', 'delete'],
     fn: (id: number) => api.delete(`/sessions/${id}`),
-    invalidate: [['sessions']],
+    invalidate: ['sessions'],
     error: 'Could not revoke session',
   })
 
@@ -360,7 +413,9 @@ export const useRevokeSession = () =>
 
 export type NewTask = Pick<Task, 'projectId' | 'title' | 'status' | 'priority' | 'assigneeId' | 'dueDate'>
 
-const taskPrefixes = [keys.tasks.all] as const
+// tasks also feed project cards, project-stats and the workload chart (see ENTITY_KEYS)
+const TASK_WRITE: Entity[] = ['tasks', 'events']
+let nextTempId = -1
 
 export function useCreateTask() {
   const qc = useQueryClient()
@@ -368,57 +423,45 @@ export function useCreateTask() {
     mutationKey: ['tasks', 'create'],
     mutationFn: (input: NewTask) => api.post<Task>('/tasks', input),
     onMutate: async (input) => {
-      const snap = await snapshot(qc, ...taskPrefixes)
+      await qc.cancelQueries({ queryKey: keys.tasks.all })
       const temp: Task = {
         ...input,
-        id: -Date.now(),
+        id: nextTempId--,
         position: Number.MAX_SAFE_INTEGER,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       }
-      qc.setQueryData<Page<Task>>(keys.tasks.byProject(input.projectId), (old) =>
-        old ? { ...old, data: [...old.data, temp], total: old.total + 1 } : old,
-      )
-      if (input.assigneeId)
-        qc.setQueryData<Page<Task>>(keys.tasks.byAssignee(input.assigneeId), (old) =>
-          old ? { ...old, data: [...old.data, temp], total: old.total + 1 } : old,
-        )
-      return { snap }
+      const append = (old: Page<Task> | undefined) => (old ? { ...old, data: [...old.data, temp], total: old.total + 1 } : old)
+      qc.setQueryData<Page<Task>>(keys.tasks.byProject(input.projectId), append)
+      if (input.assigneeId) qc.setQueryData<Page<Task>>(keys.tasks.byAssignee(input.assigneeId), append)
+      return { tempId: temp.id }
     },
     onError: (err, _v, ctx) => {
-      restore(qc, ctx?.snap)
+      if (ctx) patchEverywhere<Task>(qc, keys.tasks.all, ctx.tempId, () => null)
       onError('Could not create task')(err)
     },
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.tasks.all }),
-        qc.invalidateQueries({ queryKey: keys.projects.all }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-      ]),
+    // swap the placeholder for the real row right away (no flash while the lists refetch)
+    onSuccess: (task, _v, ctx) => patchEverywhere<Task>(qc, keys.tasks.all, ctx.tempId, () => task),
+    onSettled: () => invalidateEntities(qc, TASK_WRITE, { self: 'tasks' }),
   })
 }
 
-export function useUpdateTask() {
+/** Pass the task id so that writes to the same task run serially, in order. */
+export function useUpdateTask(taskId?: number) {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['tasks', 'update'],
-    scope: { id: 'tasks' },
+    scope: taskId === undefined ? undefined : { id: `task-${taskId}` },
     mutationFn: ({ id, patch }: { id: number; patch: Partial<Task> }) => api.patch<Task>(`/tasks/${id}`, patch),
-    onMutate: async ({ id, patch }) => {
-      const snap = await snapshot(qc, ...taskPrefixes)
-      patchEverywhere<Task>(qc, keys.tasks.all, id, (t) => ({ ...t, ...patch }))
-      return { snap }
-    },
+    onMutate: ({ id, patch }) => optimisticPatch<Task>(qc, keys.tasks.all, [id], patch),
     onError: (err, _v, ctx) => {
-      restore(qc, ctx?.snap)
+      revertPatch(qc, ctx)
       onError('Task update failed — rolled back')(err)
     },
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.tasks.all }),
-        qc.invalidateQueries({ queryKey: keys.projects.all }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-      ]),
+    onSuccess: (task) => {
+      if (lastWrite(qc, 'tasks')) patchEverywhere<Task>(qc, keys.tasks.all, task.id, () => task)
+    },
+    onSettled: () => invalidateEntities(qc, TASK_WRITE, { self: 'tasks' }),
   })
 }
 
@@ -428,20 +471,16 @@ export function useDeleteTask() {
     mutationKey: ['tasks', 'delete'],
     mutationFn: (id: number) => api.delete(`/tasks/${id}`),
     onMutate: async (id) => {
-      const snap = await snapshot(qc, ...taskPrefixes)
+      const snap = await snapshot(qc, keys.tasks.all)
       patchEverywhere<Task>(qc, keys.tasks.all, id, () => null)
       return { snap }
     },
     onError: (err, _v, ctx) => {
-      restore(qc, ctx?.snap)
+      // with other task writes in flight the final invalidation restores the card instead
+      if (lastWrite(qc, 'tasks')) restore(qc, ctx?.snap)
       onError('Could not delete task')(err)
     },
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: keys.tasks.all }),
-        qc.invalidateQueries({ queryKey: keys.projects.all }),
-        qc.invalidateQueries({ queryKey: keys.metrics.all }),
-      ]),
+    onSettled: () => invalidateEntities(qc, TASK_WRITE, { self: 'tasks' }),
   })
 }
 
@@ -449,20 +488,19 @@ export function useDeleteTask() {
 // Users
 // ----------------------------------------------------------------------------
 
-export function useUpdateUser() {
+/** Pass the user id so that writes to the same user run serially, in order. */
+export function useUpdateUser(userId?: number) {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['users', 'update'],
+    scope: userId === undefined ? undefined : { id: `user-${userId}` },
     mutationFn: ({ id, patch }: { id: number; patch: Partial<User> }) => api.patch<User>(`/users/${id}`, patch),
-    onMutate: async ({ id, patch }) => {
-      const snap = await snapshot(qc, keys.users.all)
-      patchEverywhere<User>(qc, keys.users.all, id, (u) => ({ ...u, ...patch }))
-      return { snap }
-    },
+    onMutate: ({ id, patch }) => optimisticPatch<User>(qc, keys.users.all, [id], patch),
     onError: (err, _v, ctx) => {
-      restore(qc, ctx?.snap)
+      revertPatch(qc, ctx)
       onError('Could not update teammate')(err)
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: keys.users.all }),
+    // 'users' also covers /auth/me, in case you edited yourself
+    onSettled: () => invalidateEntities(qc, ['users', 'events'], { self: 'users' }),
   })
 }

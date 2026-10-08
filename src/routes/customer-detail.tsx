@@ -49,7 +49,7 @@ export function CustomerDetailPage() {
   const { data: health } = useQuery(customerHealthQuery(customerId))
   const { can, canEditCustomer } = useCan()
   const owner = users.find((u) => u.id === customer.ownerId)
-  const update = useUpdateCustomer()
+  const update = useUpdateCustomer(customerId)
   const del = useDeleteCustomers()
   const navigate = useNavigate()
   const [editing, setEditing] = useState(false)

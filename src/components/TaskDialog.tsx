@@ -18,7 +18,7 @@ export function TaskDialog({ task, users, onClose }: { task: Task | null; users:
 
 function TaskBody({ task, users }: { task: Task; users: User[] }) {
   const { me, can } = useCan()
-  const update = useUpdateTask()
+  const update = useUpdateTask(task.id)
   const byId = new Map(users.map((u) => [u.id, u]))
   return (
     <div className="space-y-5 text-sm" data-testid="task-dialog">
