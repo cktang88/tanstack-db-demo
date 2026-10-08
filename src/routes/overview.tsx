@@ -1,13 +1,18 @@
 import { useQuery, useSuspenseQueries } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { Suspense, useState, useTransition } from 'react'
+import { Suspense, useMemo, useState, useTransition } from 'react'
+import type { Customer } from '../../shared/domain'
 import { RevenueChart, SignupsChart, DonutChart } from '../components/charts'
 import { Avatar, Badge, Card, PageHeader, Segmented, Skeleton, Spinner, Stat } from '../components/ui'
 import { money, moneyCompact, number, percent, relative } from '../lib/format'
+import { sortPins, usePins } from '../lib/pins'
 import {
   breakdownQuery,
+  customersByIdsQuery,
   customersListQuery,
+  distinctIds,
   invoicesListQuery,
+  openInvoiceTotalsQuery,
   overviewQuery,
   recentActivityQuery,
   revenueQuery,
@@ -92,13 +97,13 @@ export function OverviewPage() {
         </Card>
         <Card
           title="Live activity"
-          actions={<span className="flex items-center gap-1 text-xs text-emerald-600">● polling 10s</span>}
+          actions={<span className="flex items-center gap-1 text-xs text-emerald-600">● pushed via SSE</span>}
         >
           <RecentActivity />
         </Card>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="mb-6 grid gap-6 lg:grid-cols-2">
         <Card
           title="Top accounts by MRR"
           actions={
@@ -120,6 +125,7 @@ export function OverviewPage() {
           <OverdueInvoices />
         </Card>
       </div>
+      <PinnedAccounts />
     </>
   )
 }
@@ -176,20 +182,72 @@ function TopCustomers() {
   )
 }
 
+const NO_CUSTOMERS = new Map<number, Customer>()
+const NO_TOTALS = new Map<number, number>()
+
 function OverdueInvoices() {
   const { data, isPending } = useQuery(invoicesListQuery({ page: 1, pageSize: 6, sort: 'dueAt', status: ['overdue'] }))
+  // the invoices only carry customer ids: one batched lookup for their companies
+  const ids = useMemo(() => distinctIds(data?.data.map((i) => i.customerId) ?? []), [data])
+  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(ids))
   if (isPending) return <Skeleton className="h-48" />
   return (
-    <ul className="divide-y divide-zinc-100 dark:divide-zinc-800">
+    <ul className="divide-y divide-zinc-100 dark:divide-zinc-800" data-testid="overdue-invoices">
       {data?.data.map((i) => (
-        <li key={i.id} className="flex items-center justify-between py-2 text-sm">
-          <Link to="/customers/$customerId" params={{ customerId: i.customerId }} className="font-mono text-xs hover:underline">
-            {i.number}
+        <li key={i.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+          <Link
+            to="/customers/$customerId"
+            params={{ customerId: i.customerId }}
+            className="min-w-0 flex-1 truncate hover:underline"
+          >
+            <span className="font-mono text-xs">{i.number}</span>{' '}
+            <span className="text-zinc-500">· {customers.get(i.customerId)?.company ?? '…'}</span>
           </Link>
           <span className="text-xs text-zinc-500">due {relative(i.dueAt)}</span>
           <span className="w-24 text-right tabular-nums">{money(i.amount)}</span>
         </li>
       ))}
     </ul>
+  )
+}
+
+function PinnedAccounts() {
+  // localStorage pins + ONE batched customer lookup + ONE query of their open invoices
+  const pins = usePins()
+  const ids = useMemo(() => distinctIds(pins.map((p) => p.id)), [pins])
+  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(ids))
+  const { data: open = NO_TOTALS } = useQuery(openInvoiceTotalsQuery(ids))
+  // archived customers are no longer served, so their pins drop out (an inner join)
+  const data = sortPins(pins).flatMap((p) => {
+    const c = customers.get(p.id)
+    return c ? [{ ...c, outstanding: open.get(c.id) ?? 0 }] : []
+  })
+  return (
+    <Card
+      title={`Pinned accounts (${data.length})`}
+      actions={<span className="text-xs text-zinc-400">localStorage ⨝ server data</span>}
+    >
+      {data.length === 0 ? (
+        <p className="text-sm text-zinc-500">
+          Pin customers from their detail page — pins are stored in localStorage and synced across tabs.
+        </p>
+      ) : (
+        <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3" data-testid="pinned-accounts">
+          {data.map((c) => (
+            <li key={c.id} className="rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
+              <Link to="/customers/$customerId" params={{ customerId: c.id }} className="font-medium hover:underline">
+                {c.company}
+              </Link>
+              <div className="mt-1 flex items-center justify-between text-xs text-zinc-500">
+                <Badge value={c.status} />
+                <span>
+                  {money(c.mrr)} MRR · {money(c.outstanding)} open invoices
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
   )
 }
