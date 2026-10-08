@@ -492,6 +492,27 @@ export const resources: Record<string, Resource> = {
     read: 'billing:read',
     mode: 'read-only', // rollup maintained by triggers
   },
+  'mrr-movements': {
+    name: 'mrr-movements',
+    table: 'mrr_movements',
+    key: 'id',
+    keyType: 'number',
+    columns: {
+      id: n('id'),
+      customerId: n('customer_id'),
+      at: t('at'),
+      month: t('substr(at, 1, 7)'),
+      kind: t('kind'),
+      oldMrr: n('old_mrr'),
+      newMrr: n('new_mrr'),
+      delta: n('delta'),
+    },
+    defaultSort: '-id',
+    read: 'billing:read',
+    // ledger: written by a trigger on customers.mrr, never by clients. Like mrr-snapshots it is revenue
+    // history and keeps archived customers' movements.
+    mode: 'read-only',
+  },
   'mrr-snapshots': {
     name: 'mrr-snapshots',
     table: 'mrr_snapshots',

@@ -370,6 +370,15 @@ export function seed(db: DB, opts: SeedOptions = {}) {
     const insSub = db.prepare(
       `INSERT INTO subscriptions (customer_id, product_id, quantity, unit_price, status, started_at, canceled_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
+    // history flows through the same triggers as live writes: one net MRR movement per
+    // signup (held while its subscriptions are inserted) and one per churn
+    const holdMrr = db.prepare(
+      `INSERT INTO mrr_hold (customer_id, mrr_before, at) VALUES (@id, (SELECT mrr FROM customers WHERE id = @id), @at)`,
+    )
+    const releaseMrr = db.prepare(`DELETE FROM mrr_hold WHERE customer_id = ?`)
+    const cancelSubs = db.prepare(
+      `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
+    )
     const insInvoice = db.prepare(
       `INSERT INTO invoices (number, customer_id, status, issued_at, due_at, paid_at) VALUES (?, ?, 'open', ?, ?, NULL)`,
     )
@@ -433,7 +442,9 @@ export function seed(db: DB, opts: SeedOptions = {}) {
       // subscriptions (base plan + add-ons)
       const months = Math.floor(ageDays / 30)
       const churnMonth = status === 'churned' ? Math.max(1, Math.floor(months * r.next())) : null
-      const canceledAt = churnMonth !== null ? iso(new Date(created.getTime() + churnMonth * 30 * day)) : null
+      // (never in the future: a churned account churned by now)
+      const canceledAt =
+        churnMonth !== null ? iso(new Date(Math.min(created.getTime() + churnMonth * 30 * day, now.getTime()))) : null
       const subStatus = status === 'trial' ? 'trialing' : status === 'churned' ? 'canceled' : 'active'
       const base = PRODUCTS[PLAN_PRODUCT_ID[plan] - 1]!
       const lines: Array<{ productId: number; quantity: number; unitPrice: number; name: string }> = [
@@ -446,7 +457,15 @@ export function seed(db: DB, opts: SeedOptions = {}) {
           lines.push({ productId: 7, quantity: 1, unitPrice: 49900, name: PRODUCTS[6]!.name })
       }
       if (r.next() < 0.1) lines.push({ productId: 8, quantity: r.int(1, 5), unitPrice: 2500, name: PRODUCTS[7]!.name })
-      for (const l of lines) insSub.run(i, l.productId, l.quantity, l.unitPrice, subStatus, iso(created), canceledAt)
+      holdMrr.run({ id: i, at: iso(created) })
+      for (const l of lines)
+        insSub.run(i, l.productId, l.quantity, l.unitPrice, subStatus === 'canceled' ? 'active' : subStatus, iso(created), null)
+      releaseMrr.run(i)
+      if (canceledAt !== null) {
+        holdMrr.run({ id: i, at: canceledAt })
+        cancelSubs.run(canceledAt, i)
+        releaseMrr.run(i)
+      }
 
       // monthly invoices with line items; payments settle them (trigger)
       if (plan !== 'free' && status !== 'trial') {

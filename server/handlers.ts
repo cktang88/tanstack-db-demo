@@ -1,5 +1,5 @@
 import { Context, Effect, Schema } from 'effect'
-import { PLAN_PRICE, type Customer, type CustomerStatus, type Plan } from '../shared/domain.ts'
+import type { Customer, CustomerStatus, Plan } from '../shared/domain.ts'
 import {
   CustomerInput,
   CustomerPatch,
@@ -225,8 +225,42 @@ interface Business {
 }
 
 const SUB_STATUS: Record<CustomerStatus, string> = { active: 'active', trial: 'trialing', churned: 'canceled' }
-const planProductId = (db: Sqlite['Service'], plan: Plan) =>
-  (db.prepare(`SELECT id FROM products WHERE kind = 'plan' AND plan_code = ?`).get(plan) as { id: number }).id
+/** the catalog's product for a plan (its unit_price is the list price; there is no second price table) */
+const planProduct = (db: Sqlite['Service'], plan: Plan) =>
+  db.prepare(`SELECT id, unit_price AS unitPrice FROM products WHERE kind = 'plan' AND plan_code = ?`).get(plan) as {
+    id: number
+    unitPrice: number
+  }
+
+/** publish MRR movements appended since `lastId` */
+const touchMovementsSince = (lastId: number) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    const ids = yield* sql(() =>
+      (db.prepare(`SELECT id FROM mrr_movements WHERE id > ? ORDER BY id`).all(lastId) as Array<{ id: number }>).map((r) => r.id),
+    )
+    for (const id of ids) yield* touch('mrr-movements', id)
+  })
+
+/**
+ * Run a business operation that may change a customer's MRR in several steps
+ * (e.g. a plan change cancels one subscription and starts another) so that the
+ * MRR ledger records one net movement instead of a fake churn + new pair.
+ */
+const withMrrHold = <A, E, R>(customerId: number, effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    const lastId = yield* sql(() => (db.prepare(`SELECT COALESCE(MAX(id), 0) AS m FROM mrr_movements`).get() as { m: number }).m)
+    yield* sql(() =>
+      db
+        .prepare(`INSERT INTO mrr_hold (customer_id, mrr_before, at) VALUES (?, (SELECT mrr FROM customers WHERE id = ?), ?)`)
+        .run(customerId, customerId, new Date().toISOString()),
+    )
+    const result = yield* effect
+    yield* sql(() => db.prepare(`DELETE FROM mrr_hold WHERE customer_id = ?`).run(customerId))
+    yield* touchMovementsSince(lastId)
+    return result
+  })
 
 /** The customer's current base-plan subscription, if any. */
 const baseSubscription = (db: Sqlite['Service'], customerId: number) =>
@@ -258,30 +292,34 @@ const syncSubscriptions = (customer: Customer, next: { plan: Plan; seats: number
     const { db } = yield* ctx
     const now = new Date().toISOString()
     const base = yield* sql(() => baseSubscription(db, customer.id))
-    yield* sql(() => {
-      if (next.status === 'churned') {
+    yield* withMrrHold(
+      customer.id,
+      sql(() => {
+        if (next.status === 'churned') {
+          db.prepare(
+            `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
+          ).run(now, customer.id)
+          return
+        }
+        const status = SUB_STATUS[next.status]
+        const product = planProduct(db, next.plan)
+        const productId = product.id
+        if (!base || base.productId !== productId) {
+          // plan change (or reactivation): close the old base plan and start a new one at list price
+          if (base) db.prepare(`UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ?`).run(now, base.id)
+          db.prepare(
+            `INSERT INTO subscriptions (customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
+          ).run(customer.id, productId, next.seats, product.unitPrice, status, now)
+        } else {
+          db.prepare(`UPDATE subscriptions SET quantity = ?, status = ? WHERE id = ?`).run(next.seats, status, base.id)
+        }
+        // add-ons follow the account's lifecycle
         db.prepare(
-          `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
-        ).run(now, customer.id)
-        return
-      }
-      const status = SUB_STATUS[next.status]
-      const productId = planProductId(db, next.plan)
-      if (!base || base.productId !== productId) {
-        // plan change (or reactivation): close the old base plan and start a new one at list price
-        if (base) db.prepare(`UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ?`).run(now, base.id)
-        db.prepare(
-          `INSERT INTO subscriptions (customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        ).run(customer.id, productId, next.seats, PLAN_PRICE[next.plan], status, now)
-      } else {
-        db.prepare(`UPDATE subscriptions SET quantity = ?, status = ? WHERE id = ?`).run(next.seats, status, base.id)
-      }
-      // add-ons follow the account's lifecycle
-      db.prepare(
-        `UPDATE subscriptions SET status = ? WHERE customer_id = ? AND status != 'canceled'
+          `UPDATE subscriptions SET status = ? WHERE customer_id = ? AND status != 'canceled'
          AND product_id IN (SELECT id FROM products WHERE kind = 'addon')`,
-      ).run(status, customer.id)
-    })
+        ).run(status, customer.id)
+      }),
+    )
     yield* touchSubscriptions(customer.id)
   })
 
@@ -409,14 +447,19 @@ const business: Record<string, Business> = {
           return yield* new Conflict({
             message: 'Customer has partially paid open invoices; settle or credit them before archiving',
           })
-        yield* sql(() => {
-          const now = new Date().toISOString()
-          db.prepare(`UPDATE invoices SET status = 'void' WHERE customer_id = ? AND status IN ('open', 'overdue')`).run(before.id)
-          db.prepare(`UPDATE customers SET deleted_at = ?, status = 'churned' WHERE id = ?`).run(now, before.id)
-          db.prepare(
-            `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
-          ).run(now, before.id)
-        })
+        yield* withMrrHold(
+          before.id,
+          sql(() => {
+            const now = new Date().toISOString()
+            db.prepare(`UPDATE invoices SET status = 'void' WHERE customer_id = ? AND status IN ('open', 'overdue')`).run(
+              before.id,
+            )
+            db.prepare(`UPDATE customers SET deleted_at = ?, status = 'churned' WHERE id = ?`).run(now, before.id)
+            db.prepare(
+              `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
+            ).run(now, before.id)
+          }),
+        )
         for (const i of open) yield* audit('update', 'invoices', i.id, { status: i.status }, { status: 'void' })
         yield* touchSubscriptions(before.id)
         yield* touchBalances(before.id)
@@ -451,24 +494,25 @@ const business: Record<string, Business> = {
           return yield* new Conflict({
             message: 'Change the base plan by editing the customer’s plan; subscriptions here are for add-ons',
           })
+        if (customer.status === 'churned')
+          return yield* new Conflict({ message: 'Churned customers cannot take add-ons; reactivate the account first' })
         const now = new Date().toISOString()
-        const id = yield* sql(
-          () =>
-            (
-              db
-                .prepare(
-                  `INSERT INTO subscriptions (id, customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-                )
-                .get(
-                  data.id ?? null,
-                  data.customerId,
-                  data.productId,
-                  data.quantity,
-                  product.unitPrice,
-                  data.status ?? 'active',
-                  now,
-                ) as { id: number }
-            ).id,
+        // add-ons follow the account's lifecycle (a trial's add-ons are trialing too)
+        const status = SUB_STATUS[customer.status]
+        const id = yield* withMrrHold(
+          data.customerId,
+          sql(
+            () =>
+              (
+                db
+                  .prepare(
+                    `INSERT INTO subscriptions (id, customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+                  )
+                  .get(data.id ?? null, data.customerId, data.productId, data.quantity, product.unitPrice, status, now) as {
+                  id: number
+                }
+              ).id,
+          ),
         )
         const row = (yield* touch('subscriptions', id))!
         yield* touch('customers', data.customerId)
@@ -481,21 +525,28 @@ const business: Record<string, Business> = {
         const { db } = yield* ctx
         const patch = yield* decode(SubscriptionPatch, input)
         if (before.status === 'canceled') return yield* new Conflict({ message: 'Canceled subscriptions cannot be changed' })
-        yield* sql(() =>
-          db
-            .prepare(`UPDATE subscriptions SET quantity = ?, status = ?, canceled_at = ? WHERE id = ?`)
-            .run(
-              patch.quantity ?? before.quantity,
-              patch.status ?? before.status,
-              (patch.status ?? before.status) === 'canceled' ? new Date().toISOString() : null,
-              before.id,
-            ),
-        )
-        const after = (yield* touch('subscriptions', before.id))!
-        // keep the customer projection in sync when the base plan's seat count changes
         const isPlan = yield* sql(
           () => (db.prepare(`SELECT kind FROM products WHERE id = ?`).get(before.productId) as { kind: string }).kind === 'plan',
         )
+        if (isPlan && patch.status !== undefined && patch.status !== before.status)
+          return yield* new Conflict({
+            message: 'The base plan’s status follows the customer; change the customer’s status or plan instead',
+          })
+        yield* withMrrHold(
+          before.customerId,
+          sql(() =>
+            db
+              .prepare(`UPDATE subscriptions SET quantity = ?, status = ?, canceled_at = ? WHERE id = ?`)
+              .run(
+                patch.quantity ?? before.quantity,
+                patch.status ?? before.status,
+                (patch.status ?? before.status) === 'canceled' ? new Date().toISOString() : null,
+                before.id,
+              ),
+          ),
+        )
+        const after = (yield* touch('subscriptions', before.id))!
+        // keep the customer projection in sync when the base plan's seat count changes
         if (isPlan && patch.quantity)
           yield* sql(() => db.prepare(`UPDATE customers SET seats = ? WHERE id = ?`).run(patch.quantity, before.customerId))
         yield* touch('customers', before.customerId)

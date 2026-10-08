@@ -102,3 +102,92 @@ describe('archiving customers', () => {
     expect((await owner.get<Customer>(`/customers/${inv.customerId}`)).status).toBe(200)
   })
 })
+
+const newCustomer = {
+  name: 'Mrr Person',
+  email: 'mrr@example.com',
+  company: 'Mrrco',
+  plan: 'pro',
+  status: 'active',
+  country: 'US',
+  seats: 10,
+  ownerId: 1,
+}
+type Movement = { customerId: number; kind: string; oldMrr: number; newMrr: number; delta: number; month: string }
+const movements = async (customerId: number) =>
+  (await billing.get<Page<Movement>>(`/mrr-movements?customerId=${customerId}&sort=id`)).body.data
+
+describe('MRR movements ledger', () => {
+  it('records one net movement per customer change (no churn + new for a plan change)', async () => {
+    const c = (await owner.post<Customer>('/customers', newCustomer)).body
+    await owner.patch(`/customers/${c.id}`, { plan: 'enterprise', seats: 2 }) // 49000 -> 25800
+    await owner.patch(`/customers/${c.id}`, { seats: 4 }) // -> 51600
+    await owner.patch(`/customers/${c.id}`, { status: 'churned' })
+    await owner.patch(`/customers/${c.id}`, { status: 'active' })
+    expect((await movements(c.id)).map((m) => [m.kind, m.delta])).toEqual([
+      ['new', 49000],
+      ['contraction', 25800 - 49000],
+      ['expansion', 51600 - 25800],
+      ['churn', -51600],
+      ['reactivation', 51600],
+    ])
+  })
+  it('counts trials from conversion and add-ons as expansion', async () => {
+    const c = (await owner.post<Customer>('/customers', { ...newCustomer, status: 'trial' })).body
+    expect(c.mrr).toBe(0)
+    expect(await movements(c.id)).toEqual([])
+    const addon = await billing.post('/subscriptions', { customerId: c.id, productId: 5, quantity: 10 })
+    expect(addon.body.status).toBe('trialing') // add-ons follow the account
+    expect(await movements(c.id)).toEqual([])
+    await owner.patch(`/customers/${c.id}`, { status: 'active' })
+    await billing.post('/subscriptions', { customerId: c.id, productId: 8, quantity: 1 })
+    expect((await movements(c.id)).map((m) => [m.kind, m.delta])).toEqual([
+      ['new', 49000 + 4000],
+      ['expansion', 2500],
+    ])
+  })
+  it('is append-only', async () => {
+    const m = (await billing.get<Page<{ id: number }>>('/mrr-movements?limit=1')).body.data[0]!
+    expect((await owner.post('/mrr-movements', { customerId: 1 })).status).toBe(405)
+    expect((await owner.patch(`/mrr-movements/${m.id}`, { delta: 1 })).status).toBe(405)
+    expect(() => t.db().prepare(`DELETE FROM mrr_movements WHERE id = ?`).run(m.id)).toThrow(/append-only/)
+  })
+  it('snapshots derive from the ledger: later seat changes do not rewrite history', async () => {
+    await billing.post('/jobs/rebuild-mrr')
+    const snaps = async () =>
+      (await billing.get<Page<{ month: string; mrr: number }>>('/mrr-snapshots?sort=month&limit=100')).body.data
+    const before = await snaps()
+    const c = (await owner.get<Page<Customer>>('/customers?status=active&plan=pro&sort=id&limit=1')).body.data[0]!
+    await owner.patch(`/customers/${c.id}`, { seats: c.seats + 5 })
+    await billing.post('/jobs/rebuild-mrr')
+    const after = await snaps()
+    expect(after.slice(0, -1).map((s) => s.mrr)).toEqual(before.slice(0, -1).map((s) => s.mrr))
+    const current = after.at(-1)!
+    const total = (t.db().prepare(`SELECT SUM(mrr) AS s FROM customers`).get() as { s: number }).s
+    expect(current.mrr).toBe(total)
+  })
+})
+
+describe('subscriptions vs the customer projection', () => {
+  it('base-plan status changes go through the customer', async () => {
+    const c = (await owner.post<Customer>('/customers', newCustomer)).body
+    const base = (await billing.get<Page<{ id: number }>>(`/subscriptions?customerId=${c.id}`)).body.data[0]!
+    expect((await billing.patch(`/subscriptions/${base.id}`, { status: 'canceled' })).status).toBe(409)
+    expect((await billing.patch(`/subscriptions/${base.id}`, { quantity: 12 })).status).toBe(200)
+    expect((await owner.get<Customer>(`/customers/${c.id}`)).body).toMatchObject({ seats: 12, mrr: 12 * 4900, status: 'active' })
+  })
+  it('churned customers cannot take add-ons', async () => {
+    const c = (await owner.post<Customer>('/customers', { ...newCustomer, status: 'churned' })).body
+    expect((await billing.post('/subscriptions', { customerId: c.id, productId: 5, quantity: 1 })).status).toBe(409)
+  })
+  it('plan prices come from the product catalog', async () => {
+    const pro = (await owner.get<{ unitPrice: number }>('/products/3')).body
+    expect((await owner.patch('/products/3', { unitPrice: 5100 })).status).toBe(200)
+    try {
+      const c = (await owner.post<Customer>('/customers', { ...newCustomer, seats: 3 })).body
+      expect(c.mrr).toBe(3 * 5100)
+    } finally {
+      await owner.patch('/products/3', { unitPrice: pro.unitPrice })
+    }
+  })
+})
