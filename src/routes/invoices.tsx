@@ -8,7 +8,7 @@ import { Badge, ChipFilter, PageHeader, Stat } from '../components/ui'
 import { markInvoicePaid } from '../db/actions'
 import { listTotalQuery } from '../db/aggregates'
 import { INVOICE_SORTS, invoicesCollection, type InvoiceSort } from '../db/collections'
-import { useWindow, WINDOW } from '../db/hooks'
+import { usePageAnchor, usePagedWindow, WINDOW } from '../db/hooks'
 import { MAX_ROWS, searchPattern } from '../db/pushdown'
 import { date, money, number } from '../lib/format'
 import { useDebouncedParam } from '../lib/hooks'
@@ -46,6 +46,7 @@ function useInvoiceRows(s: InvoiceListParams) {
   const field: InvoiceSort = sort && isSortable(sort.id) ? sort.id : 'issuedAt'
   const direction = sort?.desc === false ? 'asc' : 'desc'
   // one on-demand window; the customer's company comes with each invoice (customerCompany)
+  const anchor = usePageAnchor((s.page - 1) * s.pageSize, s.pageSize)
   const page = useLiveQuery({
     ...WINDOW,
     query: (q) => {
@@ -53,12 +54,12 @@ function useInvoiceRows(s: InvoiceListParams) {
       return (hasFilters(s) ? base.where(({ i }) => allOf(invoiceFilters(s)(i))) : base)
         .orderBy(({ i }) => i.order[field], direction)
         .limit(s.pageSize)
-        .offset((s.page - 1) * s.pageSize)
+        .offset(anchor)
     },
   })
   // count and amount of every match: a server aggregate
   const totals = useQuery(listTotalQuery('invoices', listParams(s), 'amount'))
-  const { rows, isPlaceholder } = useWindow(page)
+  const { rows, isPlaceholder } = usePagedWindow(page, (s.page - 1) * s.pageSize, s.pageSize)
   return {
     rows,
     isPlaceholder,

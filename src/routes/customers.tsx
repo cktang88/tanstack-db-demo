@@ -10,7 +10,7 @@ import { Avatar, Badge, ChipFilter, Dialog, PageHeader } from '../components/ui'
 import { createCustomer, deleteCustomers, updateCustomers } from '../db/actions'
 import { listTotalQuery } from '../db/aggregates'
 import { CUSTOMER_SORTS, customersCollection, selectionCollection, usersCollection, type CustomerSort } from '../db/collections'
-import { useUsersById, useWindow, WINDOW } from '../db/hooks'
+import { useUsersById, usePageAnchor, usePagedWindow, WINDOW } from '../db/hooks'
 import { MAX_ROWS, searchPattern } from '../db/pushdown'
 import { date, money, number } from '../lib/format'
 import { useDebouncedParam } from '../lib/hooks'
@@ -49,6 +49,7 @@ function useCustomerRows(s: CustomerListParams) {
   const direction = sort?.desc === false ? 'asc' : 'desc'
   // One on-demand window: pushed down as ?<filters>&sort=<field>,id&limit=<offset+size> (the
   // composite sort key is unique, so the window is exact and its tie request is a single row).
+  const anchor = usePageAnchor((s.page - 1) * s.pageSize, s.pageSize)
   const page = useLiveQuery({
     ...WINDOW,
     query: (q) => {
@@ -56,13 +57,13 @@ function useCustomerRows(s: CustomerListParams) {
       return (hasFilters(s) ? base.where(({ c }) => allOf(customerFilters(s)(c))) : base)
         .orderBy(({ c }) => c.order[field], direction)
         .limit(s.pageSize)
-        .offset((s.page - 1) * s.pageSize)
+        .offset(anchor)
     },
   })
   // count and MRR of *every* match: a server aggregate (the collection only holds windows)
   const totals = useQuery(listTotalQuery('customers', listParams(s), 'mrr'))
   const usersById = useUsersById()
-  const { rows, isPlaceholder } = useWindow(page)
+  const { rows, isPlaceholder } = usePagedWindow(page, (s.page - 1) * s.pageSize, s.pageSize)
   return {
     rows: useMemo(
       () => rows.map((c) => ({ ...c, ownerColor: c.ownerId ? usersById.get(c.ownerId)?.avatarColor : undefined })),

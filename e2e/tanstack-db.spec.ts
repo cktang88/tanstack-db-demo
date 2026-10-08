@@ -53,15 +53,15 @@ test('the customers table pushes every window down to the API; revisiting a wind
     await expect(table.getByTestId('page-info')).toHaveText(/^26–50 of /)
   })
   const reads = requests.map(decodeURIComponent)
-  // filters, the composite sort key (owner name, then id: unique, so the window is exact) and the
-  // window as a prefix (TanStack DB counts the offset over local rows) — each as one request
+  // filters and the composite sort key (owner name, then id: unique, so the window is exact); the
+  // next page moves the same window (setWindow), so it asks for just that page — each one request
   expect(reads).toContain('GET /api/customers?status[in]=active&plan[in]=pro&sort=owner,id&limit=25')
-  expect(reads).toContain('GET /api/customers?status[in]=active&plan[in]=pro&sort=owner,id&limit=50')
+  expect(reads).toContain('GET /api/customers?status[in]=active&plan[in]=pro&sort=owner,id&limit=25&offset=25')
   // the header's count and MRR over *all* matches is a server total
   expect(reads).toContain('GET /api/customers?status=active&plan=pro&limit=0&sum=mrr')
   // never a whole table, never a tie-group download: every customers read is a bounded window or a total
   for (const r of reads.filter((r) => r.startsWith('GET /api/customers')))
-    expect(r).toMatch(/[?&](limit=(0|25|50)(&|$)|limit=0&sum=mrr$)/)
+    expect(r).toMatch(/[?&](limit=(0|25)(&offset=25)?$|limit=0&sum=mrr$)/)
 
   // back to a window that was loaded before: served from the collection and the query cache
   const revisit = await apiRequestsDuring(page, async () => {

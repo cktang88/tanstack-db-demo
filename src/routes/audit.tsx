@@ -8,7 +8,7 @@ import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { date, relative } from '../lib/format'
 import { auditCollection, usersCollection } from '../db/collections'
-import { WINDOW } from '../db/hooks'
+import { usePageAnchor, usePagedWindow, WINDOW } from '../db/hooks'
 import { listTotalQuery } from '../db/aggregates'
 import { MAX_ROWS } from '../db/pushdown'
 import type { AuditParams } from '../lib/search'
@@ -62,7 +62,8 @@ function Changes({ json }: { json: string }) {
 function useAuditRows(search: AuditParams) {
   // On-demand: filters + window pushed down (action[eq]/entity[eq]/actorId[eq], sort=-id, limit/offset);
   // the actor join happens locally against the eager users collection.
-  const { data } = useLiveQuery({
+  const anchor = usePageAnchor((search.page - 1) * search.pageSize, search.pageSize)
+  const rows = useLiveQuery({
     ...WINDOW,
     query: (q) => {
       const base = q.from({ a: auditCollection })
@@ -79,18 +80,15 @@ function useAuditRows(search: AuditParams) {
               return c.length === 1 ? c[0]! : and(c[0]!, c[1]!, ...c.slice(2))
             })
           : base
-      const page = filtered
-        .orderBy(({ a }) => a.id, 'desc')
-        .limit(search.pageSize)
-        .offset((search.page - 1) * search.pageSize)
-      return q
-        .from({ a: page })
+      return filtered
         .leftJoin({ u: usersCollection }, ({ a, u }) => eq(a.actorId, u.id))
         .orderBy(({ a }) => a.id, 'desc')
+        .limit(search.pageSize)
+        .offset(anchor)
         .select(({ a, u }) => ({ ...a, actorName: u?.name, actorColor: u?.avatarColor }))
     },
   })
-  return data
+  return usePagedWindow(rows, (search.page - 1) * search.pageSize, search.pageSize).rows
 }
 
 type Row = ReturnType<typeof useAuditRows>[number]

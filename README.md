@@ -234,8 +234,13 @@ limit that matches more rows than one request returns is refused (`SubsetTooLarg
   `stringSort: 'lexical'`), pushed down as `?sort=field,id`: windows are exact and the tie group is one row, which the
   collection answers from the row it already has (no second request). Owner name and customer company sort through
   the server's `owner` / `customerCompany` sort keys;
-- **windows**: `limit`, and `offset` as a prefix (TanStack DB counts offsets over local rows, so page _n_ loads the first
-  _n_ pages — tables let you page through the first 10,000 matches; flip the sort or filter for the rest);
+- **windows**: `limit`/`offset`. A new live query always loads its window from the start of the source (TanStack DB
+  trusts neither a remote offset nor a cursor before its first request), so the tables build their query once and
+  move its window with `setWindow` (`usePagedWindow`): the next page is `offset=25&limit=25`, not `limit=50`. A window
+  still holds every row before it, so a jump to page _n_ is one `limit=n*25` request (`usePageAnchor` rebuilds the
+  query for jumps) — tables let you page through the first 10,000 matches; flip the sort or filter for the rest.
+  The ledger keeps prefix paging: with the window on a query that joins on-demand collections, the joins' key loads
+  were aborted and the ledger never became ready;
 - **joins**: the joined side loads lazily by key (`?id[in]=…`), e.g. the ledger's invoices and customers, the selected
   customers of the bulk-action summary, the pinned accounts.
 
@@ -272,7 +277,10 @@ Against `data/big.db` (production build, local API, owner): Overview MRR and the
   unbounded read of a big table.
 - The two above compound: a held query is still an _active_ subset, so it is re-read after every direct write too. A
   3 s hold cut the journey's requests by a fifth but lost the race again (the fallback loaded every overdue invoice,
-  2.7 MB); 10 s never did in our runs. There is no "keep the rows, but stop refreshing them" mode.
+  2.7 MB). 10 s loses it less often, but not never: 1 run in ~25 on the big database still fell back (every payment
+  on Billing, every "labs" customer on Overview — both refused by the guard, so the window stayed empty). The re-read
+  after a direct write is itself a trigger: rows that left a window are deleted while another window shows them.
+  There is no "keep the rows, but stop refreshing them" mode.
 - Inner joins drive from whichever side has fewer rows _loaded_ (`getActiveAndLazySources`, db `joins.ts`), which can
   be the 250k-row on-demand side; queries that must drive from a small local collection use a left join.
 - A cursor boundary on a string sort is only pushed down with `stringSort: 'lexical'` (`canExpressCursorOrder`, db
@@ -320,10 +328,37 @@ What it shows, honestly:
   re-read every active window (the ones on screen _and_ the ones held for 10 s, e.g. the 1.1 s `?q=labs&limit=50`
   search page), and SQLite serves them one at a time. TanStack Query only refetches what is mounted; held queries
   are inactive there.
-- Paging and sorting are slower because TanStack DB counts offsets over local rows: page 2 is `limit=50`, not
-  `offset=25&limit=25`.
+- Sorting re-reads the window from the start; paging moves the window (`setWindow`, one page per request), but a
+  window always holds every row before it, so a deep jump downloads the whole prefix (page 200: 1.35 MB vs 7 kB on
+  `main`).
 - Cold load is heavier (409 kB) because the eager small tables (tasks, time entries) load whole; it is still bounded.
 - Where the data is bounded (tags, tasks, teams) the DB branch is still the faster and simpler one.
 
 The SQL work that made both usable at this size (indexes, FTS5, the revenue rollup) is in **Scale: millions of rows**
 above and is the same on both branches.
+
+### What the docs and issues say, and the upstream fix
+
+We went through the TanStack DB docs and the TanStack/db issues, PRs and discussions for these problems
+(2026-10-08; query-db-collection 1.4.2 and db 0.12.3 are the latest releases):
+
+- **Re-reading every active window after a direct write is intended** since query-db-collection 1.3.0 (PR #1826).
+  The docs: "Direct writes therefore refetch active enabled queries and remove inactive or disabled entries"; there is
+  no opt-out. **PR #2065 (open, by the maintainer) removes it**: matching rows are patched into the active cached
+  windows instead. Built from that PR and swapped into this app, on the big database (same API, median of 5):
+
+  | build                               | time   | requests | kB    |
+  | ----------------------------------- | ------ | -------- | ----- |
+  | `main` (Query)                      | 7.1 s  | 93       | 465   |
+  | this branch                         | 13.1 s | 132      | 1,120 |
+  | this branch + PR #2065 (unreleased) | 9.5 s  | 92       | 944   |
+
+  It no longer re-reads the overview's top-accounts window after a churn; it drops the row and fetches the one
+  missing row (`limit=1&offset=5`). One e2e assertion encodes today's re-read and would change; the other 58 pass.
+
+- **Rows deleted on release, then a full-source load**: unanswered discussion #1309; the RFC that would have governed
+  it (#1657) was withdrawn, with "occasional conservative refetch" as the accepted trade-off. Live-query `gcTime` is
+  the documented keep-alive; `persistedGcTime` only applies with SQLite persistence.
+- **Pagination**: the docs say the loader "may request a prefix, a suffix, a tie group, or the full filtered source";
+  `useLiveInfiniteQuery` grows a local window. Nothing sends only page _n_ of a fresh query.
+- **Progressive sync** (subset first, the rest in the background) exists only for Electric collections.

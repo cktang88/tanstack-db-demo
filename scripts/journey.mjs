@@ -141,15 +141,17 @@ await step('Projects -> board', async () => {
   await page.getByTestId('task-card').first().waitFor()
 })
 await step('move a task right', async () => {
-  // the first column that still has a task (repeated RESET=0 runs drain "todo")
-  const [from, to] = await page.evaluate(() => {
+  // the first column that still has a task to move right (repeated RESET=0 runs drain "todo");
+  // with every task done, move one back instead
+  const [from, to, label] = await page.evaluate(() => {
     const cols = ['todo', 'in_progress', 'review', 'done']
-    const i = cols.findIndex((c) => document.querySelector(`[data-testid=column-${c}] [data-testid=task-card]`))
-    return [cols[i], cols[i + 1]]
+    const has = (c) => document.querySelector(`[data-testid=column-${c}] [data-testid=task-card]`)
+    const i = cols.slice(0, 3).findIndex(has)
+    return i >= 0 ? [cols[i], cols[i + 1], 'Move right'] : ['done', 'review', 'Move left']
   })
   const sel = `[data-testid=column-${to}] [data-testid=column-count]`
   const before = await page.locator(sel).textContent()
-  await page.getByTestId(`column-${from}`).getByTestId('task-card').first().getByLabel('Move right').click()
+  await page.getByTestId(`column-${from}`).getByTestId('task-card').first().getByLabel(label).click()
   await page.waitForFunction(([sel, b]) => document.querySelector(sel).textContent !== b, [sel, before])
 })
 await step('Team page', async () => {
