@@ -418,3 +418,47 @@ export const rowCountQuery = (resource: 'customers' | 'invoices' | 'tasks' | 'pr
     select: (p) => p.total,
     staleTime: STALE,
   })
+
+// ----------------------------------------------------------------------------
+// Pinned accounts, project "next up" (port of the TanStack DB branch features)
+// ----------------------------------------------------------------------------
+
+/**
+ * Open + overdue invoices of some customers, in ONE request
+ * (`/invoices?customerId=1,2,3&status=open,overdue`), summed per customer
+ * client-side (gross: before partial payments).
+ */
+export const openInvoiceTotalsQuery = (customerIds: readonly number[]) =>
+  queryOptions({
+    queryKey: [...keys.invoices.all, 'open-by-customers', customerIds] as const,
+    queryFn: ({ signal }) =>
+      api.get<Page<Invoice>>('/invoices', { customerId: [...customerIds], status: ['open', 'overdue'], limit: 10_000 }, signal),
+    select: (p) => {
+      const totals = new Map<number, number>()
+      for (const i of p.data) totals.set(i.customerId, (totals.get(i.customerId) ?? 0) + i.amount)
+      return totals
+    },
+    enabled: customerIds.length > 0,
+    placeholderData: keepPreviousData,
+    staleTime: STALE,
+  })
+
+/** Up to `n` not-done tasks per project, by board position. */
+export function nextUpByProject(tasks: readonly Task[], n = 3) {
+  const out = new Map<number, Task[]>()
+  for (const t of [...tasks].sort((a, b) => a.position - b.position || a.id - b.id)) {
+    if (t.status === 'done') continue
+    const list = out.get(t.projectId) ?? []
+    if (list.length < n) out.set(t.projectId, [...list, t])
+  }
+  return out
+}
+
+/** Every open task in ONE request, grouped into each project's "next up" list. */
+export const nextUpTasksQuery = () =>
+  queryOptions({
+    queryKey: [...keys.tasks.all, 'next-up'] as const,
+    queryFn: ({ signal }) => api.get<Page<Task>>('/tasks', { 'status[neq]': 'done', sort: 'position', limit: 10_000 }, signal),
+    select: (p) => nextUpByProject(p.data),
+    staleTime: STALE,
+  })

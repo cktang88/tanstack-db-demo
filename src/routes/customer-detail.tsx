@@ -1,5 +1,5 @@
 import { field } from '../lib/format'
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { useMutationState, useQuery, useSuspenseQuery, type Mutation } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { Fragment, Suspense, useActionState, useMemo, useState } from 'react'
 import { PAYMENT_METHODS, type Customer, type Invoice } from '../../shared/domain'
@@ -13,14 +13,16 @@ import {
   useAddSubscription,
   useDeleteContact,
   useDeleteCustomers,
-  useMarkInvoicePaid,
-  useRecordPayment,
+  useMarkInvoicePaidWithEvent,
+  useRecordPaymentOptimistic,
+  useSeatsEditor,
   useTagCustomer,
   useUntagCustomer,
   useUpdateCustomer,
   useUpdateSubscription,
   useVoidInvoice,
 } from '../lib/mutations'
+import { pins, useIsPinned } from '../lib/pins'
 import {
   customerActivityQuery,
   customerBalanceQuery,
@@ -45,7 +47,6 @@ export function CustomerDetailPage() {
   const { customerId } = customerDetailRoute.useParams()
   const { data: customer } = useSuspenseQuery(customerQuery(customerId))
   const { data: users = [] } = useQuery(usersQuery())
-  const { data: balance } = useQuery(customerBalanceQuery(customerId))
   const { data: health } = useQuery(customerHealthQuery(customerId))
   const { can, canEditCustomer, privileged } = useCan()
   const owner = users.find((u) => u.id === customer.ownerId)
@@ -70,6 +71,7 @@ export function CustomerDetailPage() {
         actions={
           <>
             {!editable && <span className="text-xs text-zinc-500">read-only — owned by {owner?.name ?? 'nobody'}</span>}
+            <PinButton customerId={customer.id} />
             <button className="btn-secondary" onClick={() => setEditing(true)} disabled={!editable}>
               Edit
             </button>
@@ -89,7 +91,11 @@ export function CustomerDetailPage() {
         }
       />
       <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        <Stat label="Plan" value={<Badge value={customer.plan} />} hint={`${customer.seats} seats`} />
+        <Stat
+          label="Plan"
+          value={<Badge value={customer.plan} />}
+          hint={editable ? <SeatsSlider key={customer.id} id={customer.id} seats={customer.seats} /> : `${customer.seats} seats`}
+        />
         <Stat
           label="Status"
           value={
@@ -102,12 +108,7 @@ export function CustomerDetailPage() {
           testId="customer-health"
         />
         <Stat label="MRR" value={money(customer.mrr)} hint="Σ active subscriptions" testId="customer-mrr" />
-        <Stat
-          label="Balance"
-          value={money(balance?.outstanding ?? 0)}
-          hint={balance ? `${money(balance.overdue)} overdue · ${money(balance.paid)} paid lifetime` : 'no invoices'}
-          testId="customer-balance"
-        />
+        <BalanceStat customerId={customer.id} />
         <Stat
           label="Owner"
           value={
@@ -148,6 +149,65 @@ export function CustomerDetailPage() {
   )
 }
 
+/**
+ * Throttled autosave: every tick moves seats and MRR in every cached copy of
+ * the customer instantly, while the server receives at most one write per 500ms.
+ */
+function SeatsSlider({ id, seats }: { id: number; seats: number }) {
+  const { setSeats, draft, saved, pending } = useSeatsEditor(id)
+  const value = draft ?? seats
+  return (
+    <label className="flex items-center gap-2">
+      <input
+        type="range"
+        min={1}
+        // never clamp a large account to the slider's range
+        max={Math.max(300, value * 2)}
+        value={value}
+        aria-label="Seats"
+        onChange={(e) => setSeats(Number(e.target.value), seats)}
+        className="w-28 accent-brand-600"
+      />
+      <span className="tabular-nums" data-testid="seats-value">
+        {value} seats
+      </span>
+      {/* the last value the server confirmed, while newer ones are still being saved */}
+      {pending && (
+        <span className="text-xs text-amber-600" data-testid="seats-saved">
+          saved: {saved ?? '—'}
+        </span>
+      )}
+    </label>
+  )
+}
+
+function PinButton({ customerId }: { customerId: number }) {
+  const pinned = useIsPinned(customerId)
+  return (
+    <button className="btn-secondary" aria-pressed={pinned} onClick={() => pins.toggle(customerId)}>
+      {pinned ? '★ Pinned' : '☆ Pin'}
+    </button>
+  )
+}
+
+/**
+ * Balance = open invoices net of partial payments (the server's
+ * customer_balances rollup); overdue and paid-lifetime are gross invoice sums.
+ */
+function BalanceStat({ customerId }: { customerId: number }) {
+  const { data: balance } = useQuery(customerBalanceQuery(customerId))
+  const { data: invoices = [] } = useQuery(customerInvoicesQuery(customerId))
+  const sumOf = (status: Invoice['status']) => invoices.filter((i) => i.status === status).reduce((s, i) => s + i.amount, 0)
+  return (
+    <Stat
+      label="Balance"
+      testId="customer-balance"
+      value={<span data-testid="balance-value">{money(balance?.outstanding ?? 0)}</span>}
+      hint={`open invoices net of partial payments · ${money(sumOf('overdue'))} overdue (gross) · ${money(sumOf('paid'))} paid lifetime`}
+    />
+  )
+}
+
 function Subscriptions({ customer }: { customer: Customer }) {
   const { data: subs = [] } = useQuery(customerSubscriptionsQuery(customer.id))
   const { data: products = [] } = useQuery(productsQuery())
@@ -171,7 +231,7 @@ function Subscriptions({ customer }: { customer: Customer }) {
               {can('billing:write') && s.status !== 'canceled' && byId.get(s.productId)?.kind === 'addon' && (
                 <button
                   className="text-xs text-zinc-400 hover:text-red-600"
-                  aria-label="Cancel add-on"
+                  aria-label={`Cancel subscription #${s.id}`}
                   onClick={() => change.mutate({ id: s.id, patch: { status: 'canceled' } })}
                 >
                   ✕
@@ -297,15 +357,36 @@ function Tags({ customerId, editable }: { customerId: number; editable: boolean 
 function Usage({ customerId }: { customerId: number }) {
   const { data = [], isPending } = useQuery(customerUsageQuery(customerId))
   const series = useMemo(() => data.map((d) => ({ day: d.day, value: d.quantity })), [data])
-  if (isPending) return <Skeleton className="h-48" />
-  if (!series.length) return <Empty>No metered usage.</Empty>
-  return <DailyChart data={series} label="API calls per day" />
+  return (
+    <div data-testid="usage" data-state={isPending ? 'loading' : 'ready'}>
+      {isPending ? (
+        <Skeleton className="h-48" />
+      ) : series.length ? (
+        <DailyChart data={series} label="API calls per day" />
+      ) : (
+        <Empty>No metered usage.</Empty>
+      )}
+    </div>
+  )
+}
+
+/** Ids of this page's invoices with a write in flight (mark paid, void). */
+function usePendingInvoiceIds() {
+  const ids = useMutationState({
+    filters: { mutationKey: ['invoices'], status: 'pending' },
+    select: (m: Mutation<unknown, Error, unknown>) => {
+      const v = m.state.variables
+      return typeof v === 'number' ? v : v && typeof v === 'object' && 'id' in v ? Number(v.id) : null
+    },
+  })
+  return new Set(ids)
 }
 
 function CustomerInvoices({ customerId }: { customerId: number }) {
   const { data: invoices } = useSuspenseQuery(customerInvoicesQuery(customerId))
   const [open, setOpen] = useState<number | null>(null)
-  const markPaid = useMarkInvoicePaid()
+  const markPaid = useMarkInvoicePaidWithEvent()
+  const saving = usePendingInvoiceIds()
   const { can } = useCan()
   const outstanding = invoices.filter((i) => i.status === 'open' || i.status === 'overdue').reduce((s, i) => s + i.amount, 0)
   const lifetime = invoices.filter((i) => i.status === 'paid').reduce((s, i) => s + i.amount, 0)
@@ -313,8 +394,8 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
     <Card
       title={`Invoices (${invoices.length})`}
       actions={
-        <span className="text-xs text-zinc-500">
-          Lifetime {money(lifetime)} · Outstanding {money(outstanding)}
+        <span className="text-xs text-zinc-500" data-testid="invoice-totals">
+          Lifetime {money(lifetime)} · Open invoices {money(outstanding)} (before payments)
         </span>
       }
     >
@@ -344,11 +425,15 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
                   <td className="td">{date(i.issuedAt)}</td>
                   <td className="td">
                     <Badge value={i.status} />
+                    {saving.has(i.id) && <span className="ml-2 text-xs text-amber-600">saving…</span>}
                   </td>
                   <td className="td text-right tabular-nums">{money(i.amount)}</td>
                   <td className="td text-right" onClick={(e) => e.stopPropagation()}>
                     {can('billing:write') && (i.status === 'open' || i.status === 'overdue') && (
-                      <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => markPaid.mutate(i.id)}>
+                      <button
+                        className="btn-ghost px-2 py-0.5 text-xs"
+                        onClick={() => markPaid.mutate({ id: i.id, number: i.number, customerId })}
+                      >
                         Mark paid
                       </button>
                     )}
@@ -373,10 +458,11 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
 function InvoiceDetail({ invoice }: { invoice: Invoice }) {
   const { data: lines = [] } = useQuery(invoiceLineItemsQuery(invoice.id))
   const { data: payments = [] } = useQuery(invoicePaymentsQuery(invoice.id))
-  const pay = useRecordPayment()
+  const pay = useRecordPaymentOptimistic()
   const voidIt = useVoidInvoice()
   const { can } = useCan()
   const paid = payments.reduce((s, p) => s + p.amount, 0)
+  const remaining = invoice.amount - paid
   const open = invoice.status === 'open' || invoice.status === 'overdue'
   return (
     <div className="grid gap-4 text-sm md:grid-cols-2" data-testid="invoice-detail">
@@ -399,10 +485,10 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
         </div>
         <ul className="space-y-1" data-testid="invoice-payments">
           {payments.map((p) => (
-            <li key={p.id} className="flex justify-between gap-2">
+            <li key={p.id} className={`flex justify-between gap-2 ${p.id < 0 ? 'opacity-60' : ''}`}>
               <span>
-                {date(p.receivedAt)} · <Badge value={p.method} tone="zinc" />{' '}
-                <span className="font-mono text-xs">{p.reference}</span>
+                {date(p.receivedAt)} · <Badge value={p.method} tone="zinc" /> {/* the reference is generated by the server */}
+                <span className="font-mono text-xs">{p.reference || 'pending…'}</span>
               </span>
               <span className="tabular-nums">{money(p.amount)}</span>
             </li>
@@ -415,8 +501,10 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
             action={(f) =>
               pay.mutate({
                 invoiceId: invoice.id,
-                amount: Math.round(Number(f.get('amount')) * 100) || undefined,
-                method: f.get('method') as 'card',
+                customerId: invoice.customerId,
+                amount: Math.round(Number(field(f, 'amount')) * 100) || remaining,
+                overdue: invoice.status === 'overdue',
+                method: field(f, 'method') as 'card',
               })
             }
           >
@@ -426,7 +514,7 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
               step="0.01"
               min="0.01"
               className="input w-28"
-              placeholder={(invoice.amount - paid) / 100 + ''}
+              placeholder={String(remaining / 100)}
               aria-label="Payment amount"
             />
             <select name="method" className="input w-24" aria-label="Payment method">
@@ -457,9 +545,10 @@ function CustomerActivity({ customerId }: { customerId: number }) {
       ) : data.length === 0 ? (
         <Empty>No activity.</Empty>
       ) : (
-        <ul className="space-y-3 text-sm">
+        <ul className="space-y-3 text-sm" data-testid="customer-activity">
           {data.map((e) => (
-            <li key={e.id}>
+            // a negative id is the provisional entry of a write still in flight
+            <li key={e.id} className={e.id < 0 ? 'opacity-60' : undefined}>
               <div>{e.message}</div>
               <div className="text-xs text-zinc-400">{relative(e.createdAt)}</div>
             </li>

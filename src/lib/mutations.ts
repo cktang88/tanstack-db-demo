@@ -5,6 +5,16 @@ import { keys } from './queries'
 import { invalidateEntities, mutating, type Entity } from './sync'
 import { toast } from './toast'
 import type { CustomerFormValues } from './validation'
+import { useRef, useState } from 'react'
+import { PLAN_PRICE, type ActivityEvent, type CustomerBalance, type Product, type Subscription } from '../../shared/domain'
+import {
+  customerActivityQuery,
+  customerBalanceQuery,
+  customerSubscriptionsQuery,
+  invoicePaymentsQuery,
+  productsQuery,
+} from './queries'
+import { useThrottledCallback } from './throttle'
 
 // ----------------------------------------------------------------------------
 // Helpers for the "classic" React Query optimistic-update dance.
@@ -502,5 +512,211 @@ export function useUpdateUser(userId?: number) {
     },
     // 'users' also covers /auth/me, in case you edited yourself
     onSettled: () => invalidateEntities(qc, ['users', 'events'], { self: 'users' }),
+  })
+}
+
+// ----------------------------------------------------------------------------
+// Customer detail: seats slider, provisional activity, optimistic payments;
+// products: optimistic price/for-sale edits (port of the TanStack DB branch)
+// ----------------------------------------------------------------------------
+
+/** Price per seat of the customer's base plan: its sold price when that subscription is cached, else list price. */
+export function seatPrice(c: Pick<Customer, 'plan'>, subs: readonly Subscription[] = [], products: readonly Product[] = []) {
+  const kind = new Map(products.map((p) => [p.id, p]))
+  const base = subs
+    .filter((s) => s.status !== 'canceled' && kind.get(s.productId)?.kind === 'plan')
+    .sort((a, b) => b.id - a.id)[0]
+  return base && kind.get(base.productId)?.planCode === c.plan ? base.unitPrice : PLAN_PRICE[c.plan]
+}
+
+/** Optimistic MRR after a seats change: moves by the seat delta at the plan's unit price (server value read back on save). */
+export const predictSeatsMrr = (c: Pick<Customer, 'plan' | 'status' | 'seats' | 'mrr'>, seats: number, unitPrice: number) =>
+  c.status === 'active' ? Math.max(0, c.mrr + (seats - c.seats) * unitPrice) : c.mrr
+
+/**
+ * Seats slider: every tick moves seats + predicted MRR in every cached copy of
+ * the customer at once, while the server gets at most one PATCH per 500 ms
+ * (throttled, trailing). `saved` is the last server-confirmed seat count.
+ */
+export function useSeatsEditor(customerId: number) {
+  const qc = useQueryClient()
+  const [draft, setDraft] = useState<number | null>(null)
+  const [saved, setSaved] = useState<number | null>(null)
+  const wanted = useRef<number | null>(null)
+  const confirmed = useRef<number | null>(null)
+
+  const apply = (seats: number) => {
+    const page = <T>(key: QueryKey) => qc.getQueryData<Page<T>>(key)?.data
+    const subs = page<Subscription>(customerSubscriptionsQuery(customerId).queryKey)
+    const products = page<Product>(productsQuery().queryKey)
+    patchEverywhere<Customer>(qc, keys.customers.all, customerId, (c) => ({
+      ...c,
+      seats,
+      mrr: predictSeatsMrr(c, seats, seatPrice(c, subs, products)),
+    }))
+  }
+  const settleDraft = () => {
+    wanted.current = null
+    setDraft(null)
+  }
+
+  const save = useMutation({
+    mutationKey: ['customers', 'seats'],
+    scope: { id: `customer-${customerId}` },
+    mutationFn: (seats: number) => api.patch<Customer>(`/customers/${customerId}`, { seats }),
+    onSuccess: (server) => {
+      confirmed.current = server.seats
+      setSaved(server.seats)
+      if (throttled.pending() || wanted.current !== server.seats) return // a newer value is on its way
+      // reconcile with the server row (real MRR, updatedAt) unless another customer write would be overwritten
+      if (lastWrite(qc, 'customers')) patchEverywhere<Customer>(qc, keys.customers.all, server.id, () => server)
+      settleDraft()
+    },
+    onError: (err) => {
+      throttled.cancel()
+      if (confirmed.current !== null) apply(confirmed.current)
+      settleDraft()
+      onError('Could not save seats — rolled back')(err)
+    },
+    onSettled: () => {
+      if (!throttled.pending()) void invalidateEntities(qc, CUSTOMER_WRITE, { self: 'customers' })
+    },
+  })
+  const throttled = useThrottledCallback((seats: number) => save.mutate(seats), 500)
+
+  const setSeats = (seats: number, current: number) => {
+    if (wanted.current === null) {
+      confirmed.current = current
+      setSaved(current)
+    }
+    wanted.current = seats
+    setDraft(seats)
+    apply(seats)
+    // a refetch already in flight would land without this change: cancel it, then re-apply
+    if (qc.isFetching({ queryKey: keys.customers.all }))
+      void qc.cancelQueries({ queryKey: keys.customers.all }).then(() => wanted.current === seats && apply(seats))
+    throttled(seats)
+  }
+  return { setSeats, draft, saved, pending: draft !== null }
+}
+
+/**
+ * "Mark paid" that also drops a provisional "Invoice … marked paid" entry
+ * (negative id) into the customer's activity; the refetch after the write
+ * replaces it with the server's real event.
+ */
+export function useMarkInvoicePaidWithEvent() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: ['invoices', 'mark-paid'],
+    mutationFn: ({ id }: { id: number; number: string; customerId: number }) =>
+      api.post(`/invoices/${id}/pay`, { method: 'card' }),
+    onMutate: async ({ id, number, customerId }) => {
+      const now = new Date().toISOString()
+      const activityKey = customerActivityQuery(customerId).queryKey
+      await qc.cancelQueries({ queryKey: activityKey })
+      const event: ActivityEvent = {
+        id: nextTempId--,
+        type: 'invoice.paid',
+        category: 'invoice',
+        actorId: null,
+        customerId,
+        message: `Invoice ${number} marked paid`,
+        createdAt: now,
+      }
+      qc.setQueryData<Page<ActivityEvent>>(activityKey, (old) =>
+        old ? { ...old, data: [event, ...old.data], total: old.total + 1 } : old,
+      )
+      const invoice = await optimisticPatch<Invoice>(qc, keys.invoices.all, [id], { status: 'paid', paidAt: now })
+      return { invoice, eventId: event.id }
+    },
+    onError: (err, _v, ctx) => {
+      revertPatch(qc, ctx?.invoice)
+      if (ctx) patchEverywhere<ActivityEvent>(qc, keys.events.all, ctx.eventId, () => null)
+      onError('Could not mark invoice paid — rolled back')(err)
+    },
+    onSettled: () => invalidateEntities(qc, PAYMENT_WRITE, { self: 'invoices' }),
+  })
+}
+
+/**
+ * Record a payment optimistically: the ledger row (reference "pending…" until
+ * the server assigns one) and the customer's balance move at once.
+ */
+export function useRecordPaymentOptimistic() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: ['payments', 'create'],
+    mutationFn: ({
+      invoiceId,
+      amount,
+      method,
+    }: {
+      invoiceId: number
+      customerId: number
+      amount: number
+      overdue: boolean
+      method: Payment['method']
+    }) => api.post<Payment>('/payments', { invoiceId, amount, method }),
+    onMutate: async ({ invoiceId, customerId, amount, overdue, method }) => {
+      const paymentsKey = invoicePaymentsQuery(invoiceId).queryKey
+      const balanceKey = customerBalanceQuery(customerId).queryKey
+      await Promise.all([qc.cancelQueries({ queryKey: paymentsKey }), qc.cancelQueries({ queryKey: balanceKey })])
+      const temp: Payment = {
+        id: nextTempId--,
+        invoiceId,
+        customerId,
+        amount,
+        method,
+        reference: '',
+        receivedAt: new Date().toISOString(),
+        recordedBy: null,
+      }
+      qc.setQueryData<Page<Payment>>(paymentsKey, (old) =>
+        old ? { ...old, data: [...old.data, temp], total: old.total + 1 } : old,
+      )
+      const shift = (sign: 1 | -1) =>
+        qc.setQueryData<CustomerBalance | null>(balanceKey, (b) =>
+          b
+            ? {
+                ...b,
+                outstanding: b.outstanding - sign * amount,
+                overdue: overdue ? b.overdue - sign * amount : b.overdue,
+                paid: b.paid + sign * amount,
+              }
+            : b,
+        )
+      shift(1)
+      return { tempId: temp.id, undoBalance: () => shift(-1) }
+    },
+    onError: (err, _v, ctx) => {
+      if (ctx) {
+        patchEverywhere<Payment>(qc, ['payments'], ctx.tempId, () => null)
+        ctx.undoBalance()
+      }
+      onError('Could not record payment — rolled back')(err)
+    },
+    onSuccess: (payment, _v, ctx) => {
+      patchEverywhere<Payment>(qc, ['payments'], ctx.tempId, () => payment)
+      toast.success('Payment recorded')
+    },
+    onSettled: () => invalidateEntities(qc, BILLING_KEYS, { self: 'payments' }),
+  })
+}
+
+/** Optimistic product edit (price / for sale), rolled back field by field on failure. */
+export function useSaveProduct() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: ['products', 'update'],
+    mutationFn: ({ id, patch }: { id: number; patch: Partial<Pick<Product, 'unitPrice' | 'active'>> }) =>
+      api.patch<Product>(`/products/${id}`, patch),
+    onMutate: ({ id, patch }) => optimisticPatch<Product>(qc, ['products'], [id], patch),
+    onError: (err, _v, ctx) => {
+      revertPatch(qc, ctx)
+      onError('Could not update product — rolled back')(err)
+    },
+    onSuccess: () => toast.success('Product updated'),
+    onSettled: () => invalidateEntities(qc, ['products', 'events'], { self: 'products' }),
   })
 }

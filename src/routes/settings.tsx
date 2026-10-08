@@ -5,6 +5,7 @@ import { api } from '../lib/api'
 import { useCan } from '../lib/auth'
 import { relative } from '../lib/format'
 import { useRevokeSession } from '../lib/mutations'
+import { pins } from '../lib/pins'
 import { sessionsQuery } from '../lib/queries'
 import { useSettings } from '../lib/settings'
 import { toast } from '../lib/toast'
@@ -38,6 +39,12 @@ export function SettingsPage() {
             <label className="flex items-center justify-between text-sm">
               Wide layout
               <input type="checkbox" checked={settings.compact} onChange={(e) => setSettings({ compact: e.target.checked })} />
+            </label>
+            <label className="flex items-center justify-between text-sm">
+              Clear pinned accounts
+              <button className="btn-secondary" onClick={() => pins.clear()}>
+                Clear
+              </button>
             </label>
           </div>
         </Card>

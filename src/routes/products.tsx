@@ -1,10 +1,10 @@
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { useMutationState, useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import type { Subscription } from '../../shared/domain'
 import { Badge, Card, PageHeader } from '../components/ui'
 import { useCan } from '../lib/auth'
 import { money, number } from '../lib/format'
-import { useUpdateProduct } from '../lib/mutations'
+import { useSaveProduct } from '../lib/mutations'
 import { productsQuery, resourceList } from '../lib/queries'
 
 export function ProductsPage() {
@@ -12,7 +12,14 @@ export function ProductsPage() {
   // adoption per product: aggregated client-side from every active subscription (a big list for one number each)
   const { data: subs = [] } = useQuery(resourceList<Subscription>('subscriptions', { status: 'active,past_due', limit: 10000 }))
   const { can } = useCan()
-  const update = useUpdateProduct()
+  const save = useSaveProduct()
+  // rows with an optimistic edit still in flight
+  const pending = new Set(
+    useMutationState({
+      filters: { mutationKey: ['products', 'update'], status: 'pending' },
+      select: (m) => (m.state.variables as { id: number } | undefined)?.id,
+    }),
+  )
   const adoption = useMemo(() => {
     const m = new Map<number, { subs: number; units: number; mrr: number }>()
     for (const s of subs) {
@@ -47,7 +54,11 @@ export function ProductsPage() {
             {products.map((p) => {
               const a = adoption.get(p.id)
               return (
-                <tr key={p.id} data-testid="product-row">
+                <tr
+                  key={p.id}
+                  data-testid="product-row"
+                  className={pending.has(p.id) ? 'bg-amber-50/50 dark:bg-amber-500/5' : undefined}
+                >
                   <td className="td font-mono text-xs">{p.sku}</td>
                   <td className="td">{p.name}</td>
                   <td className="td">
@@ -56,6 +67,8 @@ export function ProductsPage() {
                   <td className="td text-right">
                     {editable ? (
                       <input
+                        // remounts with the current price whenever it changes — including a rollback
+                        key={p.unitPrice}
                         type="number"
                         className="input w-28 text-right"
                         aria-label={`Price of ${p.sku}`}
@@ -63,8 +76,15 @@ export function ProductsPage() {
                         min={0}
                         step={1}
                         onBlur={(e) => {
-                          const cents = Math.round(Number(e.target.value) * 100)
-                          if (cents !== p.unitPrice) update.mutate({ id: p.id, patch: { unitPrice: cents } })
+                          const input = e.currentTarget
+                          const raw = input.value.trim()
+                          const cents = Math.round(Number(raw) * 100)
+                          // empty / invalid / negative input is not "$0": put the current price back
+                          if (raw === '' || !Number.isFinite(cents) || cents < 0) {
+                            input.value = String(p.unitPrice / 100)
+                            return
+                          }
+                          if (cents !== p.unitPrice) save.mutate({ id: p.id, patch: { unitPrice: cents } })
                         }}
                       />
                     ) : (
@@ -80,7 +100,7 @@ export function ProductsPage() {
                       aria-label={`${p.sku} for sale`}
                       checked={p.active}
                       disabled={!editable}
-                      onChange={(e) => update.mutate({ id: p.id, patch: { active: e.target.checked } })}
+                      onChange={(e) => save.mutate({ id: p.id, patch: { active: e.target.checked } })}
                     />
                   </td>
                 </tr>
