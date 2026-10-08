@@ -13,7 +13,9 @@
     "typecheck": "tsc -p tsconfig.json",
     "lint": "vp lint",
     "fmt": "vp fmt",
-    "check": "vp check"
+    "check": "vp check",
+    "db:big": "tsx scripts/seed-big.ts",
+    "bench:api": "tsx scripts/bench-api.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.4",

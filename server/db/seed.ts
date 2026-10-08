@@ -263,6 +263,10 @@ export interface SeedOptions {
   projects?: number
   events?: number
   usageDays?: number
+  /** audit_log rows (the bulk of the audit history) */
+  audit?: number
+  /** progress callback for big seeds (scripts/seed-big.ts) */
+  log?: (message: string) => void
   /** Reference "now" so the data always looks recent. */
   now?: Date
 }
@@ -288,6 +292,8 @@ export function seed(db: DB, opts: SeedOptions = {}) {
   const nProjects = opts.projects ?? 40
   const nEvents = opts.events ?? 3000
   const usageDays = opts.usageDays ?? 30
+  const nAudit = opts.audit ?? 400
+  const log = opts.log ?? (() => {})
   const passwordHash = hashPassword(DEMO_PASSWORD, 'saasly-demo-salt')
 
   db.transaction(() => {
@@ -391,6 +397,7 @@ export function seed(db: DB, opts: SeedOptions = {}) {
     const voidInvoice = db.prepare(`UPDATE invoices SET status = 'void' WHERE id = ?`)
     let invoiceNo = 1000
     for (let i = 1; i <= nCustomers; i++) {
+      if (i % 25_000 === 0) log(`customers ${i.toLocaleString()} / ${nCustomers.toLocaleString()}`)
       const first = r.pick(FIRST)
       const last = r.pick(LAST)
       const company = `${r.pick(CO_A)} ${r.pick(CO_B)}`
@@ -525,6 +532,7 @@ export function seed(db: DB, opts: SeedOptions = {}) {
       }
     }
 
+    log('usage events')
     // ---------------- usage metering (append-only events -> daily rollup via trigger) ----------------
     const insUsage = db.prepare(
       `INSERT INTO usage_events (customer_id, metric, quantity, occurred_at, idempotency_key) VALUES (?, ?, ?, ?, ?)`,
@@ -634,6 +642,7 @@ export function seed(db: DB, opts: SeedOptions = {}) {
       }
     }
 
+    log(`activity feed (${nEvents.toLocaleString()} events)`)
     // ---------------- activity feed ----------------
     const insEvent = db.prepare(`INSERT INTO events (type, actor_id, customer_id, message, created_at) VALUES (?, ?, ?, ?, ?)`)
     const evTimes = Array.from({ length: nEvents }, () => now.getTime() - Math.floor(Math.pow(r.next(), 2) * 120 * day)).sort(
@@ -681,7 +690,8 @@ export function seed(db: DB, opts: SeedOptions = {}) {
       run: (at: string, actor: number, action: string, entity: string, id: number | null, changes: string, req: string) =>
         auditStmt.run(at, actor, action, entity, id, id === null ? null : String(id), changes, req),
     }
-    const auditTimes = Array.from({ length: 400 }, () => now.getTime() - r.int(1, 90 * 24) * 3600 * 1000).sort((a, b) => a - b)
+    log(`audit log (${nAudit.toLocaleString()} entries)`)
+    const auditTimes = Array.from({ length: nAudit }, () => now.getTime() - r.int(1, 90 * 24) * 3600 * 1000).sort((a, b) => a - b)
     auditTimes.forEach((t, a) => {
       const at = iso(new Date(t))
       const kind = r.weighted([
@@ -728,6 +738,7 @@ export function seed(db: DB, opts: SeedOptions = {}) {
       }
   })()
 
+  log('jobs: mark overdue, rebuild MRR snapshots')
   markOverdue(db, now)
   rebuildMrrSnapshots(db, 18, now)
 }

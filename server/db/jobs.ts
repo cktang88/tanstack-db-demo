@@ -8,7 +8,7 @@ export function markOverdue(db: DB, now = new Date()) {
   return db
     .prepare(
       `UPDATE invoices SET status = 'overdue'
-       WHERE status = 'open' AND due_at < ? AND customer_id IN (SELECT id FROM customers WHERE deleted_at IS NULL)
+       WHERE status = 'open' AND due_at < ? AND customer_id NOT IN (SELECT id FROM customers WHERE deleted_at IS NOT NULL)
        RETURNING id, customer_id AS customerId`,
     )
     .all(now.toISOString()) as Array<{ id: number; customerId: number }>

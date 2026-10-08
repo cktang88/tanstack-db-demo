@@ -103,7 +103,38 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 CREATE INDEX IF NOT EXISTS idx_customers_status ON customers(status);
 CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(owner_id);
-CREATE INDEX IF NOT EXISTS idx_customers_created ON customers(created_at);
+-- (created_at) is served by the partial covering idx_customers_live_created_plan below; the old
+-- full index made the planner do a table lookup per row for the signups aggregate
+DROP INDEX IF EXISTS idx_customers_created;
+-- Indexes for the list grammar at scale (pnpm db:big). Lists only ever read live customers,
+-- so these are partial indexes on "deleted_at IS NULL" (smaller, and they match the scope):
+-- filter + sort + COUNT/SUM(mrr) are answered from the index without touching the table.
+CREATE INDEX IF NOT EXISTS idx_customers_live_created_plan ON customers(created_at, plan) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customers_live_mrr ON customers(mrr) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customers_live_status_mrr ON customers(status, mrr) WHERE deleted_at IS NULL;  -- top accounts
+CREATE INDEX IF NOT EXISTS idx_customers_live_status_plan ON customers(status, plan, mrr) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customers_live_plan_status ON customers(plan, status, mrr) WHERE deleted_at IS NULL;
+-- one covering index per access path (an overlapping narrower one tempts the planner into
+-- 250k table lookups): country filter + company sort, and GROUP BY country for the breakdown
+CREATE INDEX IF NOT EXISTS idx_customers_live_country_company ON customers(country, company, status, mrr) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customers_live_company ON customers(company) WHERE deleted_at IS NULL;
+-- the archived set is small: child resources hide it with "customer_id NOT IN (archived ids)"
+CREATE INDEX IF NOT EXISTS idx_customers_archived ON customers(id) WHERE deleted_at IS NOT NULL;
+-- substring search (name/email/company) without scanning every row: a trigram full-text index
+-- answers the same LIKE '%term%' question (case-insensitive) from the index; kept in sync by triggers
+CREATE VIRTUAL TABLE IF NOT EXISTS customers_fts USING fts5(
+  name, email, company, content = 'customers', content_rowid = 'id', tokenize = 'trigram'
+);
+CREATE TRIGGER IF NOT EXISTS trg_customers_fts_insert AFTER INSERT ON customers BEGIN
+  INSERT INTO customers_fts (rowid, name, email, company) VALUES (NEW.id, NEW.name, NEW.email, NEW.company);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_customers_fts_delete AFTER DELETE ON customers BEGIN
+  INSERT INTO customers_fts (customers_fts, rowid, name, email, company) VALUES ('delete', OLD.id, OLD.name, OLD.email, OLD.company);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_customers_fts_update AFTER UPDATE OF name, email, company ON customers BEGIN
+  INSERT INTO customers_fts (customers_fts, rowid, name, email, company) VALUES ('delete', OLD.id, OLD.name, OLD.email, OLD.company);
+  INSERT INTO customers_fts (rowid, name, email, company) VALUES (NEW.id, NEW.name, NEW.email, NEW.company);
+END;
 
 CREATE TABLE IF NOT EXISTS contacts (
   id           INTEGER PRIMARY KEY,
@@ -167,6 +198,10 @@ CREATE TABLE IF NOT EXISTS invoices (
 CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_issued ON invoices(issued_at);
+-- covering indexes: COUNT/SUM(amount) over all (or one status of) the invoices from the index alone
+CREATE INDEX IF NOT EXISTS idx_invoices_customer_amount ON invoices(customer_id, amount);
+CREATE INDEX IF NOT EXISTS idx_invoices_status_issued ON invoices(status, issued_at, customer_id, amount);
+CREATE INDEX IF NOT EXISTS idx_invoices_status_due ON invoices(status, due_at);  -- oldest overdue first
 
 CREATE TABLE IF NOT EXISTS invoice_line_items (
   id           INTEGER PRIMARY KEY,
@@ -192,6 +227,8 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id);
 CREATE INDEX IF NOT EXISTS idx_payments_received ON payments(received_at DESC, id);  -- default sort
+-- monthly revenue: a range scan over (received_at) that never touches the table
+CREATE INDEX IF NOT EXISTS idx_payments_revenue ON payments(received_at, amount, invoice_id);
 
 -- rollup, maintained incrementally by triggers on invoices + payments
 CREATE TABLE IF NOT EXISTS customer_balances (
@@ -334,6 +371,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
   request_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity_at ON audit_log(entity, at DESC, id);  -- filtered, newest first
 CREATE INDEX IF NOT EXISTS idx_audit_entity_key ON audit_log(entity, entity_key);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
 
@@ -439,6 +477,26 @@ END;
 -- ============================== triggers: append-only tables ==============================
 CREATE TRIGGER IF NOT EXISTS trg_audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+-- Monthly revenue rollup (payments are append-only, so an insert trigger keeps it exact):
+-- /metrics/revenue reads a dozen rows instead of grouping a million payments.
+CREATE TABLE IF NOT EXISTS revenue_monthly (
+  month     TEXT PRIMARY KEY,           -- YYYY-MM of received_at
+  revenue   INTEGER NOT NULL DEFAULT 0,
+  payments  INTEGER NOT NULL DEFAULT 0,
+  invoices  INTEGER NOT NULL DEFAULT 0  -- distinct invoices paid (or part-paid) that month
+);
+CREATE TRIGGER IF NOT EXISTS trg_revenue_monthly AFTER INSERT ON payments BEGIN
+  INSERT INTO revenue_monthly (month, revenue, payments, invoices)
+  VALUES (
+    substr(NEW.received_at, 1, 7), NEW.amount, 1,
+    NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = NEW.invoice_id AND p.id != NEW.id
+                AND substr(p.received_at, 1, 7) = substr(NEW.received_at, 1, 7))
+  )
+  ON CONFLICT (month) DO UPDATE SET
+    revenue = revenue + excluded.revenue,
+    payments = payments + 1,
+    invoices = invoices + excluded.invoices;
+END;
 CREATE TRIGGER IF NOT EXISTS trg_payments_no_update BEFORE UPDATE ON payments BEGIN SELECT RAISE(ABORT, 'payments is an append-only ledger'); END;
 CREATE TRIGGER IF NOT EXISTS trg_payments_no_delete BEFORE DELETE ON payments BEGIN SELECT RAISE(ABORT, 'payments is an append-only ledger'); END;
 CREATE TRIGGER IF NOT EXISTS trg_comments_no_update BEFORE UPDATE ON task_comments BEGIN SELECT RAISE(ABORT, 'task_comments is append-only'); END;
@@ -484,10 +542,20 @@ export function openDatabase(file: string): DB {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA)
+  // a database created before the full-text index existed: build it once from the table
+  const any = (sql: string) => (db.prepare(`SELECT EXISTS (${sql}) AS any`).get() as { any: number }).any === 1
+  // ...and the revenue rollup, from the ledger
+  if (!any('SELECT 1 FROM revenue_monthly') && any('SELECT 1 FROM payments'))
+    db.exec(`INSERT INTO revenue_monthly (month, revenue, payments, invoices)
+             SELECT substr(received_at, 1, 7), SUM(amount), COUNT(*), COUNT(DISTINCT invoice_id) FROM payments GROUP BY 1`)
+  const indexed = (db.prepare('SELECT COUNT(*) AS n FROM customers_fts_docsize').get() as { n: number }).n
+  if (indexed === 0 && (db.prepare('SELECT EXISTS (SELECT 1 FROM customers) AS any').get() as { any: number }).any)
+    db.exec(`INSERT INTO customers_fts (customers_fts) VALUES ('rebuild')`)
   return db
 }
 
 export const TABLES = [
+  'customers_fts',
   'roles',
   'permissions',
   'role_permissions',
@@ -504,6 +572,7 @@ export const TABLES = [
   'invoices',
   'invoice_line_items',
   'payments',
+  'revenue_monthly',
   'customer_balances',
   'mrr_movements',
   'mrr_hold',

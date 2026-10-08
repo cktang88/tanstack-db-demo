@@ -93,6 +93,73 @@ Outside demo mode these routes 404, and a schema-version mismatch on a non-empty
 start (migrate it, or start once with `RESEED=1` to replace it with demo data). A brand-new empty database just gets
 the schema.
 
+## Scale: millions of rows
+
+```bash
+pnpm db:big                      # data/big.db: 250k customers, ~13M rows, ~1.9 GB, ~4 min
+DB_FILE=data/big.db pnpm dev     # run the app against it
+pnpm bench:api                   # time every API request the clients make, against data/big.db
+```
+
+`scripts/seed-big.ts` runs the regular seed with big numbers, so the data flows through the same triggers: every rollup,
+ledger and history table stays consistent. Tables over a million rows: `usage_events` (2.8M), `usage_daily` (2.2M),
+`invoice_line_items` (1.7M), `events` (1.5M), `invoices` (1.1M), `payments` (1.1M), `audit_log` (1M). (Settings → Reset
+database re-seeds the _small_ dataset.)
+
+What made it fast (`pnpm bench:api`, median of 5, in-process, before → after, ms):
+
+- **Archived-customer scope**: child resources were filtered with `customer_id IN (every live customer)`, which listed 250k
+  ids on every request (60–115 ms even for one customer's rows). Archived customers are the small set, so it is now
+  `NOT IN (archived)` with a partial index on them.
+- **Partial covering indexes** on `customers … WHERE deleted_at IS NULL` for each filter/sort/aggregate path (lists only
+  read live customers), covering indexes for invoice counts/totals, `(status, due_at)`, `(entity, at)` on the audit log.
+  One covering index per access path: an overlapping narrower one made the planner pick 250k table lookups (4× slower).
+- **Trigram full-text index** (`customers_fts`, FTS5 `tokenize='trigram'`) answers the same `LIKE '%term%'` search from an
+  index (tested to return exactly the same rows); terms under 3 characters still scan.
+- **Revenue rollup** `revenue_monthly`, kept exact by an insert trigger on the append-only ledger, instead of grouping a
+  million payments per request. Date-range predicates instead of `substr()` over every row.
+
+| area      | request                         | before | after |
+| --------- | ------------------------------- | ------ | ----- |
+| customers | first page (newest)             | 61.9   | 34.2  |
+| customers | status+plan filter, sort by MRR | 108.6  | 7.1   |
+| customers | search "labs"                   | 157.7  | 50.7  |
+| customers | search "zz" (no match)          | 707.9  | 699.8 |
+| customers | sort by owner name              | 111.2  | 120.5 |
+| customers | country filter, sort by company | 61.4   | 3.1   |
+| customers | deep page (offset 100k)         | 229    | 314.1 |
+| customers | count only                      | 24.4   | 29.7  |
+| customers | eager load (limit 10000)        | 139.4  | 125.1 |
+| invoices  | first page                      | 598.7  | 135.7 |
+| invoices  | status=overdue                  | 664.5  | 6     |
+| invoices  | search company "labs"           | 1433.8 | 189.8 |
+| invoices  | sort by customer company        | 816.3  | 540.3 |
+| invoices  | one customer                    | 115.2  | 1.1   |
+| invoices  | eager load (limit 10000)        | 565.4  | 132.1 |
+| ledger    | payments, newest 10             | 417.5  | 59.4  |
+| ledger    | payments of one invoice         | 0.8    | 1     |
+| activity  | feed, first page                | 1.6    | 1.5   |
+| activity  | feed, invoice category          | 1.2    | 1.1   |
+| activity  | one customer, newest 20         | 0.9    | 0.9   |
+| usage     | one customer daily api_calls    | 116.6  | 0.9   |
+| usage     | one customer health (view)      | 0.9    | 1.4   |
+| audit     | first page                      | 1.4    | 1.5   |
+| audit     | filter entity=customers         | 39.3   | 37.8  |
+| metrics   | overview                        | 198.1  | 89.3  |
+| metrics   | revenue, 12 months              | 877.3  | 0.9   |
+| metrics   | signups, 12 months              | 181.2  | 166.2 |
+| metrics   | breakdown by country            | 126.2  | 44    |
+| metrics   | breakdown by status, plan=pro   | 90     | 10.1  |
+| metrics   | AR aging                        | 199.9  | 193.2 |
+| metrics   | workload                        | 1.4    | 1.3   |
+| billing   | MRR snapshots                   | 0.9    | 0.9   |
+| detail    | customer                        | 0.8    | 1     |
+| detail    | balance                         | 58.1   | 0.8   |
+
+Still slow by nature (documented, not hidden): 1–2 character searches (full scan), sorting 250k customers by owner name or
+1.1M invoices by customer company (a sort over a joined column — would need denormalising), deep `OFFSET` pages, and exact
+`COUNT(*)`/`SUM` over every row of a million-row table on unfiltered lists (~90 ms).
+
 ## API
 
 Every table is a resource with the same surface (`GET /api/resources` lists them with their mode and permissions):

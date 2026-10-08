@@ -56,7 +56,7 @@ const coerce = (col: ColumnDef, v: unknown) => {
 export function buildWhere(
   columns: Columns,
   filters: Filter[],
-  search?: { term?: string; fields: string[] },
+  search?: { term?: string; fields: string[]; fullText?: (term: string) => { sql: string; params: unknown[] } },
   virtual: Columns = {},
 ) {
   const clauses: string[] = []
@@ -100,7 +100,12 @@ export function buildWhere(
         throw new BadQuery(`Unknown operator "${String(f.op)}"`)
     }
   }
-  if (search?.term) {
+  // the trigram index needs 3+ characters (code points, as the tokenizer counts them); shorter terms scan
+  if (search?.term && search.fullText && Array.from(search.term).length >= 3) {
+    const ft = search.fullText(search.term)
+    clauses.push(ft.sql)
+    params.push(...ft.params)
+  } else if (search?.term) {
     const like = `%${escapeLike(search.term)}%`
     const exprs = search.fields.map((f) => (lookup(columns, f) ?? lookup(virtual, f))!.sql)
     clauses.push(`(${exprs.map((e) => `${e} LIKE ? ESCAPE '\\'`).join(' OR ')})`)
