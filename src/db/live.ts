@@ -39,7 +39,11 @@ const serverCollections = () => [...Object.values(BY_ENTITY), ...Object.values(e
  */
 function resync({ includeAuth }: { includeAuth: boolean }) {
   for (const p of FEED_PAGERS) p.reset()
-  void queryClient.invalidateQueries(includeAuth ? undefined : { predicate: (q) => q.queryKey[0] !== 'auth' })
+  // mark everything stale (inactive subsets refetch when next used) — the syncing collections are refetched below
+  void queryClient.invalidateQueries({
+    refetchType: 'none',
+    ...(!includeAuth && { predicate: (q) => q.queryKey[0] !== 'auth' }),
+  })
   return Promise.all(
     serverCollections()
       .filter(isSyncing)
