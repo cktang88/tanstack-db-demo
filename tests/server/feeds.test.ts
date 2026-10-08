@@ -93,3 +93,26 @@ describe('usage ingestion', () => {
     expect((await owner.post('/usage-events', ev({ customerId: c.id }))).status).toBe(409)
   })
 })
+
+describe('activity feed', () => {
+  type Ev = { id: number; type: string }
+  const feed = async (q: string) => (await owner.get<{ data: Ev[]; nextCursor: number | null }>(`/events/feed?${q}`)).body
+  it('filters by category or exact type, without wildcards or case folding', async () => {
+    const byPrefix = await feed('type=invoice.&limit=200')
+    expect(byPrefix.data.length).toBeGreaterThan(0)
+    expect(byPrefix.data.every((e) => e.type.startsWith('invoice.'))).toBe(true)
+    expect((await feed('type=invoice&limit=200')).data.map((e) => e.id)).toEqual(byPrefix.data.map((e) => e.id))
+    const paid = await feed('type=invoice.paid&limit=200')
+    expect(paid.data.every((e) => e.type === 'invoice.paid')).toBe(true)
+    expect((await feed('type=%25&limit=5')).data).toEqual([]) // "%" is not a wildcard
+    expect((await feed('type=in_oice.&limit=5')).data).toEqual([]) // "_" is not a wildcard
+    expect((await feed('type=INVOICE.&limit=5')).data).toEqual([])
+    expect((await feed('type=inv&limit=5')).data).toEqual([]) // not a partial-word prefix
+  })
+  it('treats cursor=0 as a cursor', async () => {
+    expect((await feed('cursor=0')).data).toEqual([])
+    const first = await feed('limit=3')
+    const next = await feed(`limit=3&cursor=${first.nextCursor}`)
+    expect(next.data[0]!.id).toBeLessThan(first.data[2]!.id)
+  })
+})
