@@ -94,7 +94,7 @@ export const audit = (action: string, entity: string, entityId: unknown, before?
           action,
           entity,
           typeof entityId === 'number' ? entityId : null,
-          entityId === null || entityId === undefined ? null : String(entityId),
+          typeof entityId === 'number' || typeof entityId === 'string' ? String(entityId) : null,
           JSON.stringify(changes),
           requestId,
         ),
