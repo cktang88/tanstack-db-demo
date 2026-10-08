@@ -10,7 +10,7 @@ import {
   UsageEventInput,
 } from '../shared/schemas.ts'
 import { deleteRow, diff, getRow, insertRow, listRows, updateRow } from './db/query.ts'
-import type { ListParams } from './db/sql.ts'
+import { lookup, type ListParams } from './db/sql.ts'
 import { resources, type Access } from './resources.ts'
 import {
   BadRequest,
@@ -36,8 +36,10 @@ const ctx = Effect.gen(function* () {
   return { db: yield* Sqlite, me: yield* CurrentUser, outbox: yield* Outbox, requestId: yield* RequestId }
 })
 
-export const resourceOf = (name: string) =>
-  resources[name] ? Effect.succeed(resources[name]) : Effect.fail(new NotFound({ entity: 'resource', id: name }))
+export const resourceOf = (name: string) => {
+  const r = lookup(resources, name)
+  return r ? Effect.succeed(r) : Effect.fail(new NotFound({ entity: 'resource', id: name }))
+}
 
 const checkAccess = (access: Access | undefined, what: string) =>
   Effect.gen(function* () {
@@ -151,7 +153,7 @@ export const create = (name: string, input: unknown) =>
     const r = yield* resourceOf(name)
     if (r.mode === 'read-only') return yield* new MethodNotAllowed({ message: `${name} is read-only` })
     yield* checkAccess(r.create, `Creating ${name}`)
-    const custom = business[name]?.create
+    const custom = lookup(business, name)?.create
     if (custom) return yield* custom(input)
     if (!r.createSchema) return yield* new MethodNotAllowed({ message: `Creating ${name} is not supported` })
     const { db, me } = yield* ctx
@@ -161,7 +163,7 @@ export const create = (name: string, input: unknown) =>
     const id = yield* sql(() => insertRow(db, r, data))
     const row = yield* touch(name, id)
     yield* audit('create', name, id, undefined, row)
-    yield* business[name]?.afterCreate?.(row!) ?? Effect.void
+    yield* lookup(business, name)?.afterCreate?.(row!) ?? Effect.void
     return row!
   })
 
@@ -173,7 +175,7 @@ export const update = (name: string, id: unknown, input: unknown) =>
     const { db, me } = yield* ctx
     const before = yield* sql(() => getRow(db, r, id, r.scope?.(me)))
     if (!before) return yield* new NotFound({ entity: name, id })
-    const custom = business[name]?.update
+    const custom = lookup(business, name)?.update
     if (custom) return yield* custom(before, input)
     if (!r.patchSchema) return yield* new MethodNotAllowed({ message: `Updating ${name} is not supported` })
     const patch = (yield* decode(r.patchSchema, input)) as Record<string, unknown>
@@ -182,7 +184,7 @@ export const update = (name: string, id: unknown, input: unknown) =>
     yield* sql(() => updateRow(db, r, id, patch))
     const after = yield* touch(name, id)
     yield* audit('update', name, id, before, after!)
-    yield* business[name]?.afterUpdate?.(before, after!) ?? Effect.void
+    yield* lookup(business, name)?.afterUpdate?.(before, after!) ?? Effect.void
     return after!
   })
 
@@ -195,7 +197,7 @@ export const remove = (name: string, id: unknown) =>
     const before = yield* sql(() => getRow(db, r, id, r.scope?.(me)))
     if (!before) return yield* new NotFound({ entity: name, id })
     yield* deny(r.canWrite?.(me, before, db, 'delete'))
-    const custom = business[name]?.remove
+    const custom = lookup(business, name)?.remove
     if (custom) yield* custom(before)
     else yield* sql(() => deleteRow(db, r, id))
     yield* touch(name, id)

@@ -16,6 +16,7 @@ import {
 } from './auth/session.ts'
 import { markOverdue, rebuildMrrSnapshots } from './db/jobs.ts'
 import { parseListParams } from './db/params.ts'
+import { lookup } from './db/sql.ts'
 import { events as eventsRepo, metrics } from './db/repo.ts'
 import { DEMO_USERS, seed } from './db/seed.ts'
 import type { DB } from './db/schema.ts'
@@ -153,7 +154,7 @@ export function makeApp(opts: AppOptions) {
     })
   const idOf = (c: Ctx) => {
     const raw = c.req.param('id')!
-    return resources[c.req.param('resource')!]?.keyType === 'number' ? Number(raw) : raw
+    return lookup(resources, c.req.param('resource')!)?.keyType === 'number' ? Number(raw) : raw
   }
 
   const app = new Hono<Vars>().basePath('/api')
@@ -343,7 +344,7 @@ export function makeApp(opts: AppOptions) {
       )
       const visible = (m: ChangeMessage) => {
         if (m.kind === 'reset') return true
-        const r = resources[m.entity]
+        const r = lookup(resources, m.entity)
         if (!r) return false
         if (r.read && !me.can(r.read)) return false
         if (r.ownerField && m.kind === 'upsert' && (m.row as Record<string, unknown>)[r.ownerField] !== me.user.id) return false

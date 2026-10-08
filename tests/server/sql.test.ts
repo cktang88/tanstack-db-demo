@@ -34,6 +34,9 @@ describe('parseListParams', () => {
 
   it('prefers raw limit/offset when present', () => {
     expect(parseListParams(new URLSearchParams('limit=5&offset=10&page=9'))).toMatchObject({ limit: 5, offset: 10 })
+    // an offset never means "the whole rest of the table"
+    expect(parseListParams(new URLSearchParams('offset=10'))).toMatchObject({ limit: 10_000, offset: 10 })
+    expect(parseListParams(new URLSearchParams('limit=50000'))).toMatchObject({ limit: 10_000 })
   })
 
   it('rejects bad operators and numbers', () => {

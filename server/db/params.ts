@@ -8,7 +8,7 @@ const MAX_PAGE_SIZE = 10_000
  * Parses a URL query string into ListParams.
  *
  *   ?page=2&pageSize=25            -> offset/limit pagination (1-based page)
- *   ?limit=50&offset=100           -> raw offset/limit
+ *   ?limit=50&offset=100           -> raw offset/limit (limit defaults to / is capped at MAX_PAGE_SIZE)
  *   ?sort=-mrr,name                -> ORDER BY mrr DESC, name ASC
  *   ?q=acme                        -> free text search
  *   ?status=active,trial           -> status IN (...)  (shorthand)
@@ -44,7 +44,8 @@ export function parseListParams(query: URLSearchParams, defaults: { pageSize?: n
     return n
   }
   if (query.has('limit') || query.has('offset')) {
-    limit = num('limit')
+    // an offset always comes with a bounded window (never "the rest of the table")
+    limit = num('limit') ?? MAX_PAGE_SIZE
     offset = num('offset')
   } else {
     const pageSize = Math.min(num('pageSize') ?? defaults.pageSize ?? 25, MAX_PAGE_SIZE)

@@ -43,3 +43,26 @@ describe('write transactions', () => {
     expect(me.status).toBe(200) // ...but the login's session survived
   })
 })
+
+describe('prototype keys', () => {
+  it('treats Object.prototype names as unknown resources / fields', async () => {
+    const owner = t.as('owner')
+    expect((await owner.get('/__proto__')).status).toBe(404)
+    expect((await owner.get('/constructor')).status).toBe(404)
+    expect((await owner.get('/toString/1')).status).toBe(404)
+    expect((await owner.get('/customers?sort=constructor')).status).toBe(400)
+    expect((await owner.get('/customers?sort=__proto__')).status).toBe(400)
+    expect((await owner.get('/customers?constructor=1')).status).toBe(400)
+    expect((await owner.get('/customers?hasOwnProperty[eq]=1')).status).toBe(400)
+    expect((await owner.post('/constructor', {})).status).toBe(404)
+  })
+})
+
+describe('list windows', () => {
+  it('bounds ?offset= without a limit', async () => {
+    const r = await t.as('owner').get('/usage-events?offset=1')
+    expect(r.status).toBe(200)
+    expect(r.body.data.length).toBeLessThanOrEqual(10_000)
+    expect(r.body.pageSize).toBe(10_000)
+  })
+})

@@ -33,6 +33,10 @@ export interface ListParams {
 
 export class BadQuery extends Error {}
 
+/** Own-property lookup: query keys like `constructor` or `__proto__` must not resolve to Object.prototype members. */
+export const lookup = <T>(record: Record<string, T>, key: string): T | undefined =>
+  Object.hasOwn(record, key) ? record[key] : undefined
+
 const coerce = (col: ColumnDef, v: unknown) => {
   if (col.type === 'number') {
     const n = Number(v)
@@ -47,7 +51,7 @@ export function buildWhere(columns: Columns, filters: Filter[], search?: { term?
   const clauses: string[] = []
   const params: unknown[] = []
   for (const f of filters) {
-    const col = columns[f.field]
+    const col = lookup(columns, f.field)
     if (!col) throw new BadQuery(`Unknown filter field "${f.field}"`)
     switch (f.op) {
       case 'eq':
@@ -95,7 +99,7 @@ export function buildWhere(columns: Columns, filters: Filter[], search?: { term?
 
 export function buildOrderBy(columns: Columns, sorts: Sort[], fallback = 'id') {
   const parts = sorts.map((s) => {
-    const col = columns[s.field]
+    const col = lookup(columns, s.field)
     if (!col) throw new BadQuery(`Unknown sort field "${s.field}"`)
     return `${col.sql} ${s.dir === 'desc' ? 'DESC' : 'ASC'}`
   })

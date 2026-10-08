@@ -752,4 +752,4 @@ export const resources: Record<string, Resource> = {
 export const RESOURCE_NAMES = Object.keys(resources)
 
 /** Which permission is needed to *receive* change-feed messages for an entity. */
-export const readPermissionOf = (entity: string) => resources[entity]?.read
+export const readPermissionOf = (entity: string) => (Object.hasOwn(resources, entity) ? resources[entity]!.read : undefined)
