@@ -280,3 +280,23 @@ describe('audit trail', () => {
     expect(JSON.parse(tagLog.changes).name).toEqual(['audited', null])
   })
 })
+
+describe('schema', () => {
+  it('keeps the activity feed append-only', () => {
+    const db = t.db()
+    expect(() => db.prepare(`DELETE FROM events WHERE id = 1`).run()).toThrow(/append-only/)
+    expect(() => db.prepare(`UPDATE events SET message = 'x' WHERE id = 1`).run()).toThrow(/append-only/)
+  })
+  it('serves default sorts from an index', () => {
+    const db = t.db()
+    const plan = (q: string) =>
+      (db.prepare(`EXPLAIN QUERY PLAN ${q}`).all() as Array<{ detail: string }>).map((r) => r.detail).join('\n')
+    for (const q of [
+      `SELECT * FROM payments ORDER BY received_at DESC, id ASC LIMIT 25`,
+      `SELECT * FROM usage_events ORDER BY occurred_at DESC, id ASC LIMIT 25`,
+      `SELECT * FROM time_entries ORDER BY spent_on DESC, id ASC LIMIT 25`,
+      `SELECT * FROM tasks WHERE project_id = 1 ORDER BY position ASC, id ASC`,
+    ])
+      expect(plan(q), q).not.toMatch(/TEMP B-TREE/)
+  })
+})

@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_payments_received ON payments(received_at DESC, id);  -- default sort
 
 -- rollup, maintained incrementally by triggers on invoices + payments
 CREATE TABLE IF NOT EXISTS customer_balances (
@@ -260,7 +261,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, position, id);  -- a board column, in order
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -284,6 +285,7 @@ CREATE TABLE IF NOT EXISTS time_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_time_entries_task ON time_entries(task_id);
 CREATE INDEX IF NOT EXISTS idx_time_entries_user ON time_entries(user_id);
+CREATE INDEX IF NOT EXISTS idx_time_entries_spent ON time_entries(spent_on DESC, id);  -- default sort
 
 -- ============================== metering ==============================
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -296,6 +298,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
   UNIQUE (customer_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_customer ON usage_events(customer_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_occurred ON usage_events(occurred_at DESC, id);  -- default sort
 
 -- rollup, maintained incrementally by trigger on usage_events
 CREATE TABLE IF NOT EXISTS usage_daily (
@@ -311,7 +314,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS events (
   id           INTEGER PRIMARY KEY,
   type         TEXT NOT NULL,
-  actor_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  actor_id     INTEGER REFERENCES users(id),  -- no SET NULL: rows are immutable (users are deactivated, not deleted)
   customer_id  INTEGER,
   message      TEXT NOT NULL,
   created_at   TEXT NOT NULL
@@ -443,6 +446,7 @@ CREATE TRIGGER IF NOT EXISTS trg_comments_no_delete BEFORE DELETE ON task_commen
 CREATE TRIGGER IF NOT EXISTS trg_usage_no_update BEFORE UPDATE ON usage_events BEGIN SELECT RAISE(ABORT, 'usage_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_usage_no_delete BEFORE DELETE ON usage_events BEGIN SELECT RAISE(ABORT, 'usage_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_mrr_movements_no_update BEFORE UPDATE ON mrr_movements BEGIN SELECT RAISE(ABORT, 'mrr_movements is an append-only ledger'); END;
 CREATE TRIGGER IF NOT EXISTS trg_mrr_movements_no_delete BEFORE DELETE ON mrr_movements BEGIN SELECT RAISE(ABORT, 'mrr_movements is an append-only ledger'); END;
 
