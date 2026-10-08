@@ -36,27 +36,59 @@ test.afterEach(async ({ page }) => {
   await setChaos(page, { latencyMs: 120, failRate: 0 })
 })
 
-test('filtering, searching, sorting and paging the customers table makes zero network requests', async ({ page }) => {
+/** Big resources are on-demand collections: never loaded whole. */
+const BIG =
+  /^GET \/api\/(customers|invoices|payments|subscriptions|contacts|customer-tags|invoice-line-items|usage-daily|events|audit-log)\?/
+
+test('the customers table pushes every window down to the API; revisiting a window makes no request', async ({ page }) => {
   await page.goto('/customers')
   const table = page.getByTestId('customers-table')
   await expect(table.getByTestId('row')).toHaveCount(25)
   const requests = await apiRequestsDuring(page, async () => {
     await page.getByRole('button', { name: 'Active', pressed: false }).click()
     await page.getByRole('button', { name: 'Pro', pressed: false }).click()
-    await page.getByRole('button', { name: /^owner/i }).click() // sort by a *joined* column
+    await page.getByRole('button', { name: /^owner/i }).click() // owner name: a client-derived sort key
+    await expect(page).toHaveURL(/sort=owner/)
     await page.getByLabel('Next page').click()
-    await page.getByLabel('Search customers').fill('a')
-    await expect(table.getByTestId('row').first()).toContainText('Active')
+    await expect(table.getByTestId('page-info')).toHaveText(/^26–50 of /)
   })
-  expect(requests).toEqual([])
+  const reads = requests.map(decodeURIComponent)
+  // filters, the composite sort key (owner name, then id: unique, so the window is exact) and the
+  // window as a prefix (TanStack DB counts the offset over local rows) — each as one request
+  expect(reads).toContain('GET /api/customers?status[in]=active&plan[in]=pro&sort=owner,id&limit=25')
+  expect(reads).toContain('GET /api/customers?status[in]=active&plan[in]=pro&sort=owner,id&limit=50')
+  // the header's count and MRR over *all* matches is a server total
+  expect(reads).toContain('GET /api/customers?status=active&plan=pro&limit=0&sum=mrr')
+  // never a whole table, never a tie-group download: every customers read is a bounded window or a total
+  for (const r of reads.filter((r) => r.startsWith('GET /api/customers')))
+    expect(r).toMatch(/[?&](limit=(0|25|50)(&|$)|limit=0&sum=mrr$)/)
+
+  // back to a window that was loaded before: served from the collection and the query cache
+  const revisit = await apiRequestsDuring(page, async () => {
+    await page.getByLabel('Previous page').click()
+    await expect(table.getByTestId('page-info')).toHaveText(/^1–25 of /)
+    await expect(table.getByTestId('row')).toHaveCount(25)
+  })
+  expect(revisit).toEqual([])
+
+  // search is the server's ?q= (debounced): the derived searchText keeps exactly those rows locally
+  const searched = await apiRequestsDuring(page, async () => {
+    await page.getByLabel('Search customers').fill('labs')
+    await expect(page).toHaveURL(/q=labs/)
+    await expect(table.getByTestId('row').first()).toContainText(/labs/i)
+  })
+  expect(searched.map(decodeURIComponent)).toContain(
+    'GET /api/customers?status[in]=active&plan[in]=pro&q=labs&sort=owner,id&limit=25',
+  )
 })
 
-test('a write is reflected in every view instantly, with no refetches', async ({ page }) => {
+test('a write is one batch request; on-demand windows on screen are re-read, nothing is loaded whole', async ({ page }) => {
   await page.goto('/')
   const mrrBefore = await page.getByTestId('kpi-mrr').textContent()
   // client-side navigation to a customer that is active
   await page.getByTestId('top-customers').getByRole('link').first().click()
   await expect(page).toHaveURL(/\/customers\/\d+/)
+  const id = Number(new URL(page.url()).pathname.split('/').pop())
   // let the page's first loads (health view, contacts, tags, usage rollup) finish before measuring
   await expect(page.getByTestId('customer-health')).toContainText('API calls')
   await expect(page.getByTestId('tags').getByRole('button').first()).toBeVisible()
@@ -67,22 +99,31 @@ test('a write is reflected in every view instantly, with no refetches', async ({
     const dialog = page.getByRole('dialog')
     await dialog.getByLabel('Status').selectOption('churned')
     await dialog.getByRole('button', { name: 'Save changes' }).click()
+    // optimistic: MRR drops before the server answers
     await expect(page.getByTestId('customer-mrr')).toContainText('$0')
-    // churn alert comes from a live query effect (onEnter)
+    // the churn alert compares the committed row with the synced one (see db/alerts.ts)
     await expect(page.getByRole('status').filter({ hasText: 'churned' })).toBeVisible()
     await page.getByRole('link', { name: 'Overview' }).click()
     await expect(page.getByTestId('kpi-mrr')).not.toHaveText(mrrBefore!)
   })
   // exactly one write…
   expect(requests.filter((r) => !r.startsWith('GET '))).toEqual(['POST /api/batch'])
-  // …and no refetch of any list, detail or metric: every view above was updated from local data.
-  // The only reads allowed are server-computed rows nobody can derive locally: the customer's
-  // health (a SQL view the server re-announces) and the activity windows (new server events).
   const reads = requests.filter((r) => r.startsWith('GET ')).map(decodeURIComponent)
-  expect(reads.filter((r) => !/^GET \/api\/(customer-health\?customerId\[eq\]=\d+&|events)/.test(r))).toEqual([])
+  // …after which the query collection re-reads the customer on screen (query-db-collection
+  // revalidates active on-demand subsets after a direct write: a changed row can enter or leave a
+  // window), and the overview's top-accounts window loads again when it is shown (the write
+  // dropped its cached copy). Every customers read is that one customer or that small window.
+  const window6 = 'status\\[eq\\]=active&sort=-mrr,-id&limit=6'
+  for (const r of reads.filter((r) => r.startsWith('GET /api/customers?') && !r.includes('limit=0')))
+    expect(r).toMatch(new RegExp(`^GET /api/customers\\?(id\\[eq\\]=${id}&limit=10000|${window6})$`))
+  // aggregates over every customer are server queries, re-read after the change
+  expect(reads).toContain('GET /api/metrics/overview')
+  // nothing of the big tables is read whole: by key, by customer, or a small window
+  for (const r of reads.filter((r) => BIG.test(r)))
+    expect(r).toMatch(/[?&](id\[eq\]|customerId\[eq\]|status\[eq\])=|[?&]limit=(0|\d{1,2})(&|$)/)
 })
 
-test('changes made elsewhere stream in over SSE and update live queries', async ({ page }) => {
+test('a change made elsewhere is written into the loaded window over SSE', async ({ page }) => {
   await page.goto('/customers?q=Tyrell')
   const row = page.getByTestId('customers-table').getByTestId('row').first()
   const href = (await row.getByRole('link').first().getAttribute('href'))!
@@ -94,8 +135,13 @@ test('changes made elsewhere stream in over SSE and update live queries', async 
     await page.request.patch(`/api/customers/${id}`, { data: { seats: nextSeats } })
     await expect(row.locator('td').nth(6)).toHaveText(String(nextSeats))
   })
-  // the pushed row was written into the collection: the table did not refetch customers
-  expect(requests.filter((r) => r.startsWith('GET /api/customers'))).toEqual([])
+  // The pushed row is written into the collection (the cell updates from it); the only customer
+  // reads are the library's revalidation of the window on screen (the same request that loaded
+  // it) and the server totals — no other window, no table load.
+  const reads = requests.filter((r) => r.startsWith('GET /api/customers')).map(decodeURIComponent)
+  for (const r of reads)
+    // (the window's search term is pushed down lower-cased: the server's search is case-insensitive)
+    expect(r).toMatch(/^GET \/api\/customers\?(q=tyrell&sort=-createdAt,-id&limit=25|q=Tyrell&limit=0&sum=mrr|limit=0)$/)
 })
 
 test('multi-collection archive transaction rolls back customers AND their invoices', async ({ page }) => {
@@ -103,22 +149,58 @@ test('multi-collection archive transaction rolls back customers AND their invoic
   const link = page.getByTestId('invoices-table').getByTestId('row').first().getByRole('link')
   const company = (await link.textContent())!
   await link.click()
-  await expect(page.getByTestId('customer-invoices')).toBeVisible()
-  await setChaos(page, { latencyMs: 800, failRate: 1 })
+  const detailUrl = page.url()
+  const invoices = page.getByTestId('customer-invoices').getByRole('row')
+  await expect(invoices.first()).toBeVisible()
+  const invoiceCount = await invoices.count()
+  await setChaos(page, { latencyMs: 2500, failRate: 1 })
   page.once('dialog', (d) => void d.accept())
   await page.getByRole('button', { name: 'Archive' }).click()
   await expect(page).toHaveURL(/\/customers$/)
-  await page.getByLabel('Search customers').fill(company)
-  await expect(page.getByRole('alert').filter({ hasText: 'Archive failed' })).toBeVisible()
-  // the customer is back, and so are its invoices — checked in-app, without a reload, so this is the
-  // client's rollback of the cascaded invoice deletes and not a fresh fetch from the untouched server
-  await expect(page.getByTestId('customers-table').getByText(company, { exact: true }).first()).toBeVisible()
+  // straight back while the batch is still in flight: the customer AND its invoices are
+  // optimistically gone (one transaction across two collections)…
   const reads = await apiRequestsDuring(page, async () => {
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Invoices' }).click()
-    await page.getByLabel('Search invoices').fill(company)
-    await expect(page.getByTestId('invoices-table').getByTestId('row').first()).toContainText(company)
+    await page.goBack()
+    await expect(page).toHaveURL(detailUrl)
+    await expect(page.getByRole('alert')).toContainText('Not found')
+    // …and after the server refuses, both come back in place — restored from the client's own
+    // synced rows (the server never changed), not refetched
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(company, { timeout: 10_000 })
+    await expect(invoices).toHaveCount(invoiceCount)
   })
   expect(reads.filter((r) => r.startsWith('GET /api/invoices'))).toEqual([])
+  await expect(page.getByRole('alert').filter({ hasText: 'Archive failed' })).toBeVisible()
+})
+
+test('the customer detail page loads only that customer: by id and customerId push-down', async ({ page }) => {
+  const requests = await apiRequestsDuring(page, async () => {
+    await page.goto('/customers/7')
+    await expect(page.getByTestId('customer-health')).toContainText('API calls')
+    await expect(page.getByTestId('usage')).toHaveAttribute('data-state', 'ready')
+  })
+  const reads = requests.map(decodeURIComponent).filter((r) => BIG.test(r) && !r.includes('limit=0'))
+  expect(reads).toContain('GET /api/customers?id[eq]=7&limit=10000')
+  expect(reads).toContain('GET /api/invoices?customerId[eq]=7&limit=10000')
+  expect(reads).toContain('GET /api/subscriptions?customerId[eq]=7&limit=10000')
+  for (const r of reads) expect(r).toMatch(/[?&](id\[eq\]=7|customerId\[eq\]=7)(&|$)/)
+})
+
+test('no page ever loads a big table whole: every read is a window, a key lookup or a server total', async ({ page }) => {
+  const requests = await apiRequestsDuring(page, async () => {
+    for (const path of ['/', '/analytics', '/customers?sort=plan', '/invoices?sort=company', '/billing', '/products', '/audit'])
+      await page.goto(path).then(() => page.waitForLoadState('networkidle'))
+    // client-side navigation between pages whose windows overlap (rows shown from local state while
+    // the previous page's windows are released) must not turn into a full-table "repair" either
+    for (const link of ['Customers', 'Overview', 'Invoices', 'Billing', 'Overview', 'Activity', 'Customers']) {
+      await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: link }).click()
+      await page.waitForTimeout(150)
+    }
+    await page.waitForLoadState('networkidle')
+  })
+  const unbounded = requests
+    .map(decodeURIComponent)
+    .filter((r) => BIG.test(r) && /[?&]limit=10000(&|$)/.test(r) && !/[?&](id|customerId|invoiceId)\[(eq|in)\]=/.test(r))
+  expect(unbounded).toEqual([])
 })
 
 test('staged transaction previews a reassignment, discard sends nothing, save sends one batch', async ({ page }) => {
