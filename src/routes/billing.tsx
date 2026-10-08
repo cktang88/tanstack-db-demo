@@ -13,7 +13,16 @@ import { date, money, moneyCompact, month, number } from '../lib/format'
 import { toast } from '../lib/toast'
 
 const BUCKETS = ['current', '1-30', '31-60', '60+']
-const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString()
+/**
+ * Bucket boundaries at UTC midnight. The live query's identity is derived from
+ * its IR (captured values included), so a millisecond-precision "now" would
+ * rebuild the query on every render.
+ */
+const daysAgo = (n: number) => {
+  const d = new Date()
+  d.setUTCHours(0, 0, 0, 0)
+  return new Date(d.getTime() - n * 86_400_000).toISOString()
+}
 
 export function BillingPage() {
   const { can } = useCan()
@@ -106,7 +115,7 @@ export function BillingPage() {
         <Stat
           label="Accounts receivable"
           value={money(outstanding)}
-          hint={`${number(aging.reduce((s, b) => s + b.invoices, 0))} unpaid invoices`}
+          hint={`${number(aging.reduce((s, b) => s + b.invoices, 0))} unpaid invoices · before partial payments`}
           testId="billing-ar"
         />
       </div>

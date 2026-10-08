@@ -86,7 +86,7 @@ export function OverviewPage() {
         <Stat
           label="Outstanding"
           value={money(kpi.outstanding)}
-          hint={`${number(kpi.overdueCount)} overdue invoices`}
+          hint={`${number(kpi.overdueCount)} overdue · open invoices before partial payments`}
           testId="kpi-outstanding"
         />
         <Stat label="ARPA" value={money(kpi.arpa)} hint={`${number(kpi.openTasks)} open tasks`} testId="kpi-arpa" />
@@ -305,7 +305,7 @@ function PinnedAccounts() {
               <div className="mt-1 flex items-center justify-between text-xs text-zinc-500">
                 <Badge value={c.status} />
                 <span>
-                  {money(c.mrr)} MRR · {money(c.outstanding ?? 0)} due
+                  {money(c.mrr)} MRR · {money(c.outstanding ?? 0)} open invoices
                 </span>
               </div>
             </li>
