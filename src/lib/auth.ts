@@ -23,9 +23,7 @@ export const isUnauthorized = (e: unknown) => e instanceof HttpError && e.status
 
 /** Only follow same-origin, in-app redirect targets (never `//evil.com` or back to /login). */
 export const safeRedirect = (target: unknown): string =>
-  typeof target === 'string' && target.startsWith('/') && !target.startsWith('//') && !target.startsWith('/login')
-    ? target
-    : '/'
+  typeof target === 'string' && target.startsWith('/') && !target.startsWith('//') && !target.startsWith('/login') ? target : '/'
 
 /** Current session (suspends; only used inside the authenticated layout). */
 export function useMe() {

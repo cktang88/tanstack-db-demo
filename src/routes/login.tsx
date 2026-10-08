@@ -53,7 +53,11 @@ export function LoginPage() {
           </label>
           <label className="block">
             <span className="label">Password</span>
-            <input name="password" type="password" className="input" autoComplete="current-password"
+            <input
+              name="password"
+              type="password"
+              className="input"
+              autoComplete="current-password"
               defaultValue={error ? '' : 'password'}
             />
           </label>

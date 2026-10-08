@@ -65,8 +65,6 @@ export function invalidateEntities(
       return !seen.has(id) && !!seen.add(id)
     })
   return Promise.all(
-    queryKeys.map((queryKey) =>
-      qc.invalidateQueries({ queryKey: [...queryKey] }, { cancelRefetch: opts.cancelRefetch ?? true }),
-    ),
+    queryKeys.map((queryKey) => qc.invalidateQueries({ queryKey: [...queryKey] }, { cancelRefetch: opts.cancelRefetch ?? true })),
   )
 }
