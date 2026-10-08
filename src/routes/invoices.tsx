@@ -1,10 +1,11 @@
-import { noop, useQuery, useQueryClient } from '@tanstack/react-query'
+import { noop, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
 import { useEffect, useMemo } from 'react'
 import { INVOICE_STATUSES, type Customer, type Invoice } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Badge, ChipFilter, PageHeader, Stat } from '../components/ui'
+import { idsOf } from '../lib/alerts'
 import { date, money, number } from '../lib/format'
 import { useMarkInvoicePaid } from '../lib/mutations'
 import { customersByIdsQuery, distinctIds, invoicesListQuery, type InvoiceListParams } from '../lib/queries'
@@ -25,6 +26,13 @@ export function InvoicesPage() {
   const markPaid = useMarkInvoicePaid()
   const canPay = useCan().can('billing:write')
   const rows = query.data?.data ?? EMPTY
+
+  // invoices with a write of ours in flight (optimistic, not yet confirmed by the server)
+  const pendingVars = useMutationState({
+    filters: { mutationKey: ['invoices'], status: 'pending' },
+    select: (m) => m.state.variables,
+  })
+  const pending = useMemo(() => new Set(pendingVars.flatMap(idsOf)), [pendingVars])
 
   // The invoice API only returns customerId: fetch the page's customers in one
   // batched request (`?id=1,2,3`) and join them client-side.
@@ -52,9 +60,10 @@ export function InvoicesPage() {
     () =>
       col.columns([
         col.accessor('number', { header: 'Invoice', cell: (i) => <span className="font-mono text-xs">{i.getValue()}</span> }),
+        // sorted by the customer's company on the server (a virtual sort key)
         col.accessor('customerId', {
+          id: 'customer',
           header: 'Customer',
-          enableSorting: false,
           cell: (i) => {
             const c = customers.get(i.getValue())
             return (
@@ -64,7 +73,15 @@ export function InvoicesPage() {
             )
           },
         }),
-        col.accessor('status', { header: 'Status', cell: (i) => <Badge value={i.getValue()} /> }),
+        col.accessor('status', {
+          header: 'Status',
+          cell: (i) => (
+            <span className="flex items-center gap-2">
+              <Badge value={i.getValue()} />
+              {pending.has(i.row.original.id) && <span className="text-xs text-amber-600">saving…</span>}
+            </span>
+          ),
+        }),
         col.accessor('issuedAt', { header: 'Issued', cell: (i) => date(i.getValue()) }),
         col.accessor('dueAt', { header: 'Due', cell: (i) => date(i.getValue()) }),
         col.accessor('paidAt', { header: 'Paid', cell: (i) => date(i.getValue()) }),
@@ -80,18 +97,20 @@ export function InvoicesPage() {
             ) : null,
         }),
       ]),
-    [customers, markPaid, canPay],
+    [customers, markPaid, canPay, pending],
   )
-
-  const pageTotal = rows.reduce((s, r) => s + r.amount, 0)
 
   return (
     <>
       <PageHeader title="Invoices" description="Billing history across all accounts." />
-      <div className="mb-4 grid gap-4 sm:grid-cols-3">
-        <Stat label="Matching invoices" value={number(query.data?.total ?? 0)} />
-        <Stat label="This page total" value={money(pageTotal)} hint="Totals for all matches need another endpoint" />
-        <Stat label="Customers on this page" value={customerIds.length} hint="Joined client-side with one batched request" />
+      <div className="mb-4 grid gap-4 sm:grid-cols-2">
+        <Stat label="Matching invoices" value={number(query.data?.total ?? 0)} testId="invoice-count" />
+        <Stat
+          label="Total of all matches"
+          value={money(query.data?.sums.amount ?? 0)}
+          hint="Aggregate over every matching row"
+          testId="invoice-total"
+        />
       </div>
       <DataTable
         testId="invoices-table"
@@ -107,8 +126,8 @@ export function InvoicesPage() {
         toolbar={
           <div className="flex flex-wrap items-center gap-3">
             <input
-              className="input w-44"
-              placeholder="Invoice #"
+              className="input w-56"
+              placeholder="Invoice # or company"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               aria-label="Search invoices"
