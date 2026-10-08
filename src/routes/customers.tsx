@@ -1,14 +1,24 @@
-import { noop, useQuery, useQueryClient } from '@tanstack/react-query'
+import { noop, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { createColumnHelper, type RowSelectionState } from '@tanstack/react-table'
+import { createColumnHelper } from '@tanstack/react-table'
 import { useEffect, useMemo, useState } from 'react'
 import { COUNTRIES, CUSTOMER_STATUSES, PLANS, type Customer, type User } from '../../shared/domain'
 import { CustomerForm } from '../components/CustomerForm'
 import { DataTable, selectColumn, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, ChipFilter, Dialog, PageHeader } from '../components/ui'
-import { date, money } from '../lib/format'
+import { idsOf } from '../lib/alerts'
+import { date, money, number } from '../lib/format'
 import { useBulkUpdateCustomers, useCreateCustomer, useDeleteCustomers } from '../lib/mutations'
-import { customerQuery, customersListQuery, usersQuery, type CustomerListParams } from '../lib/queries'
+import {
+  customerQuery,
+  customersByIdsQuery,
+  customersListQuery,
+  distinctIds,
+  usersQuery,
+  type CustomerListParams,
+} from '../lib/queries'
+import { customerSelection, selectedIds, useSelection } from '../lib/selection'
+import { toast } from '../lib/toast'
 import { formatSort, parseSort } from '../lib/search'
 import { customersRoute } from '../router'
 import { useCan } from '../lib/auth'
@@ -16,8 +26,18 @@ import { useDebouncedParam } from '../lib/hooks'
 
 const col = createColumnHelper<ServerFeatures, Customer>()
 const EMPTY: Customer[] = []
+const NO_CUSTOMERS = new Map<number, Customer>()
 
-function useColumns(users: User[]) {
+/** Customers with a write of ours still in flight (optimistic, not yet confirmed by the server). */
+function usePendingCustomerIds() {
+  const variables = useMutationState({
+    filters: { mutationKey: ['customers'], status: 'pending' },
+    select: (m) => m.state.variables,
+  })
+  return useMemo(() => new Set(variables.flatMap(idsOf)), [variables])
+}
+
+function useColumns(users: User[], pending: ReadonlySet<number>) {
   return useMemo(() => {
     const byId = new Map(users.map((u) => [u.id, u]))
     return col.columns([
@@ -49,7 +69,9 @@ function useColumns(users: User[]) {
       col.accessor('country', { header: 'Country' }),
       col.accessor('seats', { header: 'Seats', cell: (i) => <span className="tabular-nums">{i.getValue()}</span> }),
       col.accessor('mrr', { header: 'MRR', cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span> }),
+      // sorted by the owner's *name* on the server (a virtual sort key)
       col.accessor('ownerId', {
+        id: 'owner',
         header: 'Owner',
         cell: (i) => {
           const u = i.getValue() ? byId.get(i.getValue()!) : undefined
@@ -64,8 +86,19 @@ function useColumns(users: User[]) {
         },
       }),
       col.accessor('createdAt', { header: 'Created', cell: (i) => date(i.getValue()) }),
+      col.display({
+        id: 'sync',
+        header: '',
+        enableHiding: false,
+        cell: ({ row }) =>
+          pending.has(row.original.id) ? (
+            <span className="text-xs text-amber-600" title="Optimistic change not yet confirmed by the server">
+              saving…
+            </span>
+          ) : null,
+      }),
     ])
-  }, [users])
+  }, [users, pending])
 }
 
 export function CustomersPage() {
@@ -75,7 +108,8 @@ export function CustomersPage() {
   const qc = useQueryClient()
   const { data: users = [] } = useQuery(usersQuery())
   const query = useQuery(customersListQuery(search))
-  const columns = useColumns(users)
+  const pending = usePendingCustomerIds()
+  const columns = useColumns(users, pending)
   const [creating, setCreating] = useState(false)
   const create = useCreateCustomer()
   const bulk = useBulkUpdateCustomers()
@@ -98,14 +132,18 @@ export function CustomersPage() {
       void navigate({ search: (prev) => ({ ...prev, page: lastPage }), replace: true })
   }, [navigate, search.page, lastPage])
 
-  // Selection only makes sense for the rows on screen: clear it when the page, sort or filters change.
-  const [selection, setSelection] = useState<RowSelectionState>({})
-  const searchKey = JSON.stringify(search)
-  const [selectionFor, setSelectionFor] = useState(searchKey)
-  if (selectionFor !== searchKey) {
-    setSelectionFor(searchKey)
-    setSelection({})
-  }
+  // The selection lives outside the page (it survives paging, sorting and filtering). The
+  // selected rows — on any page — are fetched in ONE batched request (`?id=1,2,3`) for the
+  // summary and to know which of them we may change.
+  const [selection, setSelection] = useSelection(customerSelection, me.user.id)
+  const selected = useMemo(() => distinctIds(selectedIds(selection)), [selection])
+  const { data: selectedRows = NO_CUSTOMERS } = useQuery(customersByIdsQuery(selected))
+  // rows on screen are the freshest copy; the batched lookup covers the other pages
+  const selectedCustomers = useMemo(
+    () => selected.flatMap((id) => rows.find((r) => r.id === id) ?? selectedRows.get(id) ?? []),
+    [selected, rows, selectedRows],
+  )
+  const selectedMrr = selectedCustomers.reduce((s, c) => s + c.mrr, 0)
 
   // Debounced search box that writes to the URL.
   const [q, setQ] = useDebouncedParam(search.q, (q) => setSearch({ q }))
@@ -114,7 +152,7 @@ export function CustomersPage() {
     <>
       <PageHeader
         title="Customers"
-        description="Server-side pagination, sorting and filtering — every interaction is a new API request."
+        description={`${number(query.data?.total ?? 0)} matching · ${money(query.data?.sums.mrr ?? 0)} MRR — filtering, sorting & paging run on the server.`}
         actions={
           can('customers:write') && (
             <button className="btn-primary" onClick={() => setCreating(true)}>
@@ -132,6 +170,7 @@ export function CustomersPage() {
         isPlaceholder={query.isPlaceholderData}
         rowSelection={selection}
         onRowSelectionChange={setSelection}
+        rowClassName={(r) => (pending.has(r.id) ? 'bg-amber-50/50 dark:bg-amber-500/5' : undefined)}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
@@ -141,7 +180,7 @@ export function CustomersPage() {
           <div className="flex flex-wrap items-center gap-3">
             <input
               className="input w-64"
-              placeholder="Search name, email, company…"
+              placeholder="Search name, email, company, owner…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               aria-label="Search customers"
@@ -187,14 +226,21 @@ export function CustomersPage() {
           </div>
         }
         bulkActions={(ids, clear) => {
-          // Only act on rows that are still listed and that the server will let us
-          // change (members: their own accounts) instead of firing doomed requests.
-          const selected = ids.flatMap((id) => rows.find((r) => r.id === id) ?? [])
-          const editable = selected.filter(canEditCustomer).map((c) => c.id)
-          const archivable = can('customers:delete') ? editable : []
-          if (!editable.length) return <span className="text-zinc-500">read-only</span>
+          if (!can('customers:write')) return <span className="text-zinc-500">read-only</span>
+          // Only act on selected rows (on any page) that still exist and that the server will
+          // let us change (members: their own accounts) instead of firing doomed requests.
+          const editable = selectedCustomers.filter(canEditCustomer).map((c) => c.id)
+          const actionable = (targets: number[]) => {
+            const skipped = ids.length - targets.length
+            if (skipped)
+              toast.info(`Skipped ${skipped} customer${skipped === 1 ? '' : 's'}`, 'Not found any more, or not yours to change')
+            return targets
+          }
           return (
             <>
+              <span className="text-zinc-500" data-testid="selection-summary">
+                ({number(selectedCustomers.length)} across all pages · {money(selectedMrr)} MRR)
+              </span>
               {editable.length < ids.length && (
                 <span className="text-xs text-zinc-500" data-testid="bulk-editable">
                   {editable.length} you can edit
@@ -204,21 +250,29 @@ export function CustomersPage() {
                 <button
                   key={s}
                   className="btn-secondary py-1 text-xs"
-                  onClick={() => bulk.mutate({ ids: editable, patch: { status: s } }, { onSuccess: clear })}
+                  onClick={() => {
+                    const targets = actionable(editable)
+                    if (targets.length) bulk.mutate({ ids: targets, patch: { status: s } }, { onSuccess: clear })
+                  }}
                 >
                   Mark {s}
                 </button>
               ))}
-              {archivable.length > 0 && (
+              {can('customers:delete') && (
                 <button
                   className="btn-danger py-1 text-xs"
                   onClick={() => {
-                    if (confirm(`Archive ${archivable.length} customers?`)) del.mutate(archivable, { onSuccess: clear })
+                    if (!confirm(`Archive ${ids.length} customers?`)) return
+                    const targets = actionable(editable)
+                    if (targets.length) del.mutate(targets, { onSuccess: clear })
                   }}
                 >
                   Archive
                 </button>
               )}
+              <button className="btn-ghost py-1 text-xs" onClick={clear}>
+                Clear
+              </button>
             </>
           )
         }}
