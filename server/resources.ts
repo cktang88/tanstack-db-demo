@@ -462,6 +462,8 @@ export const resources: Record<string, Resource> = {
       issuedAt: t('issued_at'),
       dueAt: t('due_at'),
       paidAt: t('paid_at'),
+      // denormalised for display; sorting/filtering on it is a correlated subquery (slow at scale — use ?q=)
+      customerCompany: t('(SELECT customers.company FROM customers WHERE customers.id = invoices.customer_id)'),
     },
     virtual: { customer: t('(SELECT customers.company FROM customers WHERE customers.id = invoices.customer_id)') },
     search: ['number', 'customer'],

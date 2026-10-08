@@ -470,6 +470,7 @@ export function makeApp(opts: AppOptions) {
   app.get('/metrics/overview', (c) => metric(c, 'customers:read', metrics.overview))
   app.get('/metrics/workload', (c) => metric(c, 'projects:read', metrics.workload))
   app.get('/metrics/ar-aging', (c) => metric(c, 'billing:read', metrics.arAging))
+  app.get('/metrics/product-adoption', (c) => metric(c, 'products:read', metrics.productAdoption))
   app.get('/metrics/revenue', (c) =>
     run(
       c,

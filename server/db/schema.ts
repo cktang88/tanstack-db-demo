@@ -184,6 +184,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   canceled_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_subscriptions_customer ON subscriptions(customer_id);
+-- product adoption (GROUP BY product over live subscriptions) from the index alone
+CREATE INDEX IF NOT EXISTS idx_subscriptions_adoption ON subscriptions(status, product_id, quantity, unit_price, customer_id);
 
 CREATE TABLE IF NOT EXISTS invoices (
   id           INTEGER PRIMARY KEY,

@@ -1,9 +1,10 @@
 import type {
+  ActivityEvent,
   BreakdownPoint,
   CursorPage,
-  ActivityEvent,
   OverviewMetrics,
   Plan,
+  ProductAdoption,
   RevenuePoint,
   SignupPoint,
 } from '../../shared/domain.ts'
@@ -105,6 +106,14 @@ export const metrics = {
          FROM customers WHERE ${LIVE}${plan ? ' AND plan = ?' : ''} GROUP BY ${by} ORDER BY mrr DESC, customers DESC`,
       )
       .all(...(plan ? [plan] : [])) as BreakdownPoint[],
+  productAdoption: (db: DB): ProductAdoption[] =>
+    db
+      .prepare(
+        `SELECT product_id AS productId, COUNT(*) AS subscriptions, SUM(quantity) AS units, SUM(quantity * unit_price) AS mrr
+         FROM subscriptions WHERE status IN ('active', 'past_due') AND customer_id NOT IN (${ARCHIVED})
+         GROUP BY product_id ORDER BY product_id`,
+      )
+      .all() as ProductAdoption[],
   workload: (db: DB) =>
     db
       .prepare(

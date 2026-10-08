@@ -349,6 +349,8 @@ export interface Invoice {
   issuedAt: string
   dueAt: string
   paidAt: string | null
+  /** the customer's company (read-only, denormalised for display, search and sort) */
+  customerCompany?: string
 }
 
 export interface Project {
@@ -428,6 +430,14 @@ export interface SignupPoint {
   month: string
   plan: Plan
   count: number
+}
+
+/** live subscriptions (active / past_due) per product, over every customer */
+export interface ProductAdoption {
+  productId: number
+  subscriptions: number
+  units: number
+  mrr: number
 }
 
 export interface BreakdownPoint {

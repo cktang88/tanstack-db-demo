@@ -105,3 +105,25 @@ describe('archived-customer scope (NOT IN the small archived set)', () => {
     expect(await count('/payments?')).toBe(totalBefore - before)
   })
 })
+
+describe('product adoption (server aggregate)', () => {
+  it('equals a GROUP BY over live subscriptions of live customers', async () => {
+    const expected = all(
+      `SELECT s.product_id AS productId, COUNT(*) AS subscriptions, SUM(s.quantity) AS units, SUM(s.quantity * s.unit_price) AS mrr
+       FROM subscriptions s JOIN customers c ON c.id = s.customer_id
+       WHERE s.status IN ('active', 'past_due') AND c.deleted_at IS NULL GROUP BY s.product_id ORDER BY s.product_id`,
+    )
+    const res = await owner.get('/metrics/product-adoption')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual(expected)
+    expect((await as('anon').get('/metrics/product-adoption')).status).toBe(401)
+  })
+
+  it('invoices carry their customer company', async () => {
+    const page = await owner.get<Page<Invoice>>('/invoices?limit=5')
+    for (const i of page.body.data) {
+      const [c] = all<{ company: string }>('SELECT company FROM customers WHERE id = ?', i.customerId)
+      expect(i.customerCompany).toBe(c!.company)
+    }
+  })
+})
