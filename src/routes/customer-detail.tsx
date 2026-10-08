@@ -214,20 +214,21 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
   const { data: contacts = [] } = useQuery(customerContactsQuery(customerId))
   const add = useAddContact()
   const remove = useDeleteContact()
-  const [error, action] = useActionState(async (_: string | null, f: FormData) => {
-    try {
-      await add.mutateAsync({
-        customerId,
-        name: field(f, 'name'),
-        email: field(f, 'email'),
-        title: field(f, 'title') || 'Contact',
-        isPrimary: false,
-      })
-      return null
-    } catch (e) {
-      return (e as Error).message
-    }
-  }, null)
+  // keep what was typed when the server rejects it (React resets the form after the action)
+  type ContactDraft = { name: string; email: string; title: string }
+  const blank: ContactDraft = { name: '', email: '', title: '' }
+  const [{ error, draft }, action] = useActionState(
+    async (_: { error: string | null; draft: ContactDraft }, f: FormData) => {
+      const draft = { name: field(f, 'name').trim(), email: field(f, 'email').trim(), title: field(f, 'title').trim() }
+      try {
+        await add.mutateAsync({ customerId, ...draft, title: draft.title || 'Contact', isPrimary: false })
+        return { error: null, draft: blank }
+      } catch (e) {
+        return { error: (e as Error).message, draft }
+      }
+    },
+    { error: null, draft: blank },
+  )
   return (
     <Card title={`Contacts (${contacts.length})`}>
       <ul className="space-y-2 text-sm" data-testid="contacts">
@@ -253,9 +254,9 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
       </ul>
       {editable && (
         <form action={action} className="mt-3 grid grid-cols-2 gap-2">
-          <input name="name" className="input" placeholder="Name" aria-label="Contact name" />
-          <input name="email" className="input" placeholder="Email" aria-label="Contact email" />
-          <input name="title" className="input" placeholder="Title" aria-label="Contact title" />
+          <input name="name" className="input" placeholder="Name" aria-label="Contact name" defaultValue={draft.name} />
+          <input name="email" className="input" placeholder="Email" aria-label="Contact email" defaultValue={draft.email} />
+          <input name="title" className="input" placeholder="Title" aria-label="Contact title" defaultValue={draft.title} />
           <button className="btn-secondary">Add contact</button>
           {error && <p className="col-span-2 text-xs text-red-600">{error}</p>}
         </form>

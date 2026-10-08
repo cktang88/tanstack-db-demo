@@ -67,16 +67,20 @@ function Comments({ taskId, byId, canComment }: { taskId: number; byId: Map<numb
     filters: { mutationKey: ['task-comments', 'create'], status: 'pending' },
     select: (m) => m.state.variables as { taskId: number; body: string },
   }).filter((v) => v.taskId === taskId)
-  const [error, action] = useActionState(async (_: string | null, f: FormData) => {
-    const body = field(f, 'body').trim()
-    if (!body) return 'Comment cannot be empty'
-    try {
-      await add.mutateAsync({ taskId, body })
-      return null
-    } catch (e) {
-      return (e as Error).message
-    }
-  }, null)
+  // the draft survives a failed post (React resets the form after the action)
+  const [{ error, draft }, action] = useActionState(
+    async (_: { error: string | null; draft: string }, f: FormData) => {
+      const body = field(f, 'body').trim()
+      if (!body) return { error: 'Comment cannot be empty', draft: '' }
+      try {
+        await add.mutateAsync({ taskId, body })
+        return { error: null, draft: '' }
+      } catch (e) {
+        return { error: (e as Error).message, draft: body }
+      }
+    },
+    { error: null, draft: '' },
+  )
   return (
     <section>
       <h3 className="label">Discussion (append-only)</h3>
@@ -104,7 +108,7 @@ function Comments({ taskId, byId, canComment }: { taskId: number; byId: Map<numb
       </ul>
       {canComment && (
         <form action={action} className="mt-2 flex gap-2">
-          <input name="body" className="input" placeholder="Write a comment…" aria-label="Comment" />
+          <input name="body" className="input" placeholder="Write a comment…" aria-label="Comment" defaultValue={draft} />
           <button className="btn-secondary">Post</button>
         </form>
       )}

@@ -5,7 +5,7 @@ import { TASK_PRIORITIES, TASK_STATUSES, type Project, type Task, type TaskStatu
 import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { useCan } from '../lib/auth'
-import { date, titleCase } from '../lib/format'
+import { date, field, titleCase } from '../lib/format'
 import { useCreateTask, useDeleteTask, useUpdateTask, type NewTask } from '../lib/mutations'
 import { projectQuery, projectTasksQuery, usersQuery } from '../lib/queries'
 import { projectBoardRoute } from '../router'
@@ -224,25 +224,26 @@ function TaskCard({
 
 function NewTaskForm({ projectId }: { projectId: number }) {
   const create = useCreateTask()
-  // React 19 form action + useActionState for validation errors
-  const [error, action] = useActionState((_prev: string | null, form: FormData) => {
-    const title = (form.get('title') as string | null)?.trim() ?? ''
-    if (title.length < 3) return 'Title must be at least 3 characters'
-    create.mutate({
-      projectId,
-      title,
-      status: 'todo',
-      priority: (form.get('priority') as NewTask['priority']) ?? 'medium',
-      assigneeId: null,
-      dueDate: null,
-    })
-    return null
-  }, null)
+  // React 19 form action + useActionState for validation errors. React resets
+  // the form after the action, so on a validation error the submitted values
+  // come back as defaults (remounting via `key`: a reset <select> would
+  // otherwise snap back to its mount-time option).
+  type Draft = { error: string | null; title: string; priority: NewTask['priority']; attempt: number }
+  const [{ error, title, priority, attempt }, action] = useActionState(
+    (prev: Draft, form: FormData): Draft => {
+      const title = field(form, 'title').trim()
+      const priority = (field(form, 'priority') || 'medium') as NewTask['priority']
+      if (title.length < 3) return { error: 'Title must be at least 3 characters', title, priority, attempt: prev.attempt + 1 }
+      create.mutate({ projectId, title, status: 'todo', priority, assigneeId: null, dueDate: null })
+      return { ...prev, error: null, title: '' }
+    },
+    { error: null, title: '', priority: 'medium', attempt: 0 },
+  )
   return (
-    <form action={action} className="mt-3 space-y-2">
-      <input name="title" className="input" placeholder="New task…" aria-label="New task title" />
+    <form key={attempt} action={action} className="mt-3 space-y-2">
+      <input name="title" className="input" placeholder="New task…" aria-label="New task title" defaultValue={title} />
       <div className="flex gap-2">
-        <select name="priority" className="input" defaultValue="medium" aria-label="Priority">
+        <select name="priority" className="input" defaultValue={priority} aria-label="Priority">
           {TASK_PRIORITIES.map((p) => (
             <option key={p} value={p}>
               {titleCase(p)}
