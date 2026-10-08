@@ -1,16 +1,14 @@
 import { useMutationState, useQuery, useSuspenseQuery } from '@tanstack/react-query'
-import { useMemo } from 'react'
-import type { Subscription } from '../../shared/domain'
 import { Badge, Card, PageHeader } from '../components/ui'
 import { useCan } from '../lib/auth'
 import { money, number } from '../lib/format'
 import { useSaveProduct } from '../lib/mutations'
-import { productsQuery, resourceList } from '../lib/queries'
+import { productAdoptionQuery, productsQuery } from '../lib/queries'
 
 export function ProductsPage() {
   const { data: products } = useSuspenseQuery(productsQuery())
-  // adoption per product: aggregated client-side from every active subscription (a big list for one number each)
-  const { data: subs = [] } = useQuery(resourceList<Subscription>('subscriptions', { status: 'active,past_due', limit: 10000 }))
+  // adoption per product: a server aggregate over every live subscription (there can be hundreds of thousands)
+  const { data: adoption } = useQuery(productAdoptionQuery())
   const { can } = useCan()
   const save = useSaveProduct()
   // rows with an optimistic edit still in flight
@@ -20,17 +18,6 @@ export function ProductsPage() {
       select: (m) => (m.state.variables as { id: number } | undefined)?.id,
     }),
   )
-  const adoption = useMemo(() => {
-    const m = new Map<number, { subs: number; units: number; mrr: number }>()
-    for (const s of subs) {
-      const a = m.get(s.productId) ?? { subs: 0, units: 0, mrr: 0 }
-      a.subs++
-      a.units += s.quantity
-      a.mrr += s.quantity * s.unitPrice
-      m.set(s.productId, a)
-    }
-    return m
-  }, [subs])
   const editable = can('products:write')
 
   return (
@@ -52,7 +39,7 @@ export function ProductsPage() {
           </thead>
           <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
             {products.map((p) => {
-              const a = adoption.get(p.id)
+              const a = adoption?.get(p.id)
               return (
                 <tr
                   key={p.id}
@@ -91,7 +78,7 @@ export function ProductsPage() {
                       money(p.unitPrice)
                     )}
                   </td>
-                  <td className="td text-right tabular-nums">{number(a?.subs ?? 0)}</td>
+                  <td className="td text-right tabular-nums">{number(a?.subscriptions ?? 0)}</td>
                   <td className="td text-right tabular-nums">{number(a?.units ?? 0)}</td>
                   <td className="td text-right tabular-nums">{money(a?.mrr ?? 0)}</td>
                   <td className="td">

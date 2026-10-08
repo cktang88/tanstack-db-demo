@@ -1,6 +1,7 @@
 import { infiniteQueryOptions, keepPreviousData, mutationOptions, queryOptions } from '@tanstack/react-query'
 import type {
   Contact,
+  ProductAdoption,
   CustomerBalance,
   CustomerHealth,
   CustomerTag,
@@ -79,6 +80,7 @@ export const keys = {
     signups: (months: number) => [...keys.metrics.all, 'signups', months] as const,
     breakdown: (by: string, plan?: string) => [...keys.metrics.all, 'breakdown', by, ...(plan ? [plan] : [])] as const,
     workload: () => [...keys.metrics.all, 'workload'] as const,
+    productAdoption: () => [...keys.metrics.all, 'product-adoption'] as const,
   },
 }
 
@@ -320,6 +322,15 @@ export const breakdownQuery = (by: 'plan' | 'country' | 'status', plan?: Plan) =
   queryOptions({
     queryKey: keys.metrics.breakdown(by, plan),
     queryFn: ({ signal }) => api.get<BreakdownPoint[]>('/metrics/breakdown', { by, plan }, signal),
+    staleTime: STALE,
+  })
+
+/** live subscriptions per product — a server aggregate (there are hundreds of thousands of subscriptions) */
+export const productAdoptionQuery = () =>
+  queryOptions({
+    queryKey: keys.metrics.productAdoption(),
+    queryFn: ({ signal }) => api.get<ProductAdoption[]>('/metrics/product-adoption', undefined, signal),
+    select: (rows) => new Map(rows.map((r) => [r.productId, r])),
     staleTime: STALE,
   })
 
