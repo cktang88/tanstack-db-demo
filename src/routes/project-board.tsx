@@ -1,12 +1,12 @@
-import { useMutationState, useSuspenseQuery } from '@tanstack/react-query'
+import { useMutationState, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { useActionState, useMemo, useRef, useState, ViewTransition, type RefObject } from 'react'
+import { useActionState, useEffect, useMemo, useRef, useState, ViewTransition, type RefObject } from 'react'
 import { TASK_PRIORITIES, TASK_STATUSES, type Project, type Task, type TaskStatus, type User } from '../../shared/domain'
 import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { useCan } from '../lib/auth'
 import { date, field, titleCase } from '../lib/format'
-import { useCreateTask, useDeleteTask, useUpdateTask, type NewTask } from '../lib/mutations'
+import { useCreateTask, useDeleteTask, useUpdateProjectDescription, useUpdateTask, type NewTask } from '../lib/mutations'
 import { projectQuery, projectTasksQuery, usersQuery } from '../lib/queries'
 import { projectBoardRoute } from '../router'
 
@@ -29,6 +29,13 @@ export function ProjectBoardPage() {
     filters: { mutationKey: ['tasks', 'create'], status: 'pending' },
     select: (m) => m.state.variables as NewTask,
   })
+  // per-card pending state: tasks with an update still in flight (or queued in their scope)
+  const pendingUpdates = useMutationState({
+    filters: { mutationKey: ['tasks', 'update'], status: 'pending' },
+    select: (m) => (m.state.variables as { id: number }).id,
+  })
+  const savingIds = useMemo(() => new Set(pendingUpdates), [pendingUpdates])
+  const saving = pendingCreates.length + savingIds.size
 
   const columns = useMemo(() => {
     const visible = tasks.filter((t) => assignee === 'all' || t.assigneeId === assignee)
@@ -49,7 +56,7 @@ export function ProjectBoardPage() {
             <Link to="/projects" className="text-brand-600 hover:underline">
               Projects
             </Link>{' '}
-            / {done}/{tasks.length} done{pendingCreates.length > 0 && ` · saving ${pendingCreates.length}…`}
+            / {done}/{tasks.length} done{saving > 0 && ` · saving ${saving}…`}
           </>
         }
         actions={
@@ -68,6 +75,7 @@ export function ProjectBoardPage() {
           </select>
         }
       />
+      <DescriptionEditor projectId={project.id} value={project.description} editable={canEditProject(project)} />
       <TaskDialog
         task={tasks.find((t) => t.id === openId) ?? null}
         users={users}
@@ -83,6 +91,7 @@ export function ProjectBoardPage() {
             users={users}
             project={project}
             dropTarget={dropTarget}
+            savingIds={savingIds}
             onOpen={(t) => setOpenId(t.id)}
           />
         ))}
@@ -97,6 +106,7 @@ function Column({
   users,
   project,
   dropTarget,
+  savingIds,
   onOpen,
 }: {
   status: TaskStatus
@@ -104,6 +114,7 @@ function Column({
   users: User[]
   project: Project
   dropTarget: RefObject<TaskStatus | null>
+  savingIds: ReadonlySet<number>
   onOpen: (t: Task) => void
 }) {
   const { canEditProject } = useCan()
@@ -132,7 +143,14 @@ function Column({
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} users={users} project={project} dropTarget={dropTarget} onOpen={onOpen} />
+            <TaskCard
+              task={t}
+              users={users}
+              project={project}
+              dropTarget={dropTarget}
+              saving={savingIds.has(t.id)}
+              onOpen={onOpen}
+            />
           </ViewTransition>
         ))}
       </ul>
@@ -146,12 +164,14 @@ function TaskCard({
   users,
   project,
   dropTarget,
+  saving,
   onOpen,
 }: {
   task: Task
   users: User[]
   project: Project
   dropTarget: RefObject<TaskStatus | null>
+  saving: boolean
   onOpen: (t: Task) => void
 }) {
   const update = useUpdateTask(task.id)
@@ -159,6 +179,7 @@ function TaskCard({
   const assignee = users.find((u) => u.id === task.assigneeId)
   const idx = TASK_STATUSES.indexOf(task.status)
   const optimistic = task.id < 0
+  const pending = saving || optimistic
   // viewers / non-team members get a read-only card (the server would 403 and we'd roll back)
   const editable = useCan().canEditTask(task, project)
   return (
@@ -174,7 +195,8 @@ function TaskCard({
         if (status && status !== task.status) update.mutate({ id: task.id, patch: { status } })
       }}
       data-testid="task-card"
-      className={`card group p-3 text-sm ${editable ? 'cursor-grab' : ''} ${optimistic ? 'opacity-60' : ''}`}
+      data-pending={pending ? 'true' : undefined}
+      className={`card group p-3 text-sm ${editable ? 'cursor-grab' : ''} ${optimistic ? 'opacity-60' : ''} ${pending ? 'ring-1 ring-amber-400/60' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
         <button className="text-left font-medium hover:text-brand-600" data-testid="task-title" onClick={() => onOpen(task)}>
@@ -195,30 +217,90 @@ function TaskCard({
         <div className="flex items-center gap-1.5">
           <Badge value={task.priority} />
           {task.dueDate && <span className="text-xs text-zinc-500">{date(task.dueDate)}</span>}
+          {pending && <span className="text-xs text-amber-600">saving…</span>}
         </div>
         {assignee && <Avatar name={assignee.name} color={assignee.avatarColor} size={20} />}
       </div>
-      {editable && (
-        <div className="mt-2 flex justify-between">
-          <button
-            className="btn-ghost px-1.5 py-0.5 text-xs"
-            disabled={idx === 0 || optimistic}
-            aria-label="Move left"
-            onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx - 1]! } })}
-          >
-            ←
-          </button>
-          <button
-            className="btn-ghost px-1.5 py-0.5 text-xs"
-            disabled={idx === TASK_STATUSES.length - 1 || optimistic}
-            aria-label="Move right"
-            onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx + 1]! } })}
-          >
-            →
-          </button>
-        </div>
-      )}
+      <div className="mt-2 flex justify-between">
+        <button
+          className="btn-ghost px-1.5 py-0.5 text-xs"
+          disabled={!editable || idx === 0 || optimistic}
+          aria-label="Move left"
+          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx - 1]! } })}
+        >
+          ←
+        </button>
+        <button
+          className="btn-ghost px-1.5 py-0.5 text-xs"
+          disabled={!editable || idx === TASK_STATUSES.length - 1 || optimistic}
+          aria-label="Move right"
+          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx + 1]! } })}
+        >
+          →
+        </button>
+      </div>
     </li>
+  )
+}
+
+/**
+ * Autosave: a controlled local draft, one PATCH per pause in typing (600 ms
+ * debounce), optimistic in every cached copy of the project. Server values
+ * (another tab, SSE) replace the draft only while nothing is queued or saving.
+ */
+function DescriptionEditor({ projectId, value, editable }: { projectId: number; value: string; editable: boolean }) {
+  const qc = useQueryClient()
+  const save = useUpdateProjectDescription(projectId)
+  const [draft, setDraft] = useState(value)
+  const [queued, setQueued] = useState<string | null>(null)
+  const busy = queued !== null || save.isPending
+  const [seen, setSeen] = useState(value)
+  if (value !== seen) {
+    setSeen(value)
+    if (!busy) setDraft(value)
+  }
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pending = useRef<string | null>(null)
+  const { mutate } = save // stable for the observer's lifetime
+  // leaving the page while a save is still debouncing sends it right away
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current)
+      if (pending.current !== null) mutate(pending.current)
+    },
+    [mutate],
+  )
+  const onChange = (next: string) => {
+    setDraft(next)
+    setQueued(next)
+    pending.current = next
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = setTimeout(() => {
+      timer.current = null
+      pending.current = null
+      setQueued(null)
+      // a refused save rolls the cache back; show that (unless newer typing is queued)
+      mutate(next, {
+        onError: () => {
+          const saved = qc.getQueryData(projectQuery(projectId).queryKey)
+          if (saved && pending.current === null) setDraft(saved.description)
+        },
+      })
+    }, 600)
+  }
+  return (
+    <label className="mb-4 block">
+      <span className="label flex items-center gap-2">
+        Description <span className="text-amber-600">{busy ? 'saving…' : ''}</span>
+      </span>
+      <textarea
+        className="input min-h-14"
+        value={draft}
+        readOnly={!editable}
+        aria-label="Project description"
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </label>
   )
 }
 

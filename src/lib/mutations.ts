@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient, type QueryClient, type QueryKey } from '@tanstack/react-query'
-import type { Customer, Invoice, Page, Payment, Task, User } from '../../shared/domain'
+import type { Customer, Invoice, Page, Payment, Project, Task, User } from '../../shared/domain'
 import { api } from './api'
 import { keys } from './queries'
 import { invalidateEntities, mutating, type Entity } from './sync'
@@ -502,5 +502,62 @@ export function useUpdateUser(userId?: number) {
     },
     // 'users' also covers /auth/me, in case you edited yourself
     onSettled: () => invalidateEntities(qc, ['users', 'events'], { self: 'users' }),
+  })
+}
+
+// ----------------------------------------------------------------------------
+// Project board & team (port-3): description autosave, staged reassignment
+// ----------------------------------------------------------------------------
+
+/** Autosaved project description: optimistic in every cached project entry, serialized per project. */
+export function useUpdateProjectDescription(projectId: number) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: ['projects', 'update', 'description'],
+    scope: { id: `project-${projectId}` },
+    mutationFn: (description: string) => api.patch<Project>(`/projects/${projectId}`, { description }),
+    onMutate: (description) => optimisticPatch<Project>(qc, keys.projects.all, [projectId], { description }),
+    onError: (err, _v, ctx) => {
+      revertPatch(qc, ctx)
+      onError('Could not save description')(err)
+    },
+    onSettled: () => invalidateEntities(qc, ['projects', 'events'], { self: 'projects' }),
+  })
+}
+
+/** A previewed reassignment: every open task of `fromId` goes to `toId`. */
+export interface Reassignment {
+  fromId: number
+  toId: number
+  taskIds: number[]
+}
+
+/** The open tasks a reassignment would move (always fresh: it is about to be written). */
+export const fetchOpenTaskIds = (qc: QueryClient, assigneeId: number) =>
+  qc
+    .fetchQuery({
+      queryKey: [...keys.tasks.all, 'open-ids', assigneeId],
+      queryFn: ({ signal }) =>
+        api.get<Page<Task>>('/tasks', { 'assigneeId[eq]': assigneeId, 'status[neq]': 'done', limit: 10000 }, signal),
+      staleTime: 0,
+    })
+    .then((p) => p.data.map((t) => t.id))
+
+/**
+ * Save a reassignment as ONE atomic `POST /api/batch`. The mutation stays
+ * pending until the refetch of tasks/workload/project-stats has landed, so a
+ * view overlaying its variables never flashes the old numbers.
+ */
+export function useReassignTasks() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: ['tasks', 'reassign'],
+    mutationFn: ({ toId, taskIds }: Reassignment) =>
+      api.post('/batch', {
+        ops: taskIds.map((id) => ({ entity: 'tasks', op: 'update', id, data: { assigneeId: toId } })),
+      }),
+    onSuccess: (_r, { taskIds }) => toast.success(`Reassigned ${taskIds.length} tasks`),
+    onError: onError('Reassignment failed — rolled back'),
+    onSettled: () => invalidateEntities(qc, TASK_WRITE, { self: 'tasks' }),
   })
 }
