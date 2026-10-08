@@ -51,8 +51,12 @@ const checkAccess = (access: Access | undefined, what: string) =>
 const decode = <S extends Schema.Top>(schema: S, input: unknown) =>
   Schema.decodeUnknownEffect(schema)(input) as unknown as Effect.Effect<S['Type'], Schema.SchemaError>
 
-/** Re-read a row and queue it for the change feed (or a delete if it no longer exists / left its scope). */
-export const touch = (name: string, id: unknown) =>
+/**
+ * Re-read a row and queue it for the change feed (or a delete if it no longer
+ * exists / left its scope). For per-user resources (ownerField) a delete must
+ * name the row's owner, or the stream delivers it to nobody.
+ */
+export const touch = (name: string, id: unknown, ownerId?: number) =>
   Effect.gen(function* () {
     const { db, outbox } = yield* ctx
     const r = resources[name]!
@@ -60,7 +64,9 @@ export const touch = (name: string, id: unknown) =>
     const scope = r.ownerField ? undefined : r.scope?.({} as Principal)
     const row = yield* sql(() => getRow(db, r, id, scope))
     outbox.messages.push(
-      row ? { kind: 'upsert', entity: name, row: row as never } : { kind: 'delete', entity: name, id: id as number },
+      row
+        ? { kind: 'upsert', entity: name, row: row as never }
+        : { kind: 'delete', entity: name, id: id as number, ...(ownerId !== undefined && { ownerId }) },
     )
     return row
   })
@@ -200,7 +206,7 @@ export const remove = (name: string, id: unknown) =>
     const custom = lookup(business, name)?.remove
     if (custom) yield* custom(before)
     else yield* sql(() => deleteRow(db, r, id))
-    yield* touch(name, id)
+    yield* touch(name, id, r.ownerField ? (before[r.ownerField] as number) : undefined)
     yield* audit('delete', name, id, before)
     return null
   })

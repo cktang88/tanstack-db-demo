@@ -214,7 +214,8 @@ export class Chaos extends Context.Service<
 // ---------------------------------------------------------------------------
 export type ChangeMessage =
   | { kind: 'upsert'; entity: string; row: { id: number | string } & Record<string, unknown> }
-  | { kind: 'delete'; entity: string; id: number | string }
+  /** `ownerId` (server-internal, stripped before sending) addresses deletes of per-user rows to their owner only */
+  | { kind: 'delete'; entity: string; id: number | string; ownerId?: number }
   | { kind: 'reset' }
 
 export class ChangeFeed extends Context.Service<

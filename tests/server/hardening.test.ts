@@ -171,3 +171,72 @@ describe('request ids & error messages', () => {
     expect(r.body.message).not.toMatch(/constraint|tags\.name/i)
   })
 })
+
+const openStream = async (token: string) => {
+  const res = await app.request('/api/events/stream', { headers: auth(token) })
+  const reader = res.body!.getReader()
+  const dec = new TextDecoder()
+  const events: Array<{ event?: string; data?: string }> = []
+  let buf = ''
+  let closed = false
+  void (async () => {
+    for (;;) {
+      const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }))
+      if (done) return void (closed = true)
+      buf += dec.decode(value)
+      for (let i = buf.indexOf('\n\n'); i >= 0; i = buf.indexOf('\n\n')) {
+        const chunk = buf.slice(0, i)
+        buf = buf.slice(i + 2)
+        events.push({ event: /^event: (.*)$/m.exec(chunk)?.[1], data: /^data: (.*)$/m.exec(chunk)?.[1] })
+      }
+    }
+  })()
+  const until = async (pred: () => boolean, ms = 3000) => {
+    const start = Date.now()
+    while (!pred()) {
+      if (Date.now() - start > ms) throw new Error('timed out waiting for the stream')
+      await new Promise((r) => setTimeout(r, 5))
+    }
+  }
+  const changes = () => events.filter((e) => e.event === 'change').map((e) => JSON.parse(e.data!))
+  await until(() => events.some((e) => e.event === 'ready'))
+  return { events, changes, until, closed: () => closed, cancel: () => reader.cancel().catch(() => {}) }
+}
+
+describe('change stream authorization', () => {
+  it('delivers deletes of per-user rows only to their owner', async () => {
+    const member = await login('member')
+    const s = await openStream(member)
+    try {
+      const extra = await login('owner')
+      const mine = await app.request('/api/sessions?sort=-id&limit=1', { headers: auth(extra) })
+      const sid = ((await mine.json()) as { data: Array<{ id: number }> }).data[0]!.id
+      expect((await app.request(`/api/sessions/${sid}`, { method: 'DELETE', headers: auth(extra) })).status).toBe(204)
+      await t.as('owner').patch('/customers/7', { country: 'SE' })
+      await s.until(() => s.changes().some((m) => m.entity === 'customers' && m.row?.id === 7))
+      expect(s.changes().filter((m) => m.entity === 'sessions')).toEqual([])
+      expect(s.changes().every((m) => !('ownerId' in m))).toBe(true)
+    } finally {
+      await s.cancel()
+    }
+  })
+  it('closes the stream when the session is logged out', async () => {
+    const member = await login('member')
+    const s = await openStream(member)
+    expect((await app.request('/api/auth/logout', { method: 'POST', headers: auth(member) })).status).toBe(204)
+    await s.until(s.closed)
+  })
+  it('closes the stream when the user is deactivated', async () => {
+    const owner = t.as('owner')
+    const user = (await owner.get('/users?role=member&id[gt]=5&active=true&limit=1')).body.data[0]
+    const res = await app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: user.email, password: 'password' }),
+    })
+    const token = ((await res.json()) as { token: string }).token
+    const s = await openStream(token)
+    expect((await owner.patch(`/users/${user.id}`, { active: false })).status).toBe(200)
+    await s.until(s.closed)
+  })
+})

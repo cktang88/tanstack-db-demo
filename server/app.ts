@@ -288,7 +288,9 @@ export function makeApp(opts: AppOptions) {
       Effect.gen(function* () {
         const d = yield* database
         const sid = c.get('sessionId')
-        if (sid) yield* sql(() => deleteSession(d, sid))
+        const gone = sid ? yield* sql(() => deleteSession(d, sid)) : undefined
+        // tells the user's other tabs (session lists) and closes this session's change streams
+        if (gone) yield* H.touch('sessions', gone.id, gone.userId)
         yield* H.audit('logout', 'sessions', null)
         deleteCookie(c, SESSION_COOKIE, { path: '/', secure: secureCookies })
         return null
@@ -384,10 +386,21 @@ export function makeApp(opts: AppOptions) {
     ),
   )
 
-  /** Server-sent change feed, filtered by what the caller is allowed to read. */
+  /**
+   * Server-sent change feed, filtered by what the caller is allowed to read.
+   * The caller is re-resolved from their session before every delivery and
+   * heartbeat: after logout, session revocation, expiry or deactivation the
+   * stream closes; role/team changes apply to the very next message.
+   */
   app.get('/events/stream', (c) =>
     streamSSE(c, async (stream) => {
-      const me = c.get('me')!
+      const token = c.get('sessionId')!
+      let me = c.get('me')!
+      const refresh = () => {
+        const current = resolveSession(db(), token)
+        if (current) me = toPrincipal(current)
+        return current !== undefined
+      }
       const feed = await runtime.runPromise(
         Effect.gen(function* () {
           return yield* ChangeFeed
@@ -398,13 +411,15 @@ export function makeApp(opts: AppOptions) {
         const r = lookup(resources, m.entity)
         if (!r) return false
         if (r.read && !me.can(r.read)) return false
-        if (r.ownerField && m.kind === 'upsert' && (m.row as Record<string, unknown>)[r.ownerField] !== me.user.id) return false
+        if (r.ownerField) {
+          const owner = m.kind === 'upsert' ? (m.row as Record<string, unknown>)[r.ownerField] : m.ownerId
+          if (owner !== me.user.id) return false
+        }
         return true
       }
       const queue: ChangeMessage[] = []
       let wake: (() => void) | undefined
       const unsubscribe = feed.subscribe((m) => {
-        if (!visible(m)) return
         queue.push(m)
         wake?.()
       })
@@ -414,12 +429,25 @@ export function makeApp(opts: AppOptions) {
       })
       await stream.writeSSE({ event: 'ready', data: '{}' })
       while (!stream.aborted) {
-        while (queue.length) await stream.writeSSE({ event: 'change', data: JSON.stringify(queue.shift()) })
+        if (queue.length) {
+          if (!refresh()) break
+          while (queue.length) {
+            const m = queue.shift()!
+            if (!visible(m)) continue
+            const { ownerId: _owner, ...wire } = m as ChangeMessage & { ownerId?: number }
+            await stream.writeSSE({ event: 'change', data: JSON.stringify(wire) })
+          }
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined
         await new Promise<void>((r) => {
           wake = r
-          setTimeout(r, 15_000) // heartbeat
+          timer = setTimeout(r, 15_000) // heartbeat
         })
-        if (!queue.length && !stream.aborted) await stream.writeSSE({ event: 'ping', data: '' })
+        clearTimeout(timer)
+        if (!queue.length && !stream.aborted) {
+          if (!refresh()) break
+          await stream.writeSSE({ event: 'ping', data: '' })
+        }
       }
       unsubscribe()
     }),
