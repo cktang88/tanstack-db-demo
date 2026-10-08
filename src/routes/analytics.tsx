@@ -1,19 +1,25 @@
 import { useSuspenseQueries } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useDeferredValue, useState } from 'react'
+import { PLANS, type Plan } from '../../shared/domain'
 import { DonutChart, HBarChart, RevenueChart, SignupsChart } from '../components/charts'
-import { Card, PageHeader, Segmented } from '../components/ui'
+import { Card, cx, PageHeader, Segmented } from '../components/ui'
 import { money, moneyCompact, number, percent, titleCase } from '../lib/format'
 import { breakdownQuery, overviewQuery, revenueQuery, signupsQuery } from '../lib/queries'
 
 export function AnalyticsPage() {
   const [mode, setMode] = useState<'stacked' | 'grouped'>('stacked')
   const [metric, setMetric] = useState<'mrr' | 'customers'>('mrr')
+  const [plan, setPlan] = useState<Plan | 'all'>('all')
+  // Switching plans suspends on a new query key; deferring it keeps the current
+  // charts on screen (dimmed) until the filtered breakdowns arrive.
+  const shownPlan = useDeferredValue(plan)
+  const planFilter = shownPlan === 'all' ? undefined : shownPlan
   // Six server-side aggregation endpoints, fetched in parallel.
   const [{ data: byCountry }, { data: byStatus }, { data: byPlan }, { data: signups }, { data: revenue }, { data: kpi }] =
     useSuspenseQueries({
       queries: [
-        breakdownQuery('country'),
-        breakdownQuery('status'),
+        breakdownQuery('country', planFilter),
+        breakdownQuery('status', planFilter),
         breakdownQuery('plan'),
         signupsQuery(12),
         revenueQuery(18),
@@ -28,18 +34,33 @@ export function AnalyticsPage() {
         title="Analytics"
         description="Breakdowns computed by SQL aggregations on the server."
         actions={
-          <Segmented
-            label="Metric"
-            value={metric}
-            onChange={setMetric}
-            options={[
-              { value: 'mrr', label: 'MRR' },
-              { value: 'customers', label: 'Customers' },
-            ]}
-          />
+          <>
+            <select
+              className="input w-36"
+              aria-label="Plan filter"
+              value={plan}
+              onChange={(e) => setPlan(e.target.value as Plan | 'all')}
+            >
+              <option value="all">All plans</option>
+              {PLANS.map((p) => (
+                <option key={p} value={p}>
+                  {titleCase(p)}
+                </option>
+              ))}
+            </select>
+            <Segmented
+              label="Metric"
+              value={metric}
+              onChange={setMetric}
+              options={[
+                { value: 'mrr', label: 'MRR' },
+                { value: 'customers', label: 'Customers' },
+              ]}
+            />
+          </>
         }
       />
-      <div className="mb-6 grid gap-6 lg:grid-cols-2">
+      <div className={cx('mb-6 grid gap-6 transition-opacity lg:grid-cols-2', plan !== shownPlan && 'opacity-60')}>
         <Card title={`${metric === 'mrr' ? 'MRR' : 'Customers'} by country`}>
           <HBarChart label="By country" data={byCountry.map((d) => ({ key: d.key, value: d[metric] }))} format={fmt} />
         </Card>
