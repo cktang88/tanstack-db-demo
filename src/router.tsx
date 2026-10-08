@@ -60,14 +60,20 @@ const loginRoute = createRoute({
   component: LoginPage,
 })
 
+/**
+ * Loader-only options: resolve from cache whenever *any* data is cached (even stale).
+ * See the note above the page routes.
+ */
+const cached = <O extends object>(options: O) => ({ ...options, staleTime: 'static' as const })
+
 /** Everything else requires a session: the guard resolves /auth/me before any child loader runs. */
 const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: 'app',
   beforeLoad: async ({ context: { queryClient }, location }) => {
     try {
-      // 'static': a cached session never blocks navigation; the layout's useSuspenseQuery revalidates it
-      return { me: await queryClient.query({ ...meQuery(), staleTime: 'static' }) }
+      // a cached session never blocks navigation (see `cached`); the layout's useSuspenseQuery revalidates it
+      return { me: await queryClient.query(cached(meQuery())) }
     } catch (e) {
       // only a 401 means "signed out"; anything else (5xx, network) is a real error
       if (isUnauthorized(e)) throw redirect({ to: '/login', search: { redirect: location.href } })
@@ -86,13 +92,17 @@ const requires =
   }
 
 // Loaders use `queryClient.query()` (5.102+, replaces the deprecated ensureQueryData/fetchQuery)
-// so navigations render instantly from cache and
-// data starts loading in parallel with the route's JS, not in a useEffect waterfall.
+// so data starts loading in parallel with the route's JS, not in a useEffect waterfall.
+// `query()` fetches whenever the entry is stale, which would block navigation on a
+// refetch of data we already have; `cached()` sets staleTime 'static' for the loader
+// call only, so any cached data resolves immediately and only a cold cache waits.
+// The page's useSuspenseQuery/useQuery then revalidates stale data on mount.
+// (Lists with keepPreviousData are prefetched without blocking at all.)
 const overviewRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/',
   loader: ({ context: { queryClient } }) =>
-    Promise.all([queryClient.query(overviewQuery()), queryClient.query(revenueQuery(12))]),
+    Promise.all([queryClient.query(cached(overviewQuery())), queryClient.query(cached(revenueQuery(12)))]),
   component: OverviewPage,
 })
 
@@ -112,7 +122,7 @@ export const customersRoute = createRoute({
   loader: ({ context: { queryClient }, deps }) => {
     // don't block navigation on refetches of pages we already have
     void queryClient.query(customersListQuery(deps)).catch(noop)
-    return queryClient.query(usersQuery())
+    return queryClient.query(cached(usersQuery()))
   },
   component: CustomersPage,
 })
@@ -127,7 +137,7 @@ export const customerDetailRoute = createRoute({
   loader: ({ context: { queryClient }, params }) => {
     void queryClient.query(customerInvoicesQuery(params.customerId)).catch(noop)
     void queryClient.query(customerActivityQuery(params.customerId)).catch(noop)
-    return queryClient.query(customerQuery(params.customerId))
+    return queryClient.query(cached(customerQuery(params.customerId)))
   },
   errorComponent: ErrorView,
   component: CustomerDetailPage,
@@ -147,7 +157,7 @@ const projectsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/projects',
   loader: ({ context: { queryClient } }) =>
-    Promise.all([queryClient.query(projectsQuery()), queryClient.query(projectStatsQuery())]),
+    Promise.all([queryClient.query(cached(projectsQuery())), queryClient.query(cached(projectStatsQuery()))]),
   component: ProjectsPage,
 })
 
@@ -160,9 +170,9 @@ export const projectBoardRoute = createRoute({
   },
   loader: ({ context: { queryClient }, params }) =>
     Promise.all([
-      queryClient.query(projectQuery(params.projectId)),
-      queryClient.query(projectTasksQuery(params.projectId)),
-      queryClient.query(usersQuery()),
+      queryClient.query(cached(projectQuery(params.projectId))),
+      queryClient.query(cached(projectTasksQuery(params.projectId))),
+      queryClient.query(cached(usersQuery())),
     ]),
   errorComponent: ErrorView,
   component: ProjectBoardPage,
@@ -171,14 +181,14 @@ export const projectBoardRoute = createRoute({
 const teamRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/team',
-  loader: ({ context: { queryClient } }) => queryClient.query(usersQuery()),
+  loader: ({ context: { queryClient } }) => queryClient.query(cached(usersQuery())),
   component: TeamPage,
 })
 
 const activityRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/activity',
-  loader: ({ context: { queryClient } }) => queryClient.infiniteQuery(activityFeedQuery()),
+  loader: ({ context: { queryClient } }) => queryClient.infiniteQuery(cached(activityFeedQuery())),
   component: ActivityPage,
 })
 
@@ -193,7 +203,7 @@ const billingRoute = createRoute({
   path: '/billing',
   beforeLoad: requires('billing:read'),
   loader: ({ context: { queryClient } }) =>
-    Promise.all([queryClient.query(mrrSnapshotsQuery()), queryClient.query(arAgingQuery())]),
+    Promise.all([queryClient.query(cached(mrrSnapshotsQuery())), queryClient.query(cached(arAgingQuery()))]),
   component: BillingPage,
 })
 
@@ -201,7 +211,7 @@ const productsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/products',
   beforeLoad: requires('products:read'),
-  loader: ({ context: { queryClient } }) => queryClient.query(productsQuery()),
+  loader: ({ context: { queryClient } }) => queryClient.query(cached(productsQuery())),
   component: ProductsPage,
 })
 
