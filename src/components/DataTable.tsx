@@ -30,6 +30,8 @@ interface Props<T extends { id: number }> {
   columns: ColumnDef<ServerFeatures, T, any>[]
   data: T[]
   rowCount: number
+  /** only the first `maxRows` matches can be paged to (deeper windows are not served); rowCount is still shown */
+  maxRows?: number
   pagination: PaginationState
   onPaginationChange: (p: PaginationState) => void
   sorting: SortingState
@@ -55,7 +57,7 @@ export function DataTable<T extends { id: number }>(props: Props<T>) {
     features: serverTableFeatures,
     columns: props.columns,
     data: props.data,
-    rowCount: props.rowCount,
+    rowCount: props.maxRows === undefined ? props.rowCount : Math.min(props.rowCount, props.maxRows),
     getRowId: (r) => String(r.id),
     manualPagination: true,
     manualSorting: true,
@@ -158,7 +160,7 @@ export function DataTable<T extends { id: number }>(props: Props<T>) {
             {props.data.length === 0 && (
               <tr>
                 <td colSpan={99} className="td py-10 text-center text-zinc-500">
-                  No results.
+                  {props.isPlaceholder ? 'Loading…' : 'No results.'}
                 </td>
               </tr>
             )}
@@ -170,6 +172,11 @@ export function DataTable<T extends { id: number }>(props: Props<T>) {
         <span className="text-zinc-500" data-testid="page-info">
           {number(from)}–{number(to)} of {number(props.rowCount)}
         </span>
+        {props.maxRows !== undefined && props.rowCount > props.maxRows && (
+          <span className="text-xs text-zinc-400" data-testid="page-cap">
+            paging stops at the first {number(props.maxRows)} — narrow the filters or flip the sort to see the rest
+          </span>
+        )}
         <div className="flex items-center gap-2">
           <label className="flex items-center gap-2 text-zinc-500">
             Rows

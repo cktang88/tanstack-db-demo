@@ -1,14 +1,15 @@
-import { Link, Outlet, useRouterState } from '@tanstack/react-router'
-import { useIsFetching, useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query'
+import { count, isNull, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import type { Permission } from '../../shared/domain'
 import { useCan, useLogout } from '../lib/auth'
-import { createCustomerAlerts } from '../lib/alerts'
+import { Link, Outlet, useRouterState } from '@tanstack/react-router'
+import { notificationsCollection, projectsCollection, tasksCollection, usersCollection } from '../db/collections'
+import { markAllNotificationsRead } from '../db/actions'
+import { listTotalQuery } from '../db/aggregates'
+import { usePrefs } from '../db/hooks'
 import { number, relative } from '../lib/format'
-import { startLiveUpdates } from '../lib/live'
-import { useMarkNotificationsRead } from '../lib/mutations'
-import { notificationsQuery, rowCountQuery } from '../lib/queries'
-import { useSettings } from '../lib/settings'
+import { toast } from '../lib/toast'
 import { Avatar, Badge, cx, Spinner, Toaster } from './ui'
 
 const NAV: ReadonlyArray<{ to: string; label: string; icon: string; permission?: Permission }> = [
@@ -25,14 +26,24 @@ const NAV: ReadonlyArray<{ to: string; label: string; icon: string; permission?:
   { to: '/settings', label: 'Settings', icon: '⚙' },
 ]
 
-function useNav() {
-  const { can } = useCan()
-  return NAV.filter((n) => !n.permission || can(n.permission))
-}
-
 function Notifications() {
-  const { data = [] } = useQuery(notificationsQuery())
-  const mark = useMarkNotificationsRead()
+  // my notifications (server-scoped) as a live collection; unread count is a live aggregate
+  const { data } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ n: notificationsCollection })
+        .orderBy(({ n }) => n.createdAt, 'desc')
+        .orderBy(({ n }) => n.id, 'desc')
+        .limit(30),
+  })
+  const { data: unread } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ n: notificationsCollection })
+        .where(({ n }) => isNull(n.readAt))
+        .select(({ n }) => ({ n: count(n.id) }))
+        .findOne(),
+  })
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -40,17 +51,21 @@ function Notifications() {
     document.addEventListener('click', close)
     return () => document.removeEventListener('click', close)
   }, [])
-  const unread = data.filter((n) => !n.readAt).length
+  const markAll = () =>
+    markAllNotificationsRead()
+      .when('settled')
+      .catch((e: Error) => toast.error('Could not mark notifications read — restored', e.message))
+  const count_ = unread?.n ?? 0
   return (
     <div className="relative" ref={ref}>
-      <button className="btn-ghost relative" aria-label={`Notifications (${unread} unread)`} onClick={() => setOpen((o) => !o)}>
+      <button className="btn-ghost relative" aria-label={`Notifications (${count_} unread)`} onClick={() => setOpen((o) => !o)}>
         🔔
-        {unread > 0 && (
+        {count_ > 0 && (
           <span
             className="absolute -top-0.5 -right-0.5 rounded-full bg-red-600 px-1 text-[10px] text-white"
             data-testid="unread-count"
           >
-            {unread}
+            {count_}
           </span>
         )}
       </button>
@@ -58,7 +73,7 @@ function Notifications() {
         <div className="card absolute right-0 z-30 mt-2 w-80 p-0 shadow-xl" data-testid="notifications">
           <div className="flex items-center justify-between border-b border-zinc-100 px-3 py-2 text-sm font-medium dark:border-zinc-800">
             Notifications
-            <button className="text-xs text-brand-600" onClick={() => mark.mutate('all')} disabled={!unread}>
+            <button className="text-xs text-brand-600" onClick={markAll} disabled={!count_}>
               Mark all read
             </button>
           </div>
@@ -70,7 +85,12 @@ function Notifications() {
                   {!n.readAt && (
                     <button
                       className="text-xs text-zinc-400 hover:text-zinc-700"
-                      onClick={() => mark.mutate(n.id)}
+                      onClick={() =>
+                        notificationsCollection
+                          .update(n.id, (d) => void (d.readAt = new Date().toISOString()))
+                          .when('settled')
+                          .catch((e: Error) => toast.error('Could not mark notification read', e.message))
+                      }
                       aria-label="Mark read"
                     >
                       ✓
@@ -107,77 +127,56 @@ function UserMenu() {
   )
 }
 
-function GlobalStatus() {
-  const fetching = useIsFetching()
-  const mutating = useIsMutating()
-  const loading = useRouterState({ select: (s) => s.status === 'pending' })
-  return (
-    <div className="flex items-center gap-3 text-xs text-zinc-500" data-testid="global-status">
-      {(fetching > 0 || loading) && (
-        <span className="flex items-center gap-1.5">
-          <Spinner className="size-3" /> syncing {fetching > 0 ? `(${fetching})` : ''}
-        </span>
-      )}
-      {mutating > 0 && <span className="text-amber-600">saving {mutating}…</span>}
-    </div>
-  )
-}
-
-/** Live row counts: `limit=0` totals, kept fresh by the change feed's invalidations. */
-const COUNTED = [
-  ['customers', 'customers:read'],
-  ['invoices', 'billing:read'],
-  ['tasks', 'projects:read'],
-  ['projects', 'projects:read'],
-  ['users', undefined],
-] as const satisfies ReadonlyArray<readonly [Parameters<typeof rowCountQuery>[0], Permission | undefined]>
-
+/**
+ * Row counts. Customers and invoices are on-demand collections (the client
+ * holds windows, not tables): their counts are server totals (`?limit=0`),
+ * re-read when the change feed reports a write. The small eager collections
+ * are counted locally, live.
+ */
 function DbStats() {
   const { can } = useCan()
   return (
     <dl className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5" data-testid="db-stats">
-      {COUNTED.map(([name, permission]) => (
-        <RowCount key={name} name={name} enabled={!permission || can(permission)} />
-      ))}
+      {can('customers:read') && <ServerCount name="customers" />}
+      {can('billing:read') && <ServerCount name="invoices" />}
+      <CollectionSize name="tasks" collection={tasksCollection} />
+      <CollectionSize name="projects" collection={projectsCollection} />
+      <CollectionSize name="users" collection={usersCollection} />
     </dl>
   )
 }
 
-function RowCount({ name, enabled }: { name: (typeof COUNTED)[number][0]; enabled: boolean }) {
-  const { data, isPending, isError } = useQuery({ ...rowCountQuery(name), enabled })
+function ServerCount({ name }: { name: 'customers' | 'invoices' }) {
+  const { data, isError } = useQuery(listTotalQuery(name, {}))
   return (
     <>
       <dt>{name}</dt>
-      <dd className="text-right tabular-nums">
-        {!enabled || isError ? '—' : isPending ? <Spinner className="size-2.5" /> : number(data)}
-      </dd>
+      <dd className="text-right tabular-nums">{data ? number(data.total) : isError ? '—' : <Spinner className="size-2.5" />}</dd>
     </>
   )
 }
 
-/**
- * Server-sent change feed for the signed-in user; reopened when the user changes.
- * Live alerts (a customer churned / became a $20k+ account) compare the rows it
- * pushes, and our own customer mutations' results, with what we had cached.
- */
-function useLiveUpdates(userId: number) {
-  const qc = useQueryClient()
-  useEffect(() => {
-    const alerts = createCustomerAlerts(qc)
-    const stopAlerts = alerts.watchMutations()
-    const stopLive = startLiveUpdates(qc, { onChange: alerts.onChange })
-    return () => {
-      stopLive()
-      stopAlerts()
-    }
-  }, [qc, userId])
+function CollectionSize({ name, collection }: { name: string; collection: unknown }) {
+  const { data, isReady } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ r: collection as typeof tasksCollection })
+        .select(({ r }) => ({ n: count(r.id) }))
+        .findOne(),
+  })
+  return (
+    <>
+      <dt>{name}</dt>
+      <dd className="text-right tabular-nums">{isReady ? number(data?.n ?? 0) : <Spinner className="size-2.5" />}</dd>
+    </>
+  )
 }
 
 export function Layout() {
-  const [settings, setSettings] = useSettings()
-  const nav = useNav()
-  const { me } = useCan()
-  useLiveUpdates(me.user.id)
+  const [prefs] = usePrefs()
+  const { can } = useCan()
+  const nav = NAV.filter((n) => !n.permission || can(n.permission))
+  const loading = useRouterState({ select: (s) => s.status === 'pending' })
   return (
     <div className="flex min-h-screen">
       <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-zinc-200 bg-white px-3 py-4 md:flex dark:border-zinc-800 dark:bg-zinc-900">
@@ -201,7 +200,7 @@ export function Layout() {
         </nav>
         <div className="mt-auto mb-14 space-y-2 px-2 text-[11px] leading-relaxed text-zinc-400">
           <div>
-            Data layer: <b>TanStack Query</b>
+            Data layer: <b>TanStack DB</b>
           </div>
           <DbStats />
         </div>
@@ -215,24 +214,37 @@ export function Layout() {
               </Link>
             ))}
           </nav>
-          <GlobalStatus />
+          <div className="text-xs text-zinc-500" data-testid="global-status">
+            {loading && (
+              <span className="flex items-center gap-1.5">
+                <Spinner className="size-3" /> loading
+              </span>
+            )}
+          </div>
           <div className="ml-auto flex items-center gap-2">
-            <button
-              className="btn-ghost"
-              aria-label="Toggle theme"
-              onClick={() => setSettings({ theme: settings.theme === 'dark' ? 'light' : 'dark' })}
-            >
-              {settings.theme === 'dark' ? '☀' : '☾'}
-            </button>
+            <ThemeToggle />
             <Notifications />
             <UserMenu />
           </div>
         </header>
-        <main className={cx('mx-auto w-full flex-1 px-6 py-6', settings.compact ? 'max-w-[1600px]' : 'max-w-7xl')}>
+        <main className={cx('mx-auto w-full flex-1 px-6 py-6', prefs.compact ? 'max-w-[1600px]' : 'max-w-7xl')}>
           <Outlet />
         </main>
       </div>
       <Toaster />
     </div>
+  )
+}
+
+function ThemeToggle() {
+  const [prefs, update] = usePrefs()
+  return (
+    <button
+      className="btn-ghost"
+      aria-label="Toggle theme"
+      onClick={() => update({ theme: prefs.theme === 'dark' ? 'light' : 'dark' })}
+    >
+      {prefs.theme === 'dark' ? '☀' : '☾'}
+    </button>
   )
 }

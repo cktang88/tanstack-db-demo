@@ -1,32 +1,50 @@
-import { field } from '../lib/format'
-import { useMutationState, useQuery } from '@tanstack/react-query'
-import { useActionState } from 'react'
-import type { Task, User } from '../../shared/domain'
+import { and, count, eq, SchemaValidationError, sum, useLiveQuery } from '@tanstack/react-db'
+import { useState, type FormEvent } from 'react'
+import type { User } from '../../shared/domain'
+import {
+  commentsCollection,
+  newId,
+  projectsCollection,
+  tasksCollection,
+  timeEntriesCollection,
+  usersCollection,
+  type TaskRow,
+} from '../db/collections'
 import { useCan } from '../lib/auth'
-import { localToday, relative } from '../lib/format'
-import { useAddComment, useDeleteTime, useLogTime, useUpdateTask } from '../lib/mutations'
-import { taskCommentsQuery, taskTimeQuery } from '../lib/queries'
+import { field, relative } from '../lib/format'
+import { toast } from '../lib/toast'
 import { Avatar, Badge, Dialog } from './ui'
 
-interface Props {
-  task: Task | null
-  users: User[]
-  /** may (re)assign the task: only for those who can edit the project, not just the assignee */
-  canAssign: boolean
-  onClose: () => void
-}
+const today = () => new Date().toISOString().slice(0, 10)
+const rollback = (title: string) => (e: Error) => toast.error(title, e.message)
 
-export function TaskDialog({ task, users, canAssign, onClose }: Props) {
+export function TaskDialog({ taskId, onClose }: { taskId: number | null; onClose: () => void }) {
+  const { data: task } = useLiveQuery({
+    query: (q) =>
+      taskId === null
+        ? undefined
+        : q
+            .from({ t: tasksCollection })
+            .where(({ t }) => eq(t.id, taskId))
+            .findOne(),
+  })
   return (
     <Dialog open={!!task} onClose={onClose} title={task?.title ?? ''}>
-      {task && <TaskBody task={task} users={users} canAssign={canAssign} />}
+      {task && <TaskBody task={task} />}
     </Dialog>
   )
 }
 
-function TaskBody({ task, users, canAssign }: { task: Task; users: User[]; canAssign: boolean }) {
-  const { me, can, privileged } = useCan()
-  const update = useUpdateTask(task.id)
+function TaskBody({ task }: { task: TaskRow }) {
+  const { me, can, canEditProject, privileged } = useCan()
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const { data: project } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: projectsCollection })
+        .where(({ p }) => eq(p.id, task.projectId))
+        .findOne(),
+  })
   const byId = new Map(users.map((u) => [u.id, u]))
   return (
     <div className="space-y-5 text-sm" data-testid="task-dialog">
@@ -39,9 +57,13 @@ function TaskBody({ task, users, canAssign }: { task: Task; users: User[]; canAs
             className="input w-44"
             aria-label="Assignee"
             value={task.assigneeId ?? ''}
-            disabled={!canAssign || task.id < 0}
+            // the assignee may move their task, but only project editors may reassign it (server rule)
+            disabled={!project || !canEditProject(project)}
             onChange={(e) =>
-              update.mutate({ id: task.id, patch: { assigneeId: e.target.value ? Number(e.target.value) : null } })
+              tasksCollection
+                .update(task.id, (d) => void (d.assigneeId = e.target.value ? Number(e.target.value) : null))
+                .when('settled')
+                .catch(rollback('Could not reassign — rolled back'))
             }
           >
             <option value="">Unassigned</option>
@@ -77,27 +99,32 @@ function Comments({
   meId: number
   canComment: boolean
 }) {
-  const { data: comments = [] } = useQuery(taskCommentsQuery(taskId))
-  const add = useAddComment()
-  // optimistic "via the UI": render pending comment variables until the refetch lands
-  const pending = useMutationState({
-    filters: { mutationKey: ['task-comments', 'create'], status: 'pending' },
-    select: (m) => m.state.variables as { taskId: number; body: string },
-  }).filter((v) => v.taskId === taskId)
-  // the draft survives a failed post (React resets the form after the action)
-  const [{ error, draft }, action] = useActionState(
-    async (_: { error: string | null; draft: string }, f: FormData) => {
-      const body = field(f, 'body').trim()
-      if (!body) return { error: 'Comment cannot be empty', draft: '' }
-      try {
-        await add.mutateAsync({ taskId, body })
-        return { error: null, draft: '' }
-      } catch (e) {
-        return { error: (e as Error).message, draft: body }
-      }
-    },
-    { error: null, draft: '' },
-  )
+  const { data: comments } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ c: commentsCollection })
+        .where(({ c }) => eq(c.taskId, taskId))
+        .orderBy(({ c }) => c.createdAt)
+        .orderBy(({ c }) => c.id),
+  })
+  // controlled + onSubmit (a form action would reset the input) so a rejected comment stays editable
+  const [body, setBody] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const post = (e: FormEvent) => {
+    e.preventDefault()
+    try {
+      // append-only collection (insert handler only); the Effect Schema rejects empty bodies before render
+      commentsCollection
+        .insert({ id: newId(), taskId, authorId: meId, body: body.trim(), createdAt: new Date().toISOString() })
+        .when('settled')
+        .catch(rollback('Could not post comment — removed'))
+      setBody('')
+      setError(null)
+    } catch (e) {
+      if (e instanceof SchemaValidationError) return setError(e.issues[0]?.message ?? 'Invalid comment')
+      throw e
+    }
+  }
   return (
     <section>
       <h3 className="label">Discussion (append-only)</h3>
@@ -105,34 +132,29 @@ function Comments({
         {comments.map((c) => {
           const u = c.authorId ? byId.get(c.authorId) : undefined
           return (
-            <li key={c.id} className="flex gap-2">
+            <li key={c.id} className={`flex gap-2 ${c.$hasPendingWrites ? 'opacity-60' : ''}`}>
               {u && <Avatar name={u.name} color={u.avatarColor} size={22} />}
               <div>
                 <div className="text-xs text-zinc-500">
-                  {u?.name ?? 'Someone'} · {relative(c.createdAt)}
+                  {u?.name ?? 'Someone'} · {c.$hasPendingWrites ? 'sending…' : relative(c.createdAt)}
                 </div>
                 <div>{c.body}</div>
               </div>
             </li>
           )
         })}
-        {pending.map((p, i) => {
-          const u = byId.get(meId)
-          return (
-            <li key={`p${i}`} className="flex gap-2 opacity-60">
-              {u && <Avatar name={u.name} color={u.avatarColor} size={22} />}
-              <div>
-                <div className="text-xs text-zinc-500">{u?.name ?? 'Someone'} · sending…</div>
-                <div>{p.body}</div>
-              </div>
-            </li>
-          )
-        })}
-        {comments.length + pending.length === 0 && <li className="text-zinc-500">No comments yet.</li>}
+        {comments.length === 0 && <li className="text-zinc-500">No comments yet.</li>}
       </ul>
       {canComment && (
-        <form action={action} className="mt-2 flex gap-2">
-          <input name="body" className="input" placeholder="Write a comment…" aria-label="Comment" defaultValue={draft} />
+        <form onSubmit={post} className="mt-2 flex gap-2">
+          <input
+            name="body"
+            className="input"
+            placeholder="Write a comment…"
+            aria-label="Comment"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+          />
           <button className="btn-secondary">Post</button>
         </form>
       )}
@@ -140,8 +162,6 @@ function Comments({
     </section>
   )
 }
-
-type NewTimeEntry = { taskId: number; minutes: number; spentOn: string; billable: boolean; note: string }
 
 function TimeLog({
   taskId,
@@ -156,40 +176,39 @@ function TimeLog({
   canLog: boolean
   canDelete: (e: { userId: number }) => boolean
 }) {
-  const { data: entries = [] } = useQuery(taskTimeQuery(taskId))
-  const log = useLogTime()
-  const del = useDeleteTime()
-  // entries being logged are rendered from mutation state (dimmed) until the refetch lands
-  const logging = useMutationState({
-    filters: { mutationKey: ['time-entries', 'create'], status: 'pending' },
-    select: (m) => m.state.variables as NewTimeEntry,
-  }).filter((v) => v.taskId === taskId)
-  const deleting = new Set(
-    useMutationState({
-      filters: { mutationKey: ['time-entries', 'delete'], status: 'pending' },
-      select: (m) => m.state.variables as number,
-    }),
-  )
-  // totals count what's being logged right away (and stop counting what's being deleted)
-  const counted = [...logging, ...entries.filter((e) => !deleting.has(e.id))]
-  const total = counted.reduce((s, e) => s + e.minutes, 0)
-  const billable = counted.filter((e) => e.billable).reduce((s, e) => s + e.minutes, 0)
+  const { data: entries } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ e: timeEntriesCollection })
+        .where(({ e }) => eq(e.taskId, taskId))
+        .orderBy(({ e }) => e.spentOn, 'desc')
+        .orderBy(({ e }) => e.id, 'desc'),
+  })
+  // totals are live aggregates — they move the instant an entry is added or removed
+  const { data: totals } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ e: timeEntriesCollection })
+        .where(({ e }) => eq(e.taskId, taskId))
+        .select(({ e }) => ({ minutes: sum(e.minutes), n: count(e.id) }))
+        .findOne(),
+  })
+  const { data: billable } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ e: timeEntriesCollection })
+        .where(({ e }) => and(eq(e.taskId, taskId), eq(e.billable, true)))
+        .select(({ e }) => ({ minutes: sum(e.minutes) }))
+        .findOne(),
+  })
   return (
     <section>
       <h3 className="label">
-        Time — {(total / 60).toFixed(1)}h total, {(billable / 60).toFixed(1)}h billable
+        Time — {((totals?.minutes ?? 0) / 60).toFixed(1)}h total, {((billable?.minutes ?? 0) / 60).toFixed(1)}h billable
       </h3>
       <ul className="max-h-40 space-y-1 overflow-auto" data-testid="time-entries">
-        {logging.map((e, i) => (
-          <li key={`p${i}`} className="flex items-center justify-between gap-2 opacity-60">
-            <span>
-              {e.spentOn} · {byId.get(meId)?.name ?? '?'} {!e.billable && <Badge value="non-billable" tone="zinc" />}
-            </span>
-            <span className="flex items-center gap-2 tabular-nums">{e.minutes}m</span>
-          </li>
-        ))}
         {entries.map((e) => (
-          <li key={e.id} className={`flex items-center justify-between gap-2 ${deleting.has(e.id) ? 'opacity-60' : ''}`}>
+          <li key={e.id} className={`flex items-center justify-between gap-2 ${e.$hasPendingWrites ? 'opacity-60' : ''}`}>
             <span>
               {e.spentOn} · {byId.get(e.userId)?.name ?? '?'} {!e.billable && <Badge value="non-billable" tone="zinc" />}
             </span>
@@ -199,7 +218,9 @@ function TimeLog({
                 <button
                   className="text-xs text-zinc-400 hover:text-red-600"
                   aria-label="Delete time entry"
-                  onClick={() => del.mutate(e.id)}
+                  onClick={() =>
+                    timeEntriesCollection.delete(e.id).when('settled').catch(rollback('Could not delete — restored'))
+                  }
                 >
                   ✕
                 </button>
@@ -212,17 +233,23 @@ function TimeLog({
         <form
           className="mt-2 flex flex-wrap items-center gap-2"
           action={(f) =>
-            log.mutate({
-              taskId,
-              minutes: Number(f.get('minutes')),
-              spentOn: field(f, 'spentOn'),
-              billable: f.get('billable') === 'on',
-              note: '',
-            })
+            void timeEntriesCollection
+              .insert({
+                id: newId(),
+                taskId,
+                userId: meId,
+                minutes: Number(field(f, 'minutes')),
+                spentOn: field(f, 'spentOn'),
+                billable: f.get('billable') === 'on',
+                note: '',
+                createdAt: new Date().toISOString(),
+              })
+              .when('settled')
+              .then(() => toast.success('Time logged'), rollback('Could not log time — removed'))
           }
         >
           <input name="minutes" type="number" min={1} max={1440} defaultValue={30} className="input w-20" aria-label="Minutes" />
-          <input name="spentOn" type="date" defaultValue={localToday()} className="input w-36" aria-label="Date" />
+          <input name="spentOn" type="date" defaultValue={today()} className="input w-36" aria-label="Date" />
           <label className="flex items-center gap-1 text-xs">
             <input name="billable" type="checkbox" defaultChecked /> billable
           </label>

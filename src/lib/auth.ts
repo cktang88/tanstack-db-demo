@@ -1,6 +1,8 @@
-import { queryOptions, useMutation, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
+import { queryOptions, useMutation, useQueryClient, useSuspenseQuery, type QueryClient } from '@tanstack/react-query'
 import { useRouter } from '@tanstack/react-router'
 import type { Me, Permission, Role } from '../../shared/domain'
+import { resetServerCollections } from '../db/collections'
+import { stopLiveSync } from '../db/live'
 import { api, HttpError } from './api'
 
 export const meQuery = () =>
@@ -21,55 +23,62 @@ export const demoUsersQuery = () =>
 
 export const isUnauthorized = (e: unknown) => e instanceof HttpError && e.status === 401
 
-/** Only follow same-origin, in-app redirect targets (never `//evil.com` or back to /login). */
-export const safeRedirect = (target: unknown): string =>
-  typeof target === 'string' && target.startsWith('/') && !target.startsWith('//') && !target.startsWith('/login') ? target : '/'
-
 /** Current session (suspends; only used inside the authenticated layout). */
 export function useMe() {
   return useSuspenseQuery(meQuery()).data
 }
 
-type ProjectRef = { teamId: number | null; ownerId: number | null }
+type ProjectAccess = { teamId: number | null; ownerId: number | null }
 
-/**
- * Permission + row-level rules, mirrored from the server (server/resources.ts)
- * so the UI doesn't offer actions that would only 403 and roll back.
- */
-export function permissionsFor(me: Me) {
-  const can = (p: Permission) => me.permissions.includes(p)
+export function useCan() {
+  const me = useMe()
   const privileged = me.user.role === 'owner' || me.user.role === 'admin'
-  const canEditProject = (p: ProjectRef) =>
-    can('projects:write') && (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId)))
+  /** row-level rule mirrored from the server: members may only edit projects they own or that belong to one of their teams */
+  const canEditProject = (p: ProjectAccess) =>
+    me.permissions.includes('projects:write') &&
+    (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId)))
   return {
     me,
-    can,
-    /** owners/admins bypass row-level rules (and may (re)assign account owners) */
-    privileged,
-    /** members may only edit (and archive) customers they own */
-    canEditCustomer: (c: { ownerId: number | null }) => can('customers:write') && (privileged || c.ownerId === me.user.id),
-    /** members may only touch projects owned by them or one of their teams (includes creating tasks there) */
+    can: (p: Permission) => me.permissions.includes(p),
+    /** row-level rule mirrored from the server: members may only edit customers they own */
+    canEditCustomer: (c: { ownerId: number | null }) =>
+      me.permissions.includes('customers:write') && (privileged || c.ownerId === me.user.id),
     canEditProject,
-    /** a task's assignee may move/edit/delete it even in a foreign project (but not reassign it) */
-    canEditTask: (t: { assigneeId: number | null }, p: ProjectRef) =>
-      can('projects:write') && (t.assigneeId === me.user.id || canEditProject(p)),
+    /** tasks: project editors, plus the task's assignee (server: tasks.canWrite) */
+    canEditTask: (p: ProjectAccess | undefined, t: { assigneeId: number | null }) =>
+      (!!p && canEditProject(p)) || (me.permissions.includes('projects:write') && t.assigneeId === me.user.id),
+    privileged,
   }
 }
 
-export function useCan() {
-  return permissionsFor(useMe())
+/**
+ * Forget the current session on this client: close the per-user change feed,
+ * drop every server-backed collection, cached query (metrics, totals) and the
+ * cached identity, so route guards ask the server again. Used on sign-in, sign-out
+ * and when any request comes back 401.
+ */
+export async function clearSession(qc: QueryClient) {
+  stopLiveSync()
+  await resetServerCollections()
+  qc.removeQueries({ queryKey: ['auth'] })
 }
 
-export function useLogin({ redirect }: { redirect?: string } = {}) {
+/** Only same-origin, absolute paths are followed after sign-in. */
+export const safeRedirect = (r: unknown) =>
+  typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') && !r.startsWith('/login') ? r : '/'
+
+export function useLogin(opts: { redirect?: string } = {}) {
   const qc = useQueryClient()
   const router = useRouter()
   return useMutation({
-    mutationKey: ['auth', 'login'],
     mutationFn: (creds: { email: string; password: string }) => api.post<Me & { token: string }>('/auth/login', creds),
     onSuccess: async ({ token: _token, ...me }) => {
-      qc.clear() // never leak cached data between users
+      // never leak another user's rows: drop every collection, then sync fresh as the new user
+      await clearSession(qc)
       qc.setQueryData(meQuery().queryKey, me)
-      await router.navigate({ href: safeRedirect(redirect), replace: true })
+      // the app route's guard opens the change feed for this user
+      const redirectTo = opts.redirect ?? (router.state.location.search as { redirect?: unknown }).redirect
+      await router.navigate({ href: safeRedirect(redirectTo), replace: true })
     },
   })
 }
@@ -80,7 +89,7 @@ export function useLogout() {
   return useMutation({
     mutationFn: () => api.post('/auth/logout', {}),
     onSettled: async () => {
-      qc.clear()
+      await clearSession(qc)
       await router.navigate({ to: '/login' })
     },
   })

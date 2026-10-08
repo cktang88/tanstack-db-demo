@@ -1,48 +1,41 @@
-import { useSuspenseQueries } from '@tanstack/react-query'
-import { useDeferredValue, useState } from 'react'
-import { PLANS, type Plan } from '../../shared/domain'
+import { useQuery } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import type { Plan } from '../../shared/domain'
 import { DonutChart, HBarChart, RevenueChart, SignupsChart } from '../components/charts'
-import { Card, cx, PageHeader, Segmented } from '../components/ui'
+import { Card, PageHeader, Segmented } from '../components/ui'
+import { breakdownQuery } from '../db/aggregates'
 import { money, moneyCompact, number, percent, titleCase } from '../lib/format'
-import { breakdownQuery, overviewQuery, revenueQuery, signupsQuery } from '../lib/queries'
+import { useRevenue, useSignups } from './overview'
 
 export function AnalyticsPage() {
   const [mode, setMode] = useState<'stacked' | 'grouped'>('stacked')
   const [metric, setMetric] = useState<'mrr' | 'customers'>('mrr')
-  const [plan, setPlan] = useState<Plan | 'all'>('all')
-  // Switching plans suspends on a new query key; deferring it keeps the current
-  // charts on screen (dimmed) until the filtered breakdowns arrive.
-  const shownPlan = useDeferredValue(plan)
-  const planFilter = shownPlan === 'all' ? undefined : shownPlan
-  // Six server-side aggregation endpoints, fetched in parallel.
-  const [{ data: byCountry }, { data: byStatus }, { data: byPlan }, { data: signups }, { data: revenue }, { data: kpi }] =
-    useSuspenseQueries({
-      queries: [
-        breakdownQuery('country', planFilter),
-        breakdownQuery('status', planFilter),
-        breakdownQuery('plan'),
-        signupsQuery(12),
-        revenueQuery(18),
-        overviewQuery(),
-      ],
-    })
+  const [plan, setPlan] = useState<string>('all')
+  const planFilter = plan === 'all' ? undefined : (plan as Plan)
+
+  // GROUP BY over 250k customers: server aggregates (/metrics/breakdown), re-sliced by plan on the
+  // server; the previous slice stays on screen while the next one loads.
+  const { data: countries = [] } = useQuery(breakdownQuery('country', planFilter))
+  const byCountry = useMemo(() => [...countries].sort((a, b) => b[metric] - a[metric]), [countries, metric])
+  const { data: statuses = [] } = useQuery(breakdownQuery('status', planFilter))
+  const byStatus = statuses.map((d) => ({ key: d.key, value: d.customers }))
+  const { data: plans = [] } = useQuery(breakdownQuery('plan'))
+  const byPlan = useMemo(() => [...plans].sort((a, b) => b.mrr - a.mrr), [plans])
+  const signups = useSignups(12)
+  const revenue = useRevenue(18)
+  const totalMrr = byPlan.reduce((s, p) => s + p.mrr, 0)
   const fmt = metric === 'mrr' ? moneyCompact : number
 
   return (
     <>
       <PageHeader
         title="Analytics"
-        description="Breakdowns computed by SQL aggregations on the server."
+        description="Breakdowns over every customer are server aggregates; the change feed keeps them fresh."
         actions={
           <>
-            <select
-              className="input w-36"
-              aria-label="Plan filter"
-              value={plan}
-              onChange={(e) => setPlan(e.target.value as Plan | 'all')}
-            >
+            <select className="input w-36" aria-label="Plan filter" value={plan} onChange={(e) => setPlan(e.target.value)}>
               <option value="all">All plans</option>
-              {PLANS.map((p) => (
+              {['free', 'starter', 'pro', 'enterprise'].map((p) => (
                 <option key={p} value={p}>
                   {titleCase(p)}
                 </option>
@@ -60,12 +53,12 @@ export function AnalyticsPage() {
           </>
         }
       />
-      <div className={cx('mb-6 grid gap-6 transition-opacity lg:grid-cols-2', plan !== shownPlan && 'opacity-60')}>
+      <div className="mb-6 grid gap-6 lg:grid-cols-2">
         <Card title={`${metric === 'mrr' ? 'MRR' : 'Customers'} by country`}>
           <HBarChart label="By country" data={byCountry.map((d) => ({ key: d.key, value: d[metric] }))} format={fmt} />
         </Card>
         <Card title="Customers by status">
-          <DonutChart label="Status" data={byStatus.map((d) => ({ key: d.key, value: d.customers }))} height={300} />
+          <DonutChart label="Status" data={byStatus} height={300} />
         </Card>
       </div>
       <Card
@@ -105,7 +98,7 @@ export function AnalyticsPage() {
                   <td className="td">{titleCase(p.key)}</td>
                   <td className="td text-right tabular-nums">{number(p.customers)}</td>
                   <td className="td text-right tabular-nums">{money(p.mrr)}</td>
-                  <td className="td text-right tabular-nums">{percent(kpi.mrr ? p.mrr / kpi.mrr : 0)}</td>
+                  <td className="td text-right tabular-nums">{percent(totalMrr ? p.mrr / totalMrr : 0)}</td>
                 </tr>
               ))}
             </tbody>

@@ -1,59 +1,80 @@
-import { field } from '../lib/format'
-import { useMutationState, useQuery, useSuspenseQuery, type Mutation } from '@tanstack/react-query'
+import {
+  eq,
+  sum,
+  count,
+  throttleStrategy,
+  useLiveQuery,
+  useLiveSuspenseQuery,
+  usePacedMutations,
+  and,
+  inArray,
+} from '@tanstack/react-db'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Fragment, Suspense, useActionState, useMemo, useState } from 'react'
-import { PAYMENT_METHODS, type Customer, type Invoice } from '../../shared/domain'
-import { DailyChart } from '../components/charts'
+import { Fragment, useMemo, useState, type FormEvent } from 'react'
 import { CustomerForm } from '../components/CustomerForm'
-import { Avatar, Badge, Card, Dialog, Empty, PageHeader, Skeleton, Stat } from '../components/ui'
+import { Avatar, Badge, Card, Dialog, Empty, PageHeader, Stat } from '../components/ui'
+import {
+  addAddon,
+  applyBillingPatch,
+  cancelSubscription,
+  deleteCustomers,
+  markInvoicePaid,
+  recordPayment,
+  updateCustomers,
+} from '../db/actions'
 import { useCan } from '../lib/auth'
-import { date, money, number, relative } from '../lib/format'
+import { DailyChart } from '../components/charts'
+import { PAYMENT_METHODS } from '../../shared/domain'
 import {
-  useAddContact,
-  useAddSubscription,
-  useDeleteContact,
-  useDeleteCustomers,
-  useMarkInvoicePaidWithEvent,
-  useRecordPaymentOptimistic,
-  useSeatsEditor,
-  useTagCustomer,
-  useUntagCustomer,
-  useUpdateCustomer,
-  useUpdateSubscription,
-  useVoidInvoice,
-} from '../lib/mutations'
-import { pins, useIsPinned } from '../lib/pins'
-import {
-  customerActivityQuery,
-  customerBalanceQuery,
-  customerContactsQuery,
-  customerHealthQuery,
-  customerInvoicesQuery,
-  customerQuery,
-  customerSubscriptionsQuery,
-  customerTagsQuery,
-  customerUsageQuery,
-  invoiceLineItemsQuery,
-  invoicePaymentsQuery,
-  productsQuery,
-  tagsQuery,
-  usersQuery,
-} from '../lib/queries'
+  contactsCollection,
+  customerHealthCollection,
+  customerTagsCollection,
+  customersCollection,
+  eventsCollection,
+  invoicesCollection,
+  lineItemsCollection,
+  newId,
+  paymentsCollection,
+  productsCollection,
+  subscriptionsCollection,
+  tagsCollection,
+  usageDailyCollection,
+  type InvoiceRow,
+  persist,
+  pinsCollection,
+  usersCollection,
+} from '../db/collections'
+import { WINDOW } from '../db/hooks'
+import { date, field, money, number, relative } from '../lib/format'
+import { toast } from '../lib/toast'
 import { customerDetailRoute } from '../router'
-
-const HEALTH_TONE = { healthy: 'green', at_risk: 'red', dormant: 'amber', churned: 'zinc' } as const
 
 export function CustomerDetailPage() {
   const { customerId } = customerDetailRoute.useParams()
-  const { data: customer } = useSuspenseQuery(customerQuery(customerId))
-  const { data: users = [] } = useQuery(usersQuery())
-  const { data: health } = useQuery(customerHealthQuery(customerId))
-  const { can, canEditCustomer, privileged } = useCan()
-  const owner = users.find((u) => u.id === customer.ownerId)
-  const update = useUpdateCustomer(customerId)
-  const del = useDeleteCustomers()
+  // Suspense-friendly live query; a join gives us the owner in the same row.
+  const { data } = useLiveSuspenseQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ c: customersCollection })
+        .leftJoin({ u: usersCollection }, ({ c, u }) => eq(c.ownerId, u.id))
+        .where(({ c }) => eq(c.id, customerId))
+        .findOne(),
+  })
   const navigate = useNavigate()
   const [editing, setEditing] = useState(false)
+  const { can, canEditCustomer, privileged } = useCan()
+  if (!data)
+    return (
+      <div className="card mx-auto mt-10 max-w-md p-6 text-center" role="alert">
+        <div className="text-lg font-semibold">Not found</div>
+        <p className="mt-2 text-sm text-zinc-500">Customer {customerId} does not exist (or was just deleted).</p>
+        <Link to="/customers" className="btn-secondary mt-4">
+          Back to customers
+        </Link>
+      </div>
+    )
+  const { c: customer, u: owner } = data
   const editable = canEditCustomer(customer)
 
   return (
@@ -75,12 +96,14 @@ export function CustomerDetailPage() {
             <button className="btn-secondary" onClick={() => setEditing(true)} disabled={!editable}>
               Edit
             </button>
-            {can('customers:delete') && editable && (
+            {can('customers:delete') && (
               <button
                 className="btn-danger"
                 onClick={() => {
                   if (!confirm(`Archive ${customer.company}? Subscriptions will be canceled; billing history is kept.`)) return
-                  del.mutate([customer.id])
+                  deleteCustomers([customer.id])
+                    .when('settled')
+                    .catch((e: Error) => toast.error('Archive failed — restored', e.message))
                   void navigate({ to: '/customers' })
                 }}
               >
@@ -94,19 +117,15 @@ export function CustomerDetailPage() {
         <Stat
           label="Plan"
           value={<Badge value={customer.plan} />}
-          hint={editable ? <SeatsSlider key={customer.id} id={customer.id} seats={customer.seats} /> : `${customer.seats} seats`}
-        />
-        <Stat
-          label="Status"
-          value={
-            <span className="flex items-center gap-2">
-              <Badge value={customer.status} />
-              {health && <Badge value={health.health} tone={HEALTH_TONE[health.health]} />}
-            </span>
+          hint={
+            editable ? (
+              <SeatsSlider id={customer.id} seats={customer.seats} pending={!!customer.$hasPendingWrites} />
+            ) : (
+              `${customer.seats} seats`
+            )
           }
-          hint={health ? `${number(health.apiCalls30d)} API calls / 30d` : `since ${date(customer.createdAt)}`}
-          testId="customer-health"
         />
+        <HealthStat customerId={customer.id} status={customer.status} />
         <Stat label="MRR" value={money(customer.mrr)} hint="Σ active subscriptions" testId="customer-mrr" />
         <BalanceStat customerId={customer.id} />
         <Stat
@@ -123,25 +142,27 @@ export function CustomerDetailPage() {
         />
       </div>
       <div className="mb-6 grid gap-6 lg:grid-cols-3">
-        <Subscriptions customer={customer} />
-        <Contacts customerId={customerId} editable={editable} />
-        <Tags customerId={customerId} editable={editable} />
+        <Subscriptions customerId={customer.id} churned={customer.status === 'churned'} seats={customer.seats} />
+        <Contacts customerId={customer.id} editable={editable} />
+        <Tags customerId={customer.id} editable={editable} />
       </div>
-      <Card className="mb-6" title="API usage (daily rollup)">
-        <Usage customerId={customerId} />
+      <Card className="mb-6" title="API usage (daily rollup, on-demand)">
+        <Usage customerId={customer.id} />
       </Card>
       <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
-        <Suspense fallback={<Skeleton className="h-64" />}>
-          <CustomerInvoices customerId={customerId} />
-        </Suspense>
+        <CustomerInvoices customerId={customerId} />
         <CustomerActivity customerId={customerId} />
       </div>
       <Dialog open={editing} onClose={() => setEditing(false)} title="Edit customer">
         <CustomerForm
-          initial={customer}
           canAssignOwner={privileged}
+          initial={customer}
           submitLabel="Save changes"
-          onSubmit={(patch) => update.mutateAsync({ id: customer.id, patch })}
+          onSubmit={async (patch) => {
+            updateCustomers([customer.id], patch)
+              .when('settled')
+              .catch((e: Error) => toast.error('Update failed — changes rolled back', e.message))
+          }}
           onDone={() => setEditing(false)}
         />
       </Dialog>
@@ -150,31 +171,36 @@ export function CustomerDetailPage() {
 }
 
 /**
- * Throttled autosave: every tick moves seats and MRR in every cached copy of
- * the customer instantly, while the server receives at most one write per 500ms.
+ * Paced mutation: drag the slider and every tick updates MRR everywhere
+ * (this page, KPIs, charts, tables) instantly, while the server receives at
+ * most one write per 500ms.
  */
-function SeatsSlider({ id, seats }: { id: number; seats: number }) {
-  const { setSeats, draft, saved, pending } = useSeatsEditor(id)
-  const value = draft ?? seats
+function SeatsSlider({ id, seats, pending }: { id: number; seats: number; pending: boolean }) {
+  const setSeats = usePacedMutations<number>({
+    // MRR moves by the base plan's sold price (see predictMrr); the server's value is read back on save
+    onMutate: (n) => customersCollection.update(id, (d) => applyBillingPatch(d, { seats: n })),
+    mutationFn: async ({ transaction }) => persist(transaction.mutations),
+    strategy: throttleStrategy({ wait: 500, trailing: true }),
+  })
   return (
     <label className="flex items-center gap-2">
       <input
         type="range"
         min={1}
         // never clamp a large account to the slider's range
-        max={Math.max(300, value * 2)}
-        value={value}
+        max={Math.max(300, seats * 2)}
+        value={seats}
         aria-label="Seats"
-        onChange={(e) => setSeats(Number(e.target.value), seats)}
+        onChange={(e) => setSeats(Number(e.target.value))}
         className="w-28 accent-brand-600"
       />
       <span className="tabular-nums" data-testid="seats-value">
-        {value} seats
+        {seats} seats
       </span>
-      {/* the last value the server confirmed, while newer ones are still being saved */}
+      {/* `base` = the authoritative synced row, without optimistic writes layered on top */}
       {pending && (
         <span className="text-xs text-amber-600" data-testid="seats-saved">
-          saved: {saved ?? '—'}
+          saved: {customersCollection.base.get(id)?.seats ?? '—'}
         </span>
       )}
     </label>
@@ -182,220 +208,55 @@ function SeatsSlider({ id, seats }: { id: number; seats: number }) {
 }
 
 function PinButton({ customerId }: { customerId: number }) {
-  const pinned = useIsPinned(customerId)
+  const { data: pin } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: pinsCollection })
+        .where(({ p }) => eq(p.id, customerId))
+        .findOne(),
+  })
   return (
-    <button className="btn-secondary" aria-pressed={pinned} onClick={() => pins.toggle(customerId)}>
-      {pinned ? '★ Pinned' : '☆ Pin'}
+    <button
+      className="btn-secondary"
+      aria-pressed={!!pin}
+      onClick={() =>
+        pin ? pinsCollection.delete(customerId) : pinsCollection.insert({ id: customerId, pinnedAt: new Date().toISOString() })
+      }
+    >
+      {pin ? '★ Pinned' : '☆ Pin'}
     </button>
   )
 }
 
-/**
- * Balance = open invoices net of partial payments (the server's
- * customer_balances rollup); overdue and paid-lifetime are gross invoice sums.
- */
-function BalanceStat({ customerId }: { customerId: number }) {
-  const { data: balance } = useQuery(customerBalanceQuery(customerId))
-  const { data: invoices = [] } = useQuery(customerInvoicesQuery(customerId))
-  const sumOf = (status: Invoice['status']) => invoices.filter((i) => i.status === status).reduce((s, i) => s + i.amount, 0)
-  return (
-    <Stat
-      label="Balance"
-      testId="customer-balance"
-      value={<span data-testid="balance-value">{money(balance?.outstanding ?? 0)}</span>}
-      hint={`open invoices net of partial payments · ${money(sumOf('overdue'))} overdue (gross) · ${money(sumOf('paid'))} paid lifetime`}
-    />
-  )
-}
-
-function Subscriptions({ customer }: { customer: Customer }) {
-  const { data: subs = [] } = useQuery(customerSubscriptionsQuery(customer.id))
-  const { data: products = [] } = useQuery(productsQuery())
-  const { can } = useCan()
-  const add = useAddSubscription()
-  const change = useUpdateSubscription()
-  const byId = new Map(products.map((p) => [p.id, p]))
-  const live = subs.filter((s) => s.status !== 'canceled')
-  const addons = products.filter((p) => p.kind === 'addon' && p.active)
-  return (
-    <Card title={`Subscriptions (${live.length} live)`}>
-      <ul className="space-y-2 text-sm" data-testid="subscriptions">
-        {subs.map((s) => (
-          <li key={s.id} className={`flex items-center justify-between gap-2 ${s.status === 'canceled' ? 'opacity-50' : ''}`}>
-            <span className="min-w-0 truncate">
-              {byId.get(s.productId)?.name ?? `#${s.productId}`} <span className="text-xs text-zinc-500">× {s.quantity}</span>
-            </span>
-            <span className="flex shrink-0 items-center gap-2">
-              <span className="text-xs tabular-nums">{money(s.quantity * s.unitPrice)}</span>
-              <Badge value={s.status} />
-              {can('billing:write') && s.status !== 'canceled' && byId.get(s.productId)?.kind === 'addon' && (
-                <button
-                  className="text-xs text-zinc-400 hover:text-red-600"
-                  aria-label={`Cancel subscription #${s.id}`}
-                  onClick={() => change.mutate({ id: s.id, patch: { status: 'canceled' } })}
-                >
-                  ✕
-                </button>
-              )}
-            </span>
-          </li>
-        ))}
-      </ul>
-      {can('billing:write') && customer.status !== 'churned' && (
-        <form
-          className="mt-3 flex gap-2"
-          action={(f) =>
-            add.mutate({ customerId: customer.id, productId: Number(f.get('productId')), quantity: Number(f.get('quantity')) })
-          }
-        >
-          <select name="productId" className="input" aria-label="Add-on">
-            {addons.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-          <input
-            name="quantity"
-            type="number"
-            min={1}
-            defaultValue={customer.seats}
-            className="input w-20"
-            aria-label="Quantity"
-          />
-          <button className="btn-secondary">Add</button>
-        </form>
-      )}
-    </Card>
-  )
-}
-
-function Contacts({ customerId, editable }: { customerId: number; editable: boolean }) {
-  const { data: contacts = [] } = useQuery(customerContactsQuery(customerId))
-  const add = useAddContact()
-  const remove = useDeleteContact()
-  // keep what was typed when the server rejects it (React resets the form after the action)
-  type ContactDraft = { name: string; email: string; title: string }
-  const blank: ContactDraft = { name: '', email: '', title: '' }
-  const [{ error, draft }, action] = useActionState(
-    async (_: { error: string | null; draft: ContactDraft }, f: FormData) => {
-      const draft = { name: field(f, 'name').trim(), email: field(f, 'email').trim(), title: field(f, 'title').trim() }
-      try {
-        await add.mutateAsync({ customerId, ...draft, title: draft.title || 'Contact', isPrimary: false })
-        return { error: null, draft: blank }
-      } catch (e) {
-        return { error: (e as Error).message, draft }
-      }
-    },
-    { error: null, draft: blank },
-  )
-  return (
-    <Card title={`Contacts (${contacts.length})`}>
-      <ul className="space-y-2 text-sm" data-testid="contacts">
-        {contacts.map((c) => (
-          <li key={c.id} className="flex items-center justify-between gap-2">
-            <span className="min-w-0">
-              <span className="font-medium">{c.name}</span> {c.isPrimary && <Badge value="primary" tone="violet" />}
-              <div className="truncate text-xs text-zinc-500">
-                {c.title} · {c.email}
-              </div>
-            </span>
-            {editable && !c.isPrimary && (
-              <button
-                className="text-xs text-zinc-400 hover:text-red-600"
-                aria-label={`Remove ${c.name}`}
-                onClick={() => remove.mutate(c.id)}
-              >
-                ✕
-              </button>
-            )}
-          </li>
-        ))}
-      </ul>
-      {editable && (
-        <form action={action} className="mt-3 grid grid-cols-2 gap-2">
-          <input name="name" className="input" placeholder="Name" aria-label="Contact name" defaultValue={draft.name} />
-          <input name="email" className="input" placeholder="Email" aria-label="Contact email" defaultValue={draft.email} />
-          <input name="title" className="input" placeholder="Title" aria-label="Contact title" defaultValue={draft.title} />
-          <button className="btn-secondary">Add contact</button>
-          {error && <p className="col-span-2 text-xs text-red-600">{error}</p>}
-        </form>
-      )}
-    </Card>
-  )
-}
-
-function Tags({ customerId, editable }: { customerId: number; editable: boolean }) {
-  const { data: tags = [] } = useQuery(tagsQuery())
-  const { data: links = [] } = useQuery(customerTagsQuery(customerId))
-  const tag = useTagCustomer()
-  const untag = useUntagCustomer()
-  const applied = new Set(links.map((l) => l.tagId))
-  return (
-    <Card title="Tags">
-      <div className="flex flex-wrap gap-2" data-testid="tags">
-        {tags.map((t) => {
-          const on = applied.has(t.id)
-          return (
-            <button
-              key={t.id}
-              disabled={!editable}
-              aria-pressed={on}
-              onClick={() => (on ? untag.mutate(`${customerId}:${t.id}`) : tag.mutate({ customerId, tagId: t.id }))}
-              className={`rounded-full border px-2 py-0.5 text-xs ${on ? 'text-white' : 'text-zinc-500'} disabled:cursor-default`}
-              style={on ? { background: t.color, borderColor: t.color } : { borderColor: t.color }}
-            >
-              {t.name}
-            </button>
-          )
-        })}
-      </div>
-    </Card>
-  )
-}
-
-function Usage({ customerId }: { customerId: number }) {
-  const { data = [], isPending } = useQuery(customerUsageQuery(customerId))
-  const series = useMemo(() => data.map((d) => ({ day: d.day, value: d.quantity })), [data])
-  return (
-    <div data-testid="usage" data-state={isPending ? 'loading' : 'ready'}>
-      {isPending ? (
-        <Skeleton className="h-48" />
-      ) : series.length ? (
-        <DailyChart data={series} label="API calls per day" />
-      ) : (
-        <Empty>No metered usage.</Empty>
-      )}
-    </div>
-  )
-}
-
-/** Ids of this page's invoices with a write in flight (mark paid, void). */
-function usePendingInvoiceIds() {
-  const ids = useMutationState({
-    filters: { mutationKey: ['invoices'], status: 'pending' },
-    select: (m: Mutation<unknown, Error, unknown>) => {
-      const v = m.state.variables
-      return typeof v === 'number' ? v : v && typeof v === 'object' && 'id' in v ? Number(v.id) : null
-    },
-  })
-  return new Set(ids)
-}
-
 function CustomerInvoices({ customerId }: { customerId: number }) {
-  const { data: invoices } = useSuspenseQuery(customerInvoicesQuery(customerId))
-  const [open, setOpen] = useState<number | null>(null)
-  const markPaid = useMarkInvoicePaidWithEvent()
-  const saving = usePendingInvoiceIds()
-  const { can } = useCan()
-  const outstanding = invoices.filter((i) => i.status === 'open' || i.status === 'overdue').reduce((s, i) => s + i.amount, 0)
+  // On-demand: pushed down as customerId[eq]=… (a customer has a few dozen invoices at most);
+  // the open-invoice total below is covered by the same load (subset dedupe), no extra request.
+  const { data: invoices } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ i: invoicesCollection })
+        .where(({ i }) => eq(i.customerId, customerId))
+        .orderBy(({ i }) => i.issuedAt, 'desc'),
+  })
+  const { data: totals } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ i: invoicesCollection })
+        .where(({ i }) => and(eq(i.customerId, customerId), inArray(i.status, ['open', 'overdue'])))
+        .select(({ i }) => ({ outstanding: sum(i.amount), n: count(i.id) }))
+        .findOne(),
+  })
   const lifetime = invoices.filter((i) => i.status === 'paid').reduce((s, i) => s + i.amount, 0)
+  const [open, setOpen] = useState<number | null>(null)
+  const canPay = useCan().can('billing:write')
   return (
     <Card
       title={`Invoices (${invoices.length})`}
       actions={
         <span className="text-xs text-zinc-500" data-testid="invoice-totals">
-          Lifetime {money(lifetime)} · Open invoices {money(outstanding)} (before payments)
+          Lifetime {money(lifetime)} · Open invoices {money(totals?.outstanding ?? 0)} (before payments)
         </span>
       }
     >
@@ -425,14 +286,18 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
                   <td className="td">{date(i.issuedAt)}</td>
                   <td className="td">
                     <Badge value={i.status} />
-                    {saving.has(i.id) && <span className="ml-2 text-xs text-amber-600">saving…</span>}
+                    {i.$hasPendingWrites && <span className="ml-2 text-xs text-amber-600">saving…</span>}
                   </td>
                   <td className="td text-right tabular-nums">{money(i.amount)}</td>
                   <td className="td text-right" onClick={(e) => e.stopPropagation()}>
-                    {can('billing:write') && (i.status === 'open' || i.status === 'overdue') && (
+                    {canPay && (i.status === 'open' || i.status === 'overdue') && (
                       <button
                         className="btn-ghost px-2 py-0.5 text-xs"
-                        onClick={() => markPaid.mutate({ id: i.id, number: i.number, customerId })}
+                        onClick={() =>
+                          markInvoicePaid({ invoiceId: i.id, number: i.number, customerId })
+                            .when('settled')
+                            .catch((e: Error) => toast.error('Could not mark invoice paid — rolled back', e.message))
+                        }
                       >
                         Mark paid
                       </button>
@@ -455,15 +320,369 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
   )
 }
 
-function InvoiceDetail({ invoice }: { invoice: Invoice }) {
-  const { data: lines = [] } = useQuery(invoiceLineItemsQuery(invoice.id))
-  const { data: payments = [] } = useQuery(invoicePaymentsQuery(invoice.id))
-  const pay = useRecordPaymentOptimistic()
-  const voidIt = useVoidInvoice()
+function CustomerActivity({ customerId }: { customerId: number }) {
+  // On-demand: pushes `customerId[eq]=…&sort=-id&limit=20` to the API.
+  const { data, isLoading } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ e: eventsCollection })
+        .where(({ e }) => eq(e.customerId, customerId))
+        // ids are monotonic, so a single unique sort key keeps pushed-down windows exact & cheap
+        .orderBy(({ e }) => e.id, 'desc')
+        .limit(20),
+  })
+  return (
+    <Card title="Recent activity">
+      {isLoading ? (
+        <div className="h-40 animate-pulse rounded-md bg-zinc-100 dark:bg-zinc-800" />
+      ) : data.length === 0 ? (
+        <Empty>No activity.</Empty>
+      ) : (
+        <ul className="space-y-3 text-sm" data-testid="customer-activity">
+          {data.map((e) => (
+            <li key={e.id} className={e.$hasPendingWrites ? 'opacity-60' : undefined}>
+              <div>{e.message}</div>
+              <div className="text-xs text-zinc-400">{relative(e.createdAt)}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  )
+}
+
+/** Status + health: health comes from a SQL view (on-demand, one row pushed down by customerId). */
+function HealthStat({ customerId, status }: { customerId: number; status: string }) {
+  const { data: health } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ h: customerHealthCollection })
+        .where(({ h }) => eq(h.customerId, customerId))
+        .findOne(),
+  })
+  const tone = { healthy: 'green', at_risk: 'red', dormant: 'amber', churned: 'zinc' } as const
+  return (
+    <Stat
+      label="Status"
+      testId="customer-health"
+      value={
+        <span className="flex items-center gap-2">
+          <Badge value={status} />
+          {health && <Badge value={health.health} tone={tone[health.health]} />}
+        </span>
+      }
+      hint={health ? `${number(health.apiCalls30d)} API calls / 30d` : '—'}
+    />
+  )
+}
+
+/**
+ * Replaces the server's customer_balances rollup with two live aggregates over
+ * bounded data: this customer's invoices and its slice of the payment ledger
+ * (both on-demand, pushed down as customerId[eq]=…). An optimistic payment
+ * moves the balance at once.
+ */
+function BalanceStat({ customerId }: { customerId: number }) {
+  const { data: invoiced } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ i: invoicesCollection })
+        .where(({ i }) => eq(i.customerId, customerId))
+        .groupBy(({ i }) => i.status)
+        .select(({ i }) => ({ status: i.status, amount: sum(i.amount) })),
+  })
+  const { data: partial } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ p: paymentsCollection })
+        .where(({ p }) => eq(p.customerId, customerId))
+        // compound join condition (db 0.12): same invoice AND same customer
+        .innerJoin({ i: invoicesCollection }, ({ p, i }) => and(eq(p.invoiceId, i.id), eq(p.customerId, i.customerId)))
+        // also bounds the invoices side to this customer, whichever side the join drives from
+        .where(({ i }) => and(eq(i.customerId, customerId), inArray(i.status, ['open', 'overdue'])))
+        .select(({ p }) => ({ paid: sum(p.amount) }))
+        .findOne(),
+  })
+  const by = (s: string) => invoiced.find((r) => r.status === s)?.amount ?? 0
+  return (
+    <Stat
+      label="Balance"
+      testId="customer-balance"
+      value={<span data-testid="balance-value">{money(by('open') + by('overdue') - (partial?.paid ?? 0))}</span>}
+      hint={`open invoices net of partial payments · ${money(by('overdue'))} overdue (gross) · ${money(by('paid'))} paid lifetime`}
+    />
+  )
+}
+
+function Subscriptions({ customerId, churned, seats }: { customerId: number; churned: boolean; seats: number }) {
   const { can } = useCan()
+  const { data: subs } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ s: subscriptionsCollection })
+        .innerJoin({ p: productsCollection }, ({ s, p }) => eq(s.productId, p.id))
+        .where(({ s }) => eq(s.customerId, customerId))
+        .orderBy(({ s }) => s.id)
+        .select(({ s, p }) => ({ ...s, productName: p.name, kind: p.kind })),
+  })
+  const { data: addons } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: productsCollection })
+        .where(({ p }) => and(eq(p.kind, 'addon'), eq(p.active, true)))
+        .orderBy(({ p }) => p.id),
+  })
+  const live = subs.filter((s) => s.status !== 'canceled')
+  const fail = (e: Error) => toast.error('Subscription change failed — rolled back', e.message)
+  return (
+    <Card title={`Subscriptions (${live.length} live)`}>
+      <ul className="space-y-2 text-sm" data-testid="subscriptions">
+        {subs.map((s) => (
+          <li
+            key={s.id}
+            className={`flex items-center justify-between gap-2 ${s.status === 'canceled' ? 'opacity-50' : ''} ${s.$hasPendingWrites ? 'animate-pulse' : ''}`}
+          >
+            <span className="min-w-0 truncate">
+              {s.productName} <span className="text-xs text-zinc-500">× {s.quantity}</span>
+            </span>
+            <span className="flex shrink-0 items-center gap-2">
+              <span className="text-xs tabular-nums">{money(s.quantity * s.unitPrice)}</span>
+              <Badge value={s.status} />
+              {can('billing:write') && s.status !== 'canceled' && s.kind === 'addon' && (
+                <button
+                  className="text-xs text-zinc-400 hover:text-red-600"
+                  aria-label={`Cancel subscription #${s.id}`}
+                  onClick={() => cancelSubscription(s).when('settled').catch(fail)}
+                >
+                  ✕
+                </button>
+              )}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {can('billing:write') && !churned && (
+        <form
+          className="mt-3 flex gap-2"
+          action={(f) => {
+            const product = addons.find((p) => p.id === Number(field(f, 'productId')))
+            if (product)
+              addAddon(customerId, product, Number(field(f, 'quantity')))
+                .when('settled')
+                .then(() => toast.success('Add-on added'), fail)
+          }}
+        >
+          <select name="productId" className="input" aria-label="Add-on">
+            {addons.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <input name="quantity" type="number" min={1} defaultValue={seats} className="input w-20" aria-label="Quantity" />
+          <button className="btn-secondary">Add</button>
+        </form>
+      )}
+    </Card>
+  )
+}
+
+function Contacts({ customerId, editable }: { customerId: number; editable: boolean }) {
+  const { data: contacts } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ c: contactsCollection })
+        .where(({ c }) => eq(c.customerId, customerId))
+        .orderBy(({ c }) => c.isPrimary, { direction: 'desc', nulls: 'last' })
+        .orderBy(({ c }) => c.name),
+  })
+  // controlled + onSubmit (a form action would reset the inputs) so a rejected entry stays editable
+  const empty = { name: '', email: '', title: '' }
+  const [draft, setDraft] = useState(empty)
+  const [error, setError] = useState<string | null>(null)
+  const set = (k: keyof typeof empty) => (e: { target: { value: string } }) => setDraft((d) => ({ ...d, [k]: e.target.value }))
+  const add = (e: FormEvent) => {
+    e.preventDefault()
+    const name = draft.name.trim()
+    const email = draft.email.trim()
+    if (name.length < 2 || !email.includes('@')) return setError('Name and a valid email are required')
+    contactsCollection
+      .insert({
+        id: newId(),
+        customerId,
+        name,
+        email,
+        title: draft.title.trim() || 'Contact',
+        isPrimary: false,
+        createdAt: new Date().toISOString(),
+      })
+      .when('settled')
+      .catch((e: Error) => toast.error('Could not add contact — removed', e.message))
+    setDraft(empty)
+    setError(null)
+  }
+  return (
+    <Card title={`Contacts (${contacts.length})`}>
+      <ul className="space-y-2 text-sm" data-testid="contacts">
+        {contacts.map((c) => (
+          <li key={c.id} className={`flex items-center justify-between gap-2 ${c.$hasPendingWrites ? 'opacity-60' : ''}`}>
+            <span className="min-w-0">
+              <span className="font-medium">{c.name}</span> {c.isPrimary && <Badge value="primary" tone="violet" />}
+              <div className="truncate text-xs text-zinc-500">
+                {c.title} · {c.email}
+              </div>
+            </span>
+            {editable && !c.isPrimary && (
+              <button
+                className="text-xs text-zinc-400 hover:text-red-600"
+                aria-label={`Remove ${c.name}`}
+                onClick={() =>
+                  contactsCollection
+                    .delete(c.id)
+                    .when('settled')
+                    .catch((e: Error) => toast.error('Could not remove contact', e.message))
+                }
+              >
+                ✕
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {editable && (
+        <form onSubmit={add} className="mt-3 grid grid-cols-2 gap-2">
+          <input
+            name="name"
+            className="input"
+            placeholder="Name"
+            aria-label="Contact name"
+            value={draft.name}
+            onChange={set('name')}
+          />
+          <input
+            name="email"
+            className="input"
+            placeholder="Email"
+            aria-label="Contact email"
+            value={draft.email}
+            onChange={set('email')}
+          />
+          <input
+            name="title"
+            className="input"
+            placeholder="Title"
+            aria-label="Contact title"
+            value={draft.title}
+            onChange={set('title')}
+          />
+          <button className="btn-secondary">Add contact</button>
+          {error && <p className="col-span-2 text-xs text-red-600">{error}</p>}
+        </form>
+      )}
+    </Card>
+  )
+}
+
+function Tags({ customerId, editable }: { customerId: number; editable: boolean }) {
+  // many-to-many: tags LEFT JOIN customer_tags (for this customer) -> "applied" flag per tag
+  const { data: tags } = useLiveQuery({
+    ...WINDOW,
+    query: (q) => {
+      const mine = q.from({ ct: customerTagsCollection }).where(({ ct }) => eq(ct.customerId, customerId))
+      return q
+        .from({ t: tagsCollection })
+        .leftJoin({ ct: mine }, ({ t, ct }) => eq(t.id, ct.tagId))
+        .orderBy(({ t }) => t.name)
+        .select(({ t, ct }) => ({ ...t, linkId: ct?.id }))
+    },
+  })
+  const toggle = (t: { id: number; linkId?: string }) => {
+    const tx = t.linkId
+      ? customerTagsCollection.delete(t.linkId)
+      : customerTagsCollection.insert({
+          id: `${customerId}:${t.id}`,
+          customerId,
+          tagId: t.id,
+          taggedAt: new Date().toISOString(),
+        })
+    tx.when('settled').catch((e: Error) => toast.error('Could not change tag — rolled back', e.message))
+  }
+  return (
+    <Card title="Tags">
+      <div className="flex flex-wrap gap-2" data-testid="tags">
+        {tags.map((t) => {
+          const on = !!t.linkId
+          return (
+            <button
+              key={t.id}
+              disabled={!editable}
+              aria-pressed={on}
+              onClick={() => toggle(t)}
+              className={`rounded-full border px-2 py-0.5 text-xs ${on ? 'text-white' : 'text-zinc-500'} disabled:cursor-default`}
+              style={on ? { background: t.color, borderColor: t.color } : { borderColor: t.color }}
+            >
+              {t.name}
+            </button>
+          )
+        })}
+      </div>
+    </Card>
+  )
+}
+
+function Usage({ customerId }: { customerId: number }) {
+  // on-demand: pushes customerId[eq]=…&metric[eq]=api_calls&sort=day
+  const { data, isLoading } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ u: usageDailyCollection })
+        .where(({ u }) => and(eq(u.customerId, customerId), eq(u.metric, 'api_calls')))
+        .orderBy(({ u }) => u.day),
+  })
+  const series = useMemo(() => data.map((d) => ({ day: d.day, value: d.quantity })), [data])
+  return (
+    <div data-testid="usage" data-state={isLoading ? 'loading' : 'ready'}>
+      {isLoading ? (
+        <div className="h-48 animate-pulse rounded-md bg-zinc-100 dark:bg-zinc-800" />
+      ) : series.length ? (
+        <DailyChart data={series} label="API calls per day" />
+      ) : (
+        <Empty>No metered usage.</Empty>
+      )}
+    </div>
+  )
+}
+
+function InvoiceDetail({ invoice }: { invoice: InvoiceRow }) {
+  const { me, can } = useCan()
+  // both on-demand: immutable line items and the append-only ledger, fetched for this invoice only
+  const { data: lines } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ l: lineItemsCollection })
+        .where(({ l }) => eq(l.invoiceId, invoice.id))
+        .orderBy(({ l }) => l.id),
+  })
+  const { data: payments } = useLiveQuery({
+    ...WINDOW,
+    query: (q) =>
+      q
+        .from({ p: paymentsCollection })
+        .where(({ p }) => eq(p.invoiceId, invoice.id))
+        .orderBy(({ p }) => p.id),
+  })
   const paid = payments.reduce((s, p) => s + p.amount, 0)
   const remaining = invoice.amount - paid
   const open = invoice.status === 'open' || invoice.status === 'overdue'
+  const fail = (e: Error) => toast.error('Billing change failed — rolled back', e.message)
   return (
     <div className="grid gap-4 text-sm md:grid-cols-2" data-testid="invoice-detail">
       <div>
@@ -485,7 +704,7 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
         </div>
         <ul className="space-y-1" data-testid="invoice-payments">
           {payments.map((p) => (
-            <li key={p.id} className={`flex justify-between gap-2 ${p.id < 0 ? 'opacity-60' : ''}`}>
+            <li key={p.id} className={`flex justify-between gap-2 ${p.$hasPendingWrites ? 'opacity-60' : ''}`}>
               <span>
                 {date(p.receivedAt)} · <Badge value={p.method} tone="zinc" /> {/* the reference is generated by the server */}
                 <span className="font-mono text-xs">{p.reference || 'pending…'}</span>
@@ -498,15 +717,19 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
         {can('billing:write') && open && (
           <form
             className="mt-3 flex flex-wrap gap-2"
-            action={(f) =>
-              pay.mutate({
+            action={(f) => {
+              const amount = Math.round(Number(field(f, 'amount')) * 100) || remaining
+              recordPayment({
                 invoiceId: invoice.id,
                 customerId: invoice.customerId,
-                amount: Math.round(Number(field(f, 'amount')) * 100) || remaining,
-                overdue: invoice.status === 'overdue',
+                amount,
+                remaining,
                 method: field(f, 'method') as 'card',
+                userId: me.user.id,
               })
-            }
+                .when('settled')
+                .catch(fail)
+            }}
           >
             <input
               name="amount"
@@ -525,7 +748,16 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
             <button className="btn-secondary">Record payment</button>
             {/* the server refuses (409) to void an invoice that already has payments */}
             {payments.length === 0 && (
-              <button type="button" className="btn-ghost text-red-600" onClick={() => voidIt.mutate(invoice.id)}>
+              <button
+                type="button"
+                className="btn-ghost text-red-600"
+                onClick={() =>
+                  invoicesCollection
+                    .update(invoice.id, (d) => void (d.status = 'void'))
+                    .when('settled')
+                    .catch(fail)
+                }
+              >
                 Void
               </button>
             )}
@@ -533,28 +765,5 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
         )}
       </div>
     </div>
-  )
-}
-
-function CustomerActivity({ customerId }: { customerId: number }) {
-  const { data = [], isPending } = useQuery(customerActivityQuery(customerId))
-  return (
-    <Card title="Recent activity">
-      {isPending ? (
-        <Skeleton className="h-40" />
-      ) : data.length === 0 ? (
-        <Empty>No activity.</Empty>
-      ) : (
-        <ul className="space-y-3 text-sm" data-testid="customer-activity">
-          {data.map((e) => (
-            // a negative id is the provisional entry of a write still in flight
-            <li key={e.id} className={e.id < 0 ? 'opacity-60' : undefined}>
-              <div>{e.message}</div>
-              <div className="text-xs text-zinc-400">{relative(e.createdAt)}</div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </Card>
   )
 }

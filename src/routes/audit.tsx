@@ -1,17 +1,19 @@
+import { and, eq, useLiveQuery } from '@tanstack/react-db'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
 import { useMemo } from 'react'
-import { AUDIT_ACTIONS, type AuditEntry, type User } from '../../shared/domain'
+import { AUDIT_ACTIONS } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { date, relative } from '../lib/format'
-import { resourcePage, usersQuery } from '../lib/queries'
+import { auditCollection, usersCollection } from '../db/collections'
+import { usePageAnchor, usePagedWindow, WINDOW } from '../db/hooks'
+import { listTotalQuery } from '../db/aggregates'
+import { MAX_ROWS } from '../db/pushdown'
 import type { AuditParams } from '../lib/search'
 import { auditRoute } from '../router'
 
-const col = createColumnHelper<ServerFeatures, AuditEntry>()
-const EMPTY: AuditEntry[] = []
 const ENTITIES = [
   'customers',
   'subscriptions',
@@ -57,64 +59,87 @@ function Changes({ json }: { json: string }) {
   )
 }
 
+function useAuditRows(search: AuditParams) {
+  // On-demand: filters + window pushed down (action[eq]/entity[eq]/actorId[eq], sort=-id, limit/offset);
+  // the actor join happens locally against the eager users collection.
+  const anchor = usePageAnchor((search.page - 1) * search.pageSize, search.pageSize)
+  const rows = useLiveQuery({
+    ...WINDOW,
+    query: (q) => {
+      const base = q.from({ a: auditCollection })
+      const conds = (a: any) =>
+        [
+          search.action ? eq(a.action, search.action) : undefined,
+          search.entity ? eq(a.entity, search.entity) : undefined,
+          search.actorId ? eq(a.actorId, search.actorId) : undefined,
+        ].filter((x) => x !== undefined)
+      const filtered =
+        search.action || search.entity || search.actorId
+          ? base.where(({ a }) => {
+              const c = conds(a)
+              return c.length === 1 ? c[0]! : and(c[0]!, c[1]!, ...c.slice(2))
+            })
+          : base
+      return filtered
+        .leftJoin({ u: usersCollection }, ({ a, u }) => eq(a.actorId, u.id))
+        .orderBy(({ a }) => a.id, 'desc')
+        .limit(search.pageSize)
+        .offset(anchor)
+        .select(({ a, u }) => ({ ...a, actorName: u?.name, actorColor: u?.avatarColor }))
+    },
+  })
+  return usePagedWindow(rows, (search.page - 1) * search.pageSize, search.pageSize).rows
+}
+
+type Row = ReturnType<typeof useAuditRows>[number]
+const col = createColumnHelper<ServerFeatures, Row>()
+const columns = col.columns([
+  col.accessor('at', {
+    header: 'When',
+    enableSorting: false,
+    cell: (i) => <span title={date(i.getValue())}>{relative(i.getValue())}</span>,
+  }),
+  col.accessor('actorName', {
+    header: 'Actor',
+    enableSorting: false,
+    cell: (i) =>
+      i.getValue() ? (
+        <span className="flex items-center gap-2">
+          <Avatar name={i.getValue()!} color={i.row.original.actorColor} size={20} /> {i.getValue()}
+        </span>
+      ) : (
+        'system'
+      ),
+  }),
+  col.accessor('action', {
+    header: 'Action',
+    enableSorting: false,
+    cell: (i) => <Badge value={i.getValue()} tone={i.getValue() === 'denied' ? 'red' : undefined} />,
+  }),
+  col.accessor('entity', {
+    header: 'Entity',
+    enableSorting: false,
+    cell: (i) => (
+      <span className="font-mono text-xs">
+        {i.getValue()}
+        {i.row.original.entityId ? `#${i.row.original.entityId}` : ''}
+      </span>
+    ),
+  }),
+  col.accessor('changes', { header: 'Changes', enableSorting: false, cell: (i) => <Changes json={i.getValue()} /> }),
+])
+
 export function AuditPage() {
   const search = auditRoute.useSearch()
   const navigate = useNavigate({ from: '/audit' })
-  const { data: users = [] } = useQuery(usersQuery())
-  const byId = useMemo(() => new Map<number, User>(users.map((u) => [u.id, u])), [users])
-  const query = useQuery(
-    resourcePage<AuditEntry>('audit-log', {
-      page: search.page,
-      pageSize: search.pageSize,
-      sort: '-id',
-      action: search.action,
-      entity: search.entity,
-      actorId: search.actorId,
-    }),
-  )
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const rows = useAuditRows(search)
+  // the pager's total: a server count (the log itself is only ever loaded a window at a time)
+  const total =
+    useQuery(listTotalQuery('audit-log', { action: search.action, entity: search.entity, actorId: search.actorId })).data
+      ?.total ?? 0
   const set = (patch: Partial<AuditParams>) =>
     navigate({ search: (p) => ({ ...p, ...patch, page: patch.page ?? 1 }), replace: true })
-  const columns = useMemo(
-    () =>
-      col.columns([
-        col.accessor('at', {
-          header: 'When',
-          enableSorting: false,
-          cell: (i) => <span title={date(i.getValue())}>{relative(i.getValue())}</span>,
-        }),
-        col.accessor('actorId', {
-          header: 'Actor',
-          enableSorting: false,
-          cell: (i) => {
-            const u = i.getValue() ? byId.get(i.getValue()!) : undefined
-            return u ? (
-              <span className="flex items-center gap-2">
-                <Avatar name={u.name} color={u.avatarColor} size={20} /> {u.name}
-              </span>
-            ) : (
-              'system'
-            )
-          },
-        }),
-        col.accessor('action', {
-          header: 'Action',
-          enableSorting: false,
-          cell: (i) => <Badge value={i.getValue()} tone={i.getValue() === 'denied' ? 'red' : undefined} />,
-        }),
-        col.accessor('entity', {
-          header: 'Entity',
-          enableSorting: false,
-          cell: (i) => (
-            <span className="font-mono text-xs">
-              {i.getValue()}
-              {i.row.original.entityId ? `#${i.row.original.entityId}` : ''}
-            </span>
-          ),
-        }),
-        col.accessor('changes', { header: 'Changes', enableSorting: false, cell: (i) => <Changes json={i.getValue()} /> }),
-      ]),
-    [byId],
-  )
   return (
     <>
       <PageHeader
@@ -124,10 +149,9 @@ export function AuditPage() {
       <DataTable
         testId="audit-table"
         columns={columns}
-        data={query.data?.data ?? EMPTY}
-        rowCount={query.data?.total ?? 0}
-        isFetching={query.isFetching}
-        isPlaceholder={query.isPlaceholderData}
+        data={rows}
+        rowCount={total}
+        maxRows={MAX_ROWS}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => set({ page: p.pageIndex + 1, pageSize: p.pageSize })}
         sorting={[]}

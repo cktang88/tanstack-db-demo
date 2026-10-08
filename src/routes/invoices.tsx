@@ -1,137 +1,166 @@
-import { noop, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query'
+import { and, eq, gte, ilike, inArray, lte, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
-import { useEffect, useMemo } from 'react'
-import { INVOICE_STATUSES, type Customer, type Invoice } from '../../shared/domain'
+import { INVOICE_STATUSES } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Badge, ChipFilter, PageHeader, Stat } from '../components/ui'
-import { idsOf } from '../lib/alerts'
+import { markInvoicePaid } from '../db/actions'
+import { listTotalQuery } from '../db/aggregates'
+import { INVOICE_SORTS, invoicesCollection, type InvoiceSort } from '../db/collections'
+import { usePageAnchor, usePagedWindow, WINDOW } from '../db/hooks'
+import { MAX_ROWS, searchPattern } from '../db/pushdown'
 import { date, money, number } from '../lib/format'
-import { useMarkInvoicePaid } from '../lib/mutations'
-import { customersByIdsQuery, distinctIds, invoicesListQuery, type InvoiceListParams } from '../lib/queries'
-import { formatSort, parseSort } from '../lib/search'
-import { invoicesRoute } from '../router'
-import { useCan } from '../lib/auth'
 import { useDebouncedParam } from '../lib/hooks'
+import { formatSort, parseSort, type InvoiceListParams } from '../lib/search'
+import { useCan } from '../lib/auth'
+import { toast } from '../lib/toast'
+import { invoicesRoute } from '../router'
 
-const col = createColumnHelper<ServerFeatures, Invoice>()
-const EMPTY: Invoice[] = []
-const NO_CUSTOMERS = new Map<number, Customer>()
+const endOfDay = (d: string) => `${d}T23:59:59.999Z`
+const invoiceFilters = (s: InvoiceListParams) => (i: any) =>
+  [
+    s.status ? inArray(i.status, s.status) : undefined,
+    s.customerId ? eq(i.customerId, s.customerId) : undefined,
+    s.issuedFrom ? gte(i.issuedAt, s.issuedFrom) : undefined,
+    s.issuedTo ? lte(i.issuedAt, endOfDay(s.issuedTo)) : undefined,
+    // invoice number or customer company, like the server's ?q= (see searchText in collections.ts)
+    s.q ? ilike(i.searchText, searchPattern(s.q)) : undefined,
+  ].filter((p) => p !== undefined)
+const allOf = (parts: any[]) => (parts.length === 1 ? parts[0] : and(parts[0], parts[1], ...parts.slice(2)))
+const hasFilters = (s: InvoiceListParams) => !!(s.status || s.customerId || s.issuedFrom || s.issuedTo || s.q)
+
+/** The same filters in the REST grammar, for the server totals. */
+const listParams = (s: InvoiceListParams) => ({
+  q: s.q,
+  status: s.status,
+  customerId: s.customerId,
+  'issuedAt[gte]': s.issuedFrom,
+  'issuedAt[lte]': s.issuedTo && endOfDay(s.issuedTo),
+})
+
+const isSortable = (id: string): id is InvoiceSort => Object.hasOwn(INVOICE_SORTS, id)
+
+function useInvoiceRows(s: InvoiceListParams) {
+  const [sort] = parseSort(s.sort)
+  const field: InvoiceSort = sort && isSortable(sort.id) ? sort.id : 'issuedAt'
+  const direction = sort?.desc === false ? 'asc' : 'desc'
+  // one on-demand window; the customer's company comes with each invoice (customerCompany)
+  const anchor = usePageAnchor((s.page - 1) * s.pageSize, s.pageSize)
+  const page = useLiveQuery({
+    ...WINDOW,
+    query: (q) => {
+      const base = q.from({ i: invoicesCollection })
+      return (hasFilters(s) ? base.where(({ i }) => allOf(invoiceFilters(s)(i))) : base)
+        .orderBy(({ i }) => i.order[field], direction)
+        .limit(s.pageSize)
+        .offset(anchor)
+    },
+  })
+  // count and amount of every match: a server aggregate
+  const totals = useQuery(listTotalQuery('invoices', listParams(s), 'amount'))
+  const { rows, isPlaceholder } = usePagedWindow(page, (s.page - 1) * s.pageSize, s.pageSize)
+  return {
+    rows,
+    isPlaceholder,
+    isFetching: totals.isFetching || page.isLoading,
+    total: totals.data?.total ?? 0,
+    amount: totals.data?.sums.amount ?? 0,
+  }
+}
+
+type Row = ReturnType<typeof useInvoiceRows>['rows'][number]
+const col = createColumnHelper<ServerFeatures, Row>()
+const columns = col.columns([
+  col.accessor('number', { header: 'Invoice', cell: (i) => <span className="font-mono text-xs">{i.getValue()}</span> }),
+  col.accessor('customerCompany', {
+    id: 'company',
+    header: 'Customer',
+    cell: (i) => (
+      <Link to="/customers/$customerId" params={{ customerId: i.row.original.customerId }} className="hover:text-brand-600">
+        {i.getValue()}
+      </Link>
+    ),
+  }),
+  col.accessor('status', {
+    header: 'Status',
+    cell: (i) => (
+      <span className="flex items-center gap-2">
+        <Badge value={i.getValue()} />
+        {i.row.original.$hasPendingWrites && <span className="text-xs text-amber-600">saving…</span>}
+      </span>
+    ),
+  }),
+  col.accessor('issuedAt', { header: 'Issued', cell: (i) => date(i.getValue()) }),
+  col.accessor('dueAt', { header: 'Due', cell: (i) => date(i.getValue()) }),
+  col.accessor('paidAt', { header: 'Paid', cell: (i) => date(i.getValue()) }),
+  col.accessor('amount', { header: 'Amount', cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span> }),
+  col.display({
+    id: 'actions',
+    header: '',
+    cell: ({ row }) => <MarkPaid invoice={row.original} />,
+  }),
+])
+
+function MarkPaid({ invoice }: { invoice: Row }) {
+  const canPay = useCan().can('billing:write')
+  if (!canPay || (invoice.status !== 'open' && invoice.status !== 'overdue')) return null
+  return (
+    <button
+      className="btn-ghost px-2 py-0.5 text-xs"
+      onClick={() =>
+        markInvoicePaid({ invoiceId: invoice.id, number: invoice.number, customerId: invoice.customerId })
+          .when('settled')
+          .catch((e: Error) => toast.error('Could not mark invoice paid — rolled back', e.message))
+      }
+    >
+      Mark paid
+    </button>
+  )
+}
 
 export function InvoicesPage() {
   const search = invoicesRoute.useSearch()
   const navigate = useNavigate({ from: '/invoices' })
-  const qc = useQueryClient()
-  const query = useQuery(invoicesListQuery(search))
-  const markPaid = useMarkInvoicePaid()
-  const canPay = useCan().can('billing:write')
-  const rows = query.data?.data ?? EMPTY
-
-  // invoices with a write of ours in flight (optimistic, not yet confirmed by the server)
-  const pendingVars = useMutationState({
-    filters: { mutationKey: ['invoices'], status: 'pending' },
-    select: (m) => m.state.variables,
-  })
-  const pending = useMemo(() => new Set(pendingVars.flatMap(idsOf)), [pendingVars])
-
-  // The invoice API only returns customerId: fetch the page's customers in one
-  // batched request (`?id=1,2,3`) and join them client-side.
-  const customerIds = useMemo(() => distinctIds(rows.map((r) => r.customerId)), [rows])
-  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(customerIds))
-
+  const { rows, total, amount, isPlaceholder, isFetching } = useInvoiceRows(search)
   const setSearch = (patch: Partial<InvoiceListParams>, resetPage = true) =>
     navigate({ search: (prev) => ({ ...prev, ...patch, ...(resetPage ? { page: 1 } : {}) }), replace: true })
 
-  const pageCount = query.data?.pageCount ?? 1
-  useEffect(() => {
-    if (search.page < pageCount) void qc.query(invoicesListQuery({ ...search, page: search.page + 1 })).catch(noop)
-  }, [qc, search, pageCount])
-
-  // Past the end (e.g. a stale link, or paid invoices leaving a filter): go to the last page.
-  const lastPage = query.data && !query.isPlaceholderData ? Math.max(1, query.data.pageCount) : undefined
-  useEffect(() => {
-    if (lastPage !== undefined && search.page > lastPage)
-      void navigate({ search: (prev) => ({ ...prev, page: lastPage }), replace: true })
-  }, [navigate, search.page, lastPage])
-
-  const [q, setQ] = useDebouncedParam(search.q, (q) => setSearch({ q }))
-
-  const columns = useMemo(
-    () =>
-      col.columns([
-        col.accessor('number', { header: 'Invoice', cell: (i) => <span className="font-mono text-xs">{i.getValue()}</span> }),
-        // sorted by the customer's company on the server (a virtual sort key)
-        col.accessor('customerId', {
-          id: 'customer',
-          header: 'Customer',
-          cell: (i) => {
-            const c = customers.get(i.getValue())
-            return (
-              <Link to="/customers/$customerId" params={{ customerId: i.getValue() }} className="hover:text-brand-600">
-                {c?.company ?? <span className="inline-block h-3 w-24 animate-pulse rounded bg-zinc-200 dark:bg-zinc-800" />}
-              </Link>
-            )
-          },
-        }),
-        col.accessor('status', {
-          header: 'Status',
-          cell: (i) => (
-            <span className="flex items-center gap-2">
-              <Badge value={i.getValue()} />
-              {pending.has(i.row.original.id) && <span className="text-xs text-amber-600">saving…</span>}
-            </span>
-          ),
-        }),
-        col.accessor('issuedAt', { header: 'Issued', cell: (i) => date(i.getValue()) }),
-        col.accessor('dueAt', { header: 'Due', cell: (i) => date(i.getValue()) }),
-        col.accessor('paidAt', { header: 'Paid', cell: (i) => date(i.getValue()) }),
-        col.accessor('amount', { header: 'Amount', cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span> }),
-        col.display({
-          id: 'actions',
-          header: '',
-          cell: ({ row }) =>
-            canPay && (row.original.status === 'open' || row.original.status === 'overdue') ? (
-              <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => markPaid.mutate(row.original.id)}>
-                Mark paid
-              </button>
-            ) : null,
-        }),
-      ]),
-    [customers, markPaid, canPay, pending],
-  )
-
   return (
     <>
-      <PageHeader title="Invoices" description="Billing history across all accounts." />
-      <div className="mb-4 grid gap-4 sm:grid-cols-2">
-        <Stat label="Matching invoices" value={number(query.data?.total ?? 0)} testId="invoice-count" />
+      <PageHeader
+        title="Invoices"
+        description="An on-demand window of invoices: filters, search and sort are pushed down to the API; totals are a server aggregate."
+      />
+      <div className="mb-4 grid gap-4 sm:grid-cols-3">
+        <Stat label="Matching invoices" value={number(total)} testId="invoice-count" />
         <Stat
           label="Total of all matches"
-          value={money(query.data?.sums.amount ?? 0)}
-          hint="Aggregate over every matching row"
+          value={money(amount)}
+          hint="Server total over every matching row"
           testId="invoice-total"
+        />
+        <Stat
+          label="Rows held locally"
+          value={number(rows.length)}
+          hint="Only this window — the company comes with each invoice"
         />
       </div>
       <DataTable
         testId="invoices-table"
         columns={columns}
         data={rows}
-        rowCount={query.data?.total ?? 0}
-        isFetching={query.isFetching}
-        isPlaceholder={query.isPlaceholderData}
+        rowCount={total}
+        maxRows={MAX_ROWS}
+        isPlaceholder={isPlaceholder}
+        isFetching={isFetching}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
         onSortingChange={(s) => setSearch({ sort: formatSort(s) })}
         toolbar={
           <div className="flex flex-wrap items-center gap-3">
-            <input
-              className="input w-56"
-              placeholder="Invoice # or company"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              aria-label="Search invoices"
-            />
+            <SearchBox value={search.q} onChange={(q) => setSearch({ q })} />
             <ChipFilter
               label="Status"
               options={INVOICE_STATUSES}
@@ -160,5 +189,19 @@ export function InvoicesPage() {
         }
       />
     </>
+  )
+}
+
+/** Search pushes `?q=` down to the server: wait for a pause in typing (250ms) first. */
+function SearchBox({ value, onChange }: { value?: string; onChange: (q?: string) => void }) {
+  const [text, setText] = useDebouncedParam(value, onChange)
+  return (
+    <input
+      className="input w-56"
+      placeholder="Invoice # or company"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      aria-label="Search invoices"
+    />
   )
 }

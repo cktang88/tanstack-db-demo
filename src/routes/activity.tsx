@@ -1,10 +1,12 @@
-import { useQuery, useSuspenseInfiniteQuery } from '@tanstack/react-query'
+import { useLiveInfiniteQuery } from '@tanstack/react-db'
 import { Link } from '@tanstack/react-router'
-import { useEffect, useEffectEvent, useMemo, useRef, useState, useTransition } from 'react'
-import type { User } from '../../shared/domain'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { Avatar, Badge, Card, PageHeader, Segmented, Spinner } from '../components/ui'
-import { date, localToday, relative } from '../lib/format'
-import { activityFeedQuery, usersQuery } from '../lib/queries'
+import { eventsByCategory, eventsCollection, type EventCategory } from '../db/collections'
+import { useUsersById } from '../db/hooks'
+import { date, relative } from '../lib/format'
+
+const PAGE_SIZE = 30
 
 const TYPES = [
   { value: '', label: 'All' },
@@ -15,54 +17,49 @@ const TYPES = [
 
 export function ActivityPage() {
   const [type, setType] = useState<string>('')
-  const [isPending, startTransition] = useTransition()
   return (
     <>
       <PageHeader
         title="Activity"
-        description="Infinite, cursor-paginated audit log (useSuspenseInfiniteQuery + IntersectionObserver)."
-        actions={
-          <>
-            {isPending && <Spinner />}
-            <Segmented label="Event type" value={type} options={TYPES} onChange={(v) => startTransition(() => setType(v))} />
-          </>
-        }
+        description="On-demand collection: each window's filter/order/limit/offset is pushed to the API; new events stream in over SSE."
+        actions={<Segmented label="Event type" value={type} options={TYPES} onChange={setType} />}
       />
-      <Feed type={type || undefined} />
+      <Feed type={type} />
     </>
   )
 }
 
-function Feed({ type }: { type?: string }) {
-  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useSuspenseInfiniteQuery({
-    ...activityFeedQuery(type),
-    select: (d) => d.pages.flatMap((p) => p.data),
-  })
-  const { data: users = [] } = useQuery(usersQuery())
-  const byId = useMemo(() => new Map<number, User>(users.map((u) => [u.id, u])), [users])
+function Feed({ type }: { type: string }) {
+  // Infinite window over an on-demand collection; every page is pushed down:
+  //   GET /api/events?category[eq]=invoice&sort=-id&limit=31   (then &offset=…)
+  // The category filter is a *scoped collection* (see eventsByCategory) rather than a `where`.
+  const source = type ? eventsByCategory[type as EventCategory] : eventsCollection
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isLoading } = useLiveInfiniteQuery(
+    (q) =>
+      q
+        .from({ e: source })
+        // ids are monotonic: one unique sort key -> exact windows and tiny tie-group requests
+        .orderBy(({ e }) => e.id, 'desc'),
+    { pageSize: PAGE_SIZE, queryKey: ['activity-feed', type] },
+  )
+  const users = useUsersById()
 
   const sentinel = useRef<HTMLDivElement>(null)
-  // useEffectEvent: read the latest flags without re-subscribing the observer
   const onVisible = useEffectEvent(() => {
     if (hasNextPage && !isFetchingNextPage) void fetchNextPage()
   })
-  // An observer only reports transitions, so if the sentinel is still on screen
-  // after a page lands (short pages, tall window) nothing would fire again.
-  // Re-observing after every load delivers a fresh initial entry.
-  const loaded = data.length
   useEffect(() => {
     const el = sentinel.current
-    if (!el || isFetchingNextPage) return
+    if (!el) return
     const io = new IntersectionObserver((entries) => entries[0]?.isIntersecting && onVisible(), { rootMargin: '400px' })
     io.observe(el)
     return () => io.disconnect()
-  }, [loaded, isFetchingNextPage])
+  }, [])
 
-  // group by the user's local calendar day
   const groups = useMemo(() => {
     const m = new Map<string, typeof data>()
     for (const e of data) {
-      const d = localToday(new Date(e.createdAt))
+      const d = e.createdAt.slice(0, 10)
       m.set(d, [...(m.get(d) ?? []), e])
     }
     return [...m]
@@ -70,13 +67,18 @@ function Feed({ type }: { type?: string }) {
 
   return (
     <Card>
+      {isLoading && (
+        <div className="flex justify-center py-10">
+          <Spinner />
+        </div>
+      )}
       <ol className="space-y-6" data-testid="activity-feed">
         {groups.map(([day, events]) => (
           <li key={day}>
             <div className="mb-2 text-xs font-semibold text-zinc-500 uppercase">{date(day)}</div>
             <ul className="divide-y divide-zinc-100 dark:divide-zinc-800">
               {events.map((e) => {
-                const actor = e.actorId ? byId.get(e.actorId) : undefined
+                const actor = e.actorId ? users.get(e.actorId) : undefined
                 return (
                   <li key={e.id} className="flex items-center gap-3 py-2" data-testid="activity-item">
                     {actor ? <Avatar name={actor.name} color={actor.avatarColor} size={24} /> : <span className="size-6" />}

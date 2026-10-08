@@ -1,30 +1,37 @@
-import { useMutationState, useQuery, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
-import { Activity, useOptimistic, useState, useTransition } from 'react'
-import { ROLES, type Role, type User } from '../../shared/domain'
-import { Avatar, Badge, Card, Empty, PageHeader, Segmented, Skeleton } from '../components/ui'
-import { date, titleCase } from '../lib/format'
-import { fetchOpenTaskIds, useReassignTasks, useUpdateUser, type Reassignment } from '../lib/mutations'
+import { caseWhen, count, eq, sum, toArray, useLiveQuery, type Transaction } from '@tanstack/react-db'
+import { Activity, useEffect, useState } from 'react'
+import { ROLES, type Role } from '../../shared/domain'
+import { Avatar, Badge, Card, Empty, PageHeader, Segmented } from '../components/ui'
+import { stageReassignment } from '../db/actions'
 import {
-  assigneeTasksQuery,
-  permissionsQuery,
-  rolePermissionsQuery,
-  rolesQuery,
-  teamMembersQuery,
-  teamsQuery,
-  usersQuery,
-  workloadQuery,
-} from '../lib/queries'
+  permissionsCollection,
+  rolePermissionsCollection,
+  rolesCollection,
+  tasksCollection,
+  teamMembersCollection,
+  teamsCollection,
+  usersCollection,
+} from '../db/collections'
 import { useCan } from '../lib/auth'
-import { useTeamMembership } from '../lib/mutations'
+import { date, titleCase } from '../lib/format'
 import { toast } from '../lib/toast'
+
+type Draft = { tx: Transaction; count: number }
 
 export function TeamPage() {
   const [tab, setTab] = useState<'members' | 'teams' | 'roles' | 'workload'>('members')
   const [selected, setSelected] = useState<number | null>(null)
   // The staged reassignment lives here, not in <Rebalance>: that panel sits in
-  // an <Activity> (hidden tabs keep their state). It is plain React state, never
-  // written to the query cache, so leaving the page simply drops the preview.
-  const [draft, setDraft] = useState<Reassignment | null>(null)
+  // an <Activity>, whose hidden mode runs effect cleanups. Leaving the page
+  // with a preview open rolls it back instead of leaving phantom assignments
+  // in the local store until reload.
+  const [draft, setDraft] = useState<Draft | null>(null)
+  useEffect(() => {
+    if (!draft) return
+    return () => {
+      if (draft.tx.state === 'pending') draft.tx.rollback()
+    }
+  }, [draft])
   return (
     <>
       <PageHeader
@@ -44,7 +51,6 @@ export function TeamPage() {
           />
         }
       />
-      {/* <Activity> keeps the hidden tab mounted (state + scroll preserved) at low priority */}
       <Activity mode={tab === 'members' ? 'visible' : 'hidden'}>
         <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
           <Members selected={selected} onSelect={setSelected} />
@@ -65,82 +71,73 @@ export function TeamPage() {
 }
 
 function Members({ selected, onSelect }: { selected: number | null; onSelect: (id: number) => void }) {
-  const { data: users } = useSuspenseQuery(usersQuery())
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const { can, me } = useCan()
+  const canManage = can('team:manage')
+  // only an owner can make someone an owner
+  const meOwner = me.user.role === 'owner'
   return (
     <Card title={`${users.length} members`}>
       <ul className="divide-y divide-zinc-100 dark:divide-zinc-800" data-testid="member-list">
         {users.map((u) => (
-          <MemberRow key={u.id} user={u} selected={selected === u.id} onSelect={() => onSelect(u.id)} />
+          <li
+            key={u.id}
+            className={`flex items-center gap-3 py-2 ${selected === u.id ? 'bg-brand-50/60 dark:bg-brand-500/10' : ''}`}
+            data-testid="member-row"
+          >
+            <Avatar name={u.name} color={u.avatarColor} />
+            <button className="min-w-0 flex-1 text-left" onClick={() => onSelect(u.id)}>
+              <div className="text-sm font-medium">
+                {u.name} {!u.active && <span className="text-xs text-zinc-400">(inactive)</span>}
+              </div>
+              <div className="truncate text-xs text-zinc-500">
+                {u.title} · {u.email}
+              </div>
+            </button>
+            <Badge value={u.role} />
+            {/* optimistic by default — no useOptimistic/onMutate/rollback code needed */}
+            <select
+              className="input w-28"
+              aria-label={`Role for ${u.name}`}
+              value={u.role}
+              // same rule as the server: nobody changes their own role, only an owner touches an owner
+              disabled={!canManage || u.id === me.user.id || (u.role === 'owner' && !meOwner)}
+              onChange={(e) =>
+                usersCollection
+                  .update(u.id, (d) => void (d.role = e.target.value as Role))
+                  .when('settled')
+                  .catch((err: Error) => toast.error('Could not update teammate — rolled back', err.message))
+              }
+            >
+              {ROLES.filter((r) => r !== 'owner' || meOwner || u.role === 'owner').map((r) => (
+                <option key={r} value={r}>
+                  {titleCase(r)}
+                </option>
+              ))}
+            </select>
+          </li>
         ))}
       </ul>
     </Card>
   )
 }
 
-function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean; onSelect: () => void }) {
-  const update = useUpdateUser(user.id)
-  const { can, me } = useCan()
-  // mirrors the server: no changing your own role, only the owner may touch (or grant) 'owner'
-  const isOwner = me.user.role === 'owner'
-  const locked = !can('team:manage') || user.id === me.user.id || (user.role === 'owner' && !isOwner)
-  // React 19 useOptimistic: the select shows the new role immediately during the transition
-  const [role, setOptimisticRole] = useOptimistic(user.role)
-  const [, startTransition] = useTransition()
-  return (
-    <li
-      className={`flex items-center gap-3 py-2 ${selected ? 'bg-brand-50/60 dark:bg-brand-500/10' : ''}`}
-      data-testid="member-row"
-    >
-      <Avatar name={user.name} color={user.avatarColor} />
-      <button className="min-w-0 flex-1 text-left" onClick={onSelect}>
-        <div className="text-sm font-medium">
-          {user.name} {!user.active && <span className="text-xs text-zinc-400">(inactive)</span>}
-        </div>
-        <div className="truncate text-xs text-zinc-500">
-          {user.title} · {user.email}
-        </div>
-      </button>
-      <Badge value={role} />
-      <select
-        className="input w-28"
-        aria-label={`Role for ${user.name}`}
-        value={role}
-        disabled={locked}
-        onChange={(e) => {
-          const next = e.target.value as Role
-          startTransition(async () => {
-            setOptimisticRole(next)
-            await update.mutateAsync({ id: user.id, patch: { role: next } }).catch(() => {})
-          })
-        }}
-      >
-        {ROLES.filter((r) => r !== 'owner' || isOwner || role === 'owner').map((r) => (
-          <option key={r} value={r}>
-            {titleCase(r)}
-          </option>
-        ))}
-      </select>
-    </li>
-  )
-}
-
 function MemberTasks({ userId }: { userId: number | null }) {
-  // dependent query: only runs once a member is selected
-  const { data, isPending } = useQuery({ ...assigneeTasksQuery(userId ?? 0), enabled: userId !== null })
-  if (userId === null)
-    return (
-      <Card title="Assigned tasks">
-        <Empty>Select a member to see their tasks.</Empty>
-      </Card>
-    )
+  // A disabled live query (returns undefined) until a member is selected.
+  const { data, isEnabled } = useLiveQuery({
+    query: (q) =>
+      userId === null
+        ? undefined
+        : q
+            .from({ t: tasksCollection })
+            .where(({ t }) => eq(t.assigneeId, userId))
+            .orderBy(({ t }) => t.dueDate, { direction: 'asc', nulls: 'last' })
+            .orderBy(({ t }) => t.id),
+  })
   return (
     <Card title="Assigned tasks">
-      {isPending ? (
-        <div className="space-y-2">
-          {Array.from({ length: 5 }, (_, i) => (
-            <Skeleton key={i} className="h-8" />
-          ))}
-        </div>
+      {!isEnabled ? (
+        <Empty>Select a member to see their tasks.</Empty>
       ) : data?.length ? (
         <ul className="space-y-2 text-sm" data-testid="member-tasks">
           {data.map((t) => (
@@ -160,26 +157,28 @@ function MemberTasks({ userId }: { userId: number | null }) {
   )
 }
 
-type WorkloadRow = { userId: number; name: string; open: number; done: number }
-
-/** Move `n` open tasks from one member to another in the server's numbers (a preview, nothing is written). */
-function overlay(rows: WorkloadRow[], r: Reassignment | null | undefined): WorkloadRow[] {
-  if (!r) return rows
-  const n = r.taskIds.length
-  return rows
-    .map((d) => (d.userId === r.fromId ? { ...d, open: d.open - n } : d.userId === r.toId ? { ...d, open: d.open + n } : d))
-    .sort((a, b) => b.open - a.open || a.name.localeCompare(b.name))
-}
-
-function Workload({ draft, setDraft }: { draft: Reassignment | null; setDraft: (d: Reassignment | null) => void }) {
-  const { data = [], dataUpdatedAt } = useQuery(workloadQuery())
-  // a save in flight keeps showing its numbers until workload data fetched after it lands
-  const saving = useMutationState({
-    filters: { mutationKey: ['tasks', 'reassign'], status: 'pending' },
-    select: (m) => ({ ...(m.state.variables as Reassignment), at: m.state.submittedAt }),
-  }).filter((r) => r.at >= dataUpdatedAt)
-  const rows = [draft, ...saving].reduce(overlay, data)
-  const max = Math.max(1, ...rows.map((d) => d.open + d.done))
+function Workload({ draft, setDraft }: { draft: Draft | null; setDraft: (d: Draft | null) => void }) {
+  // users ⨝ (tasks GROUP BY assignee) — the old app needed a dedicated /metrics/workload endpoint.
+  const { data } = useLiveQuery({
+    query: (q) => {
+      const perUser = q
+        .from({ t: tasksCollection })
+        .groupBy(({ t }) => t.assigneeId)
+        .select(({ t }) => ({
+          assigneeId: t.assigneeId,
+          open: sum(caseWhen(eq(t.status, 'done'), 0, 1)),
+          done: sum(caseWhen(eq(t.status, 'done'), 1, 0)),
+          total: count(t.id),
+        }))
+      return q
+        .from({ u: usersCollection })
+        .leftJoin({ w: perUser }, ({ u, w }) => eq(u.id, w.assigneeId))
+        .orderBy(({ w }) => w?.open, { direction: 'desc', nulls: 'last' })
+        .orderBy(({ u }) => u.name)
+        .select(({ u, w }) => ({ userId: u.id, name: u.name, open: w?.open, done: w?.done }))
+    },
+  })
+  const max = Math.max(1, ...data.map((d) => (d.open ?? 0) + (d.done ?? 0)))
   const { can, privileged } = useCan()
   // reassigning across every project needs owner/admin (members may only edit their teams' projects)
   const canRebalance = can('projects:write') && privileged
@@ -187,62 +186,64 @@ function Workload({ draft, setDraft }: { draft: Reassignment | null; setDraft: (
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <Card title="Open vs done tasks per member">
         <ul className="space-y-2" data-testid="workload">
-          {rows.map((d) => (
+          {data.map((d) => (
             <li key={d.userId} className="grid grid-cols-[160px_1fr_90px] items-center gap-3 text-sm" data-testid="workload-row">
               <span className="truncate">{d.name}</span>
               <div className="flex h-3 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
-                <div className="bg-amber-500 transition-all" style={{ width: `${(d.open / max) * 100}%` }} />
-                <div className="bg-emerald-500 transition-all" style={{ width: `${(d.done / max) * 100}%` }} />
+                <div className="bg-amber-500 transition-all" style={{ width: `${((d.open ?? 0) / max) * 100}%` }} />
+                <div className="bg-emerald-500 transition-all" style={{ width: `${((d.done ?? 0) / max) * 100}%` }} />
               </div>
               <span className="text-right text-xs text-zinc-500 tabular-nums" data-testid="workload-open">
-                {d.open} open · {d.done}
+                {d.open ?? 0} open · {d.done ?? 0}
               </span>
             </li>
           ))}
         </ul>
       </Card>
-      {canRebalance && <Rebalance users={rows} draft={draft} setDraft={setDraft} />}
+      {canRebalance && <Rebalance users={data} draft={draft} setDraft={setDraft} />}
     </div>
   )
 }
 
 /**
- * A staged draft: Preview fetches the member's open tasks and overlays the
- * move on the workload above without sending anything; Save writes it as one
- * atomic batch, Discard just forgets it.
+ * A manual transaction (autoCommit: false) used as a *draft*: the reassignment
+ * is previewed live in the workload chart above, then saved atomically or
+ * discarded with rollback().
  */
 function Rebalance({
   users,
   draft,
   setDraft,
 }: {
-  users: WorkloadRow[]
-  draft: Reassignment | null
-  setDraft: (d: Reassignment | null) => void
+  users: Array<{ userId: number; name: string; open?: number }>
+  draft: Draft | null
+  setDraft: (d: Draft | null) => void
 }) {
-  const qc = useQueryClient()
-  const reassign = useReassignTasks()
   const [from, setFrom] = useState<number | ''>('')
   const [to, setTo] = useState<number | ''>('')
-  const [loading, setLoading] = useState(false)
 
-  const preview = async () => {
+  const preview = () => {
     if (from === '' || to === '' || from === to) return
-    setLoading(true)
-    try {
-      const taskIds = await fetchOpenTaskIds(qc, from)
-      if (!taskIds.length) return void toast.info('Nothing to move', 'That member has no open tasks')
-      setDraft({ fromId: from, toId: to, taskIds })
-    } catch (e) {
-      toast.error('Could not load open tasks', (e as Error).message)
-    } finally {
-      setLoading(false)
+    const staged = stageReassignment(from, to)
+    if (!staged.count) {
+      staged.tx.rollback()
+      toast.info('Nothing to move', 'That member has no open tasks')
+      return
     }
+    setDraft(staged)
+  }
+  const discard = () => {
+    draft?.tx.rollback()
+    setDraft(null)
   }
   const save = () => {
     if (!draft) return
+    const { tx, count } = draft
     setDraft(null)
-    reassign.mutate(draft)
+    tx.commit().then(
+      () => toast.success(`Reassigned ${count} tasks`),
+      (e: Error) => toast.error('Reassignment failed — rolled back', e.message),
+    )
   }
 
   return (
@@ -260,7 +261,7 @@ function Rebalance({
             <option value="">Choose…</option>
             {users.map((u) => (
               <option key={u.userId} value={u.userId}>
-                {u.name} ({u.open} open)
+                {u.name} ({u.open ?? 0} open)
               </option>
             ))}
           </select>
@@ -288,23 +289,19 @@ function Rebalance({
             data-testid="rebalance-draft"
           >
             <p className="mb-2">
-              Previewing <b>{draft.taskIds.length}</b> reassigned tasks — nothing has been sent yet.
+              Previewing <b>{draft.count}</b> reassigned tasks — nothing has been sent yet.
             </p>
             <div className="flex gap-2">
               <button className="btn-primary" onClick={save}>
                 Save
               </button>
-              <button className="btn-secondary" onClick={() => setDraft(null)}>
+              <button className="btn-secondary" onClick={discard}>
                 Discard
               </button>
             </div>
           </div>
         ) : (
-          <button
-            className="btn-secondary"
-            disabled={from === '' || to === '' || from === to || loading}
-            onClick={() => void preview()}
-          >
+          <button className="btn-secondary" disabled={from === '' || to === '' || from === to} onClick={preview}>
             Preview
           </button>
         )}
@@ -314,74 +311,105 @@ function Rebalance({
 }
 
 function Teams() {
-  const { data: teams = [] } = useQuery(teamsQuery())
-  const { data: members = [] } = useQuery(teamMembersQuery())
-  const { data: users = [] } = useQuery(usersQuery())
-  const toggle = useTeamMembership()
   const canManage = useCan().can('team:manage')
-  const byId = new Map(users.map((u) => [u.id, u]))
+  // teams ⨝ lead, with each team's members as a nested array (includes + toArray):
+  // one live query instead of three requests stitched together with Maps.
+  const { data: teams } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ t: teamsCollection })
+        .leftJoin({ lead: usersCollection }, ({ t, lead }) => eq(t.leadId, lead.id))
+        .orderBy(({ t }) => t.name)
+        .select(({ t, lead }) => ({
+          ...t,
+          leadName: lead?.name,
+          members: toArray(
+            q
+              .from({ m: teamMembersCollection })
+              .innerJoin({ u: usersCollection }, ({ m, u }) => eq(m.userId, u.id))
+              .where(({ m }) => eq(m.teamId, t.id))
+              .orderBy(({ u }) => u.name)
+              .select(({ m, u }) => ({ id: m.id, userId: u.id, name: u.name, color: u.avatarColor })),
+          ),
+        })),
+  })
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const fail = (e: Error) => toast.error('Membership change failed — rolled back', e.message)
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3" data-testid="teams">
-      {teams.map((t) => {
-        const ids = members.filter((m) => m.teamId === t.id).map((m) => m.userId)
-        const lead = t.leadId ? byId.get(t.leadId) : undefined
-        return (
-          <Card key={t.id} title={`${t.name} (${ids.length})`}>
-            <p className="mb-3 text-xs text-zinc-500">
-              {t.description}
-              {lead && ` · lead: ${lead.name}`}
-            </p>
-            <ul className="flex flex-wrap gap-1.5">
-              {ids.map((id) => {
-                const u = byId.get(id)
-                return u ? (
-                  <li
-                    key={id}
-                    className="flex items-center gap-1 rounded-full bg-zinc-100 py-0.5 pr-2 pl-0.5 text-xs dark:bg-zinc-800"
-                  >
-                    <Avatar name={u.name} color={u.avatarColor} size={18} /> {u.name}
-                    {canManage && (
-                      <button
-                        aria-label={`Remove ${u.name} from ${t.name}`}
-                        className="text-zinc-400 hover:text-red-600"
-                        onClick={() => toggle.mutate({ teamId: t.id, userId: id, member: true })}
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </li>
-                ) : null
-              })}
-            </ul>
-            {canManage && (
-              <select
-                className="input mt-3"
-                aria-label={`Add member to ${t.name}`}
-                value=""
-                onChange={(e) => e.target.value && toggle.mutate({ teamId: t.id, userId: Number(e.target.value), member: false })}
+      {teams.map((t) => (
+        <Card key={t.id} title={`${t.name} (${t.members.length})`}>
+          <p className="mb-3 text-xs text-zinc-500">
+            {t.description}
+            {t.leadName && ` · lead: ${t.leadName}`}
+          </p>
+          <ul className="flex flex-wrap gap-1.5">
+            {t.members.map((m) => (
+              <li
+                key={m.id}
+                className="flex items-center gap-1 rounded-full bg-zinc-100 py-0.5 pr-2 pl-0.5 text-xs dark:bg-zinc-800"
               >
-                <option value="">+ Add member…</option>
-                {users
-                  .filter((u) => !ids.includes(u.id))
-                  .map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name}
-                    </option>
-                  ))}
-              </select>
-            )}
-          </Card>
-        )
-      })}
+                <Avatar name={m.name} color={m.color} size={18} /> {m.name}
+                {canManage && (
+                  <button
+                    aria-label={`Remove ${m.name} from ${t.name}`}
+                    className="text-zinc-400 hover:text-red-600"
+                    onClick={() => teamMembersCollection.delete(m.id).when('settled').catch(fail)}
+                  >
+                    ✕
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+          {canManage && (
+            <select
+              className="input mt-3"
+              aria-label={`Add member to ${t.name}`}
+              value=""
+              onChange={(e) => {
+                const userId = Number(e.target.value)
+                if (!userId) return
+                teamMembersCollection
+                  .insert({ id: `${t.id}:${userId}`, teamId: t.id, userId, joinedAt: new Date().toISOString() })
+                  .when('settled')
+                  .catch(fail)
+              }}
+            >
+              <option value="">+ Add member…</option>
+              {users
+                .filter((u) => !t.members.some((m) => m.userId === u.id))
+                .map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name}
+                  </option>
+                ))}
+            </select>
+          )}
+        </Card>
+      ))}
     </div>
   )
 }
 
 function RolesMatrix() {
-  const { data: roles = [] } = useQuery(rolesQuery())
-  const { data: perms = [] } = useQuery(permissionsQuery())
-  const { data: grants = [] } = useQuery(rolePermissionsQuery())
-  const granted = new Set(grants.map((g) => g.id))
+  const { data: roles } = useLiveQuery({ query: (q) => q.from({ r: rolesCollection }) })
+  // permissions with the granted role ids nested per row
+  const { data: perms } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: permissionsCollection })
+        .orderBy(({ p }) => p.id)
+        .select(({ p }) => ({
+          ...p,
+          roles: toArray(
+            q
+              .from({ g: rolePermissionsCollection })
+              .where(({ g }) => eq(g.permissionId, p.id))
+              .select(({ g }) => g.roleId),
+          ),
+        })),
+  })
   return (
     <Card title="Role → permission matrix (role_permissions)">
       <div className="overflow-x-auto">
@@ -405,7 +433,7 @@ function RolesMatrix() {
                 </td>
                 {roles.map((r) => (
                   <td key={r.id} className="td text-center">
-                    {granted.has(`${r.id}:${p.id}`) ? (
+                    {p.roles.includes(r.id) ? (
                       <span className="text-emerald-600">✓</span>
                     ) : (
                       <span className="text-zinc-300">—</span>

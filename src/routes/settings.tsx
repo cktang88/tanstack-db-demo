@@ -1,13 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useLiveQuery } from '@tanstack/react-db'
 import { useActionState } from 'react'
 import { Card, PageHeader, Segmented } from '../components/ui'
-import { api } from '../lib/api'
+import { applyChange } from '../db/live'
+import { usePrefs } from '../db/hooks'
+import { pinsCollection, sessionsCollection } from '../db/collections'
 import { useCan } from '../lib/auth'
 import { relative } from '../lib/format'
-import { useRevokeSession } from '../lib/mutations'
-import { pins } from '../lib/pins'
-import { sessionsQuery } from '../lib/queries'
-import { useSettings } from '../lib/settings'
+import { api } from '../lib/api'
 import { toast } from '../lib/toast'
 
 interface Chaos {
@@ -16,11 +16,14 @@ interface Chaos {
 }
 
 export function SettingsPage() {
-  const [settings, setSettings] = useSettings()
+  const [prefs, setPrefs] = usePrefs()
   const { can } = useCan()
   return (
     <>
-      <PageHeader title="Settings" description="Workspace preferences and developer tools." />
+      <PageHeader
+        title="Settings"
+        description="Preferences live in a localStorage collection — open two tabs and watch them sync."
+      />
       <div className="grid gap-6 lg:grid-cols-2">
         <Card title="Appearance">
           <div className="space-y-4">
@@ -28,21 +31,21 @@ export function SettingsPage() {
               <span className="text-sm">Theme</span>
               <Segmented
                 label="Theme"
-                value={settings.theme}
+                value={prefs.theme}
                 options={[
                   { value: 'light', label: 'Light' },
                   { value: 'dark', label: 'Dark' },
                 ]}
-                onChange={(theme) => setSettings({ theme })}
+                onChange={(theme) => setPrefs({ theme })}
               />
             </div>
             <label className="flex items-center justify-between text-sm">
               Wide layout
-              <input type="checkbox" checked={settings.compact} onChange={(e) => setSettings({ compact: e.target.checked })} />
+              <input type="checkbox" checked={prefs.compact} onChange={(e) => setPrefs({ compact: e.target.checked })} />
             </label>
             <label className="flex items-center justify-between text-sm">
               Clear pinned accounts
-              <button className="btn-secondary" onClick={() => pins.clear()}>
+              <button className="btn-secondary" onClick={() => pinsCollection.utils.clearStorage()}>
                 Clear
               </button>
             </label>
@@ -56,7 +59,8 @@ export function SettingsPage() {
   )
 }
 
-/** Simulated network conditions — lets you see optimistic updates + rollbacks in action. */
+// Non-entity server state (dev settings) stays on plain TanStack Query —
+// DB and Query coexist, so adoption can be incremental.
 function ChaosCard() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['dev', 'chaos'], queryFn: () => api.get<Chaos>('/dev/chaos') })
@@ -97,11 +101,10 @@ function ChaosCard() {
 }
 
 function ResetCard() {
-  const qc = useQueryClient()
   const reset = useMutation({
     mutationFn: () => api.post('/dev/reset', {}),
     onSuccess: async () => {
-      await qc.resetQueries()
+      await applyChange({ kind: 'reset' })
       toast.success('Database re-seeded')
     },
   })
@@ -116,8 +119,10 @@ function ResetCard() {
 }
 
 function SessionsCard() {
-  const { data: sessions = [] } = useQuery(sessionsQuery())
-  const revoke = useRevokeSession()
+  // the server scopes `sessions` to the caller (ownerField), so this is "my sessions"
+  const { data: sessions } = useLiveQuery({
+    query: (q) => q.from({ s: sessionsCollection }).orderBy(({ s }) => s.createdAt, 'desc'),
+  })
   return (
     <Card title="Your sessions">
       <ul className="space-y-2 text-sm" data-testid="sessions">
@@ -127,7 +132,15 @@ function SessionsCard() {
               {s.userAgent?.slice(0, 40) ?? 'unknown client'}{' '}
               <span className="text-xs text-zinc-500">· signed in {relative(s.createdAt)}</span>
             </span>
-            <button className="btn-ghost text-xs" onClick={() => revoke.mutate(s.id)}>
+            <button
+              className="btn-ghost text-xs"
+              onClick={() =>
+                sessionsCollection
+                  .delete(s.id)
+                  .when('settled')
+                  .catch((e: Error) => toast.error('Could not revoke session', e.message))
+              }
+            >
               Revoke
             </button>
           </li>
