@@ -103,19 +103,24 @@ export function makeApp(opts: AppOptions) {
           BadRequest: (e) => Effect.succeed(c.json({ error: 'BadRequest', message: e.message }, 400)),
           Unauthorized: (e) => Effect.succeed(c.json({ error: 'Unauthorized', message: e.message }, 401)),
           // denials are written to the (append-only) audit log outside the rolled-back transaction
+          // (through the writer, so it can never join - or be rolled back with - another request's transaction)
           Forbidden: (e) =>
-            sql(() =>
-              db()
-                .prepare(
-                  `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, 'denied', ?, NULL, ?, ?)`,
-                )
-                .run(
-                  new Date().toISOString(),
-                  me?.user.id ?? null,
-                  `${c.req.method} ${new URL(c.req.url).pathname}`,
-                  JSON.stringify({ reason: e.message }),
-                  c.get('requestId'),
+            Writer.use((w) =>
+              w.transaction(
+                sql(() =>
+                  db()
+                    .prepare(
+                      `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, 'denied', ?, NULL, ?, ?)`,
+                    )
+                    .run(
+                      new Date().toISOString(),
+                      me?.user.id ?? null,
+                      `${c.req.method} ${new URL(c.req.url).pathname}`,
+                      JSON.stringify({ reason: e.message }),
+                      c.get('requestId'),
+                    ),
                 ),
+              ),
             ).pipe(Effect.ignore, Effect.as(c.json({ error: 'Forbidden', message: e.message }, 403))),
           NotFound: (e) => Effect.succeed(c.json({ error: 'NotFound', message: `${e.entity} ${String(e.id)} not found` }, 404)),
           MethodNotAllowed: (e) => Effect.succeed(c.json({ error: 'MethodNotAllowed', message: e.message }, 405)),
@@ -129,13 +134,18 @@ export function makeApp(opts: AppOptions) {
     )
   }
 
-  const body = <S extends Schema.Top>(c: Ctx, schema: S) =>
-    Effect.promise(() => c.req.json().catch(() => null)).pipe(
-      Effect.flatMap(
-        (json) => Schema.decodeUnknownEffect(schema)(json) as unknown as Effect.Effect<S['Type'], Schema.SchemaError>,
-      ),
-    )
-  const jsonBody = (c: Ctx) => Effect.promise(() => c.req.json().catch(() => null) as Promise<unknown>)
+  /**
+   * Read the request body *before* any transaction starts: a slow client must
+   * never hold the write lock, and the transactional program stays synchronous.
+   */
+  const readJson = (c: Ctx): Promise<unknown> => c.req.json().catch(() => null)
+  const runWithBody = async <A>(
+    c: Ctx,
+    f: (input: unknown) => Program<A>,
+    o: { status?: 200 | 201 | 204; write?: boolean } = {},
+  ) => run(c, f(await readJson(c)), o)
+  const decodeInput = <S extends Schema.Top>(schema: S, input: unknown) =>
+    Schema.decodeUnknownEffect(schema)(input) as unknown as Effect.Effect<S['Type'], Schema.SchemaError>
   const listParams = (c: Ctx) =>
     Effect.try({
       try: () => parseListParams(new URL(c.req.url).searchParams),
@@ -182,20 +192,27 @@ export function makeApp(opts: AppOptions) {
   app.get('/auth/demo-users', (c) =>
     c.json(DEMO_USERS.map(({ email, name, role, title }) => ({ email, name, role, title, password: 'password' }))),
   )
-  app.post('/auth/login', (c) =>
-    runtime.runPromise(
+  app.post('/auth/login', async (c) => {
+    const input = await readJson(c)
+    return runtime.runPromise(
       Effect.gen(function* () {
-        const creds = yield* body(c, LoginInput)
+        const creds = yield* decodeInput(LoginInput, input)
         const d = yield* database
+        const writer = yield* Writer
         const user = yield* sql(() => authenticate(d, creds.email, creds.password))
         if (!user) return yield* new Unauthorized({ message: 'Invalid email or password' })
-        const sid = yield* sql(() => createSession(d, user.id, c.req.header('user-agent')))
-        yield* sql(() =>
-          d
-            .prepare(
-              `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, 'login', 'sessions', NULL, '{}', ?)`,
+        const sid = yield* writer.transaction(
+          Effect.gen(function* () {
+            const sid = yield* sql(() => createSession(d, user.id, c.req.header('user-agent')))
+            yield* sql(() =>
+              d
+                .prepare(
+                  `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, 'login', 'sessions', NULL, '{}', ?)`,
+                )
+                .run(new Date().toISOString(), user.id, c.get('requestId')),
             )
-            .run(new Date().toISOString(), user.id, c.get('requestId')),
+            return sid
+          }),
         )
         setCookie(c, SESSION_COOKIE, sid, { httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 7 * 24 * 3600 })
         return c.json({ ...loadMe(d, user), token: sid })
@@ -211,8 +228,8 @@ export function makeApp(opts: AppOptions) {
           DbError: () => Effect.succeed(c.json({ error: 'Internal', message: 'Database error' }, 500)),
         }),
       ),
-    ),
-  )
+    )
+  })
   app.post('/auth/logout', (c) =>
     run(
       c,
@@ -234,17 +251,14 @@ export function makeApp(opts: AppOptions) {
 
   // ---------------- business endpoints ----------------
   app.post('/invoices/:id/pay', (c) =>
-    run(
+    runWithBody(
       c,
-      Effect.gen(function* () {
-        const input = ((yield* jsonBody(c)) ?? {}) as object
-        const data = (yield* Schema.decodeUnknownEffect(PaymentInput)({
-          method: 'card',
-          ...input,
-          invoiceId: Number(c.req.param('id')),
-        })) as typeof PaymentInput.Type
-        return yield* H.recordPayment(data)
-      }) as Program<unknown>,
+      (body) =>
+        Effect.gen(function* () {
+          const input = (body && typeof body === 'object' ? body : {}) as object
+          const data = yield* decodeInput(PaymentInput, { method: 'card', ...input, invoiceId: Number(c.req.param('id')) })
+          return yield* H.recordPayment(data)
+        }) as Program<unknown>,
       { status: 201, write: true },
     ),
   )
@@ -272,27 +286,28 @@ export function makeApp(opts: AppOptions) {
 
   /** Atomic multi-entity write: every op goes through the same authorization/validation as REST, in one transaction. */
   app.post('/batch', (c) =>
-    run(
+    runWithBody(
       c,
-      Effect.gen(function* () {
-        const { ops } = yield* body(c, BatchRequest)
-        const results: Array<{ entity: string; op: string; id: unknown; row?: unknown }> = []
-        for (const op of ops) {
-          if (op.op === 'insert') {
-            const row = (yield* H.create(op.entity, op.data)) as { id: unknown }
-            results.push({ entity: op.entity, op: op.op, id: row.id, row })
-          } else if (op.op === 'update') {
-            if (op.id === undefined) return yield* new BadRequest({ message: 'update requires id' })
-            const row = (yield* H.update(op.entity, op.id, op.data)) as { id: unknown }
-            results.push({ entity: op.entity, op: op.op, id: op.id, row })
-          } else {
-            if (op.id === undefined) return yield* new BadRequest({ message: 'delete requires id' })
-            yield* H.remove(op.entity, op.id)
-            results.push({ entity: op.entity, op: op.op, id: op.id })
+      (input) =>
+        Effect.gen(function* () {
+          const { ops } = yield* decodeInput(BatchRequest, input)
+          const results: Array<{ entity: string; op: string; id: unknown; row?: unknown }> = []
+          for (const op of ops) {
+            if (op.op === 'insert') {
+              const row = (yield* H.create(op.entity, op.data)) as { id: unknown }
+              results.push({ entity: op.entity, op: op.op, id: row.id, row })
+            } else if (op.op === 'update') {
+              if (op.id === undefined) return yield* new BadRequest({ message: 'update requires id' })
+              const row = (yield* H.update(op.entity, op.id, op.data)) as { id: unknown }
+              results.push({ entity: op.entity, op: op.op, id: op.id, row })
+            } else {
+              if (op.id === undefined) return yield* new BadRequest({ message: 'delete requires id' })
+              yield* H.remove(op.entity, op.id)
+              results.push({ entity: op.entity, op: op.op, id: op.id })
+            }
           }
-        }
-        return { results }
-      }) as Program<unknown>,
+          return { results }
+        }) as Program<unknown>,
       { write: true },
     ),
   )
@@ -449,11 +464,10 @@ export function makeApp(opts: AppOptions) {
     ),
   )
   app.put('/dev/chaos', (c) =>
-    run(
-      c,
+    runWithBody(c, (input) =>
       Effect.gen(function* () {
         yield* requirePermission('admin:dev')
-        const cfg = yield* body(c, ChaosConfig)
+        const cfg = yield* decodeInput(ChaosConfig, input)
         return yield* Chaos.use((ch) => ch.set(cfg))
       }),
     ),
@@ -464,15 +478,21 @@ export function makeApp(opts: AppOptions) {
       Effect.gen(function* () {
         yield* requirePermission('admin:dev')
         const d = yield* database
-        yield* sql(() => {
-          // keep everyone signed in across the reset (user ids are deterministic)
-          const sessions = d.prepare(`SELECT id, user_id, created_at, expires_at, user_agent FROM sessions`).all() as unknown[][]
-          seed(d, opts.db.seedOptions)
-          const ins = d.prepare(
-            `INSERT OR IGNORE INTO sessions (id, user_id, created_at, expires_at, user_agent) VALUES (@id, @user_id, @created_at, @expires_at, @user_agent)`,
-          )
-          for (const s of sessions) ins.run(s)
-        })
+        const writer = yield* Writer
+        // under the write lock (not a transaction: the schema reset toggles pragmas)
+        yield* writer.exclusive(
+          sql(() => {
+            // keep everyone signed in across the reset (user ids are deterministic)
+            const sessions = d
+              .prepare(`SELECT id, user_id, created_at, expires_at, user_agent FROM sessions`)
+              .all() as unknown[][]
+            seed(d, opts.db.seedOptions)
+            const ins = d.prepare(
+              `INSERT OR IGNORE INTO sessions (id, user_id, created_at, expires_at, user_agent) VALUES (@id, @user_id, @created_at, @expires_at, @user_agent)`,
+            )
+            for (const s of sessions) ins.run(s)
+          }),
+        )
         const feed = yield* ChangeFeed
         yield* feed.publish({ kind: 'reset' })
         return { ok: true }
@@ -502,15 +522,10 @@ export function makeApp(opts: AppOptions) {
   )
   app.get('/:resource/:id', (c) => run(c, H.get(c.req.param('resource'), idOf(c))))
   app.post('/:resource', (c) =>
-    run(c, Effect.flatMap(jsonBody(c), (b) => H.create(c.req.param('resource'), b)) as Program<unknown>, {
-      status: 201,
-      write: true,
-    }),
+    runWithBody(c, (b) => H.create(c.req.param('resource'), b) as Program<unknown>, { status: 201, write: true }),
   )
   app.patch('/:resource/:id', (c) =>
-    run(c, Effect.flatMap(jsonBody(c), (b) => H.update(c.req.param('resource'), idOf(c), b)) as Program<unknown>, {
-      write: true,
-    }),
+    runWithBody(c, (b) => H.update(c.req.param('resource'), idOf(c), b) as Program<unknown>, { write: true }),
   )
   app.delete('/:resource/:id', (c) =>
     run(c, H.remove(c.req.param('resource'), idOf(c)) as Program<unknown>, { status: 204, write: true }),

@@ -83,29 +83,54 @@ export class DomainError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Writer: SQLite has one writer. All write programs run through a 1-permit
-// semaphore inside BEGIN IMMEDIATE ... COMMIT/ROLLBACK, so a multi-step Effect
-// (validate -> authorize -> write -> audit) is atomic and never interleaves
-// with another request's writes.
+// Writer: SQLite has one writer and this process shares one connection. A
+// write program runs inside BEGIN IMMEDIATE ... COMMIT/ROLLBACK and is executed
+// *synchronously* (no await between BEGIN and COMMIT), so nothing else on the
+// event loop - reads, logins, other writes - can ever observe or join an open
+// transaction. Request bodies must therefore be read and decoded *before* the
+// program is handed to the writer; an async step inside it fails loudly
+// (AsyncFiberError -> 500) instead of holding the lock across I/O.
 // ---------------------------------------------------------------------------
 export class Writer extends Context.Service<
   Writer,
-  { transaction: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R> }
+  {
+    transaction: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R>
+    /** run synchronously under the write lock without a transaction (e.g. schema resets, which toggle pragmas) */
+    exclusive: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R>
+  }
 >()('app/Writer') {
   static layer = Layer.effect(
     Writer,
     Effect.gen(function* () {
       const db = yield* Sqlite
       const lock = yield* Semaphore.make(1)
-      return Writer.of({
-        transaction: (program) =>
-          lock.withPermits(1)(
-            Effect.acquireUseRelease(
-              sql(() => db.exec('BEGIN IMMEDIATE')),
-              () => program,
-              (_, exit) => Effect.sync(() => db.exec(exit._tag === 'Success' ? 'COMMIT' : 'ROLLBACK')),
-            ),
+      const runSync = <A, E, R>(program: Effect.Effect<A, E, R>, tx: boolean) =>
+        lock.withPermits(1)(
+          Effect.flatMap(Effect.context<R>(), (context) =>
+            Effect.suspend((): Effect.Effect<A, E | AppError> => {
+              if (tx) {
+                try {
+                  db.exec('BEGIN IMMEDIATE')
+                } catch (cause) {
+                  return Effect.fail(new DbError({ cause }))
+                }
+              }
+              const exit = Effect.runSyncExitWith(context)(program)
+              if (tx) {
+                try {
+                  db.exec(exit._tag === 'Success' ? 'COMMIT' : 'ROLLBACK')
+                } catch (cause) {
+                  if (db.inTransaction) db.exec('ROLLBACK')
+                  return Effect.fail(new DbError({ cause }))
+                }
+              }
+              return exit
+            }),
           ),
+        )
+      return Writer.of({
+        transaction: (program) => runSync(program, true),
+        exclusive: (program) => runSync(program, false),
       })
     }),
   )
