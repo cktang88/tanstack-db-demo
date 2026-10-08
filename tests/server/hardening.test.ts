@@ -264,3 +264,19 @@ describe('client-chosen ids', () => {
     expect(next).toBe(ok + 1)
   })
 })
+
+describe('audit trail', () => {
+  it('records what a delete removed, and text keys', async () => {
+    const owner = t.as('owner')
+    const tag = (await owner.post('/tags', { name: 'audited', color: '#abcdef' })).body
+    expect((await owner.post('/customer-tags', { customerId: 9, tagId: tag.id })).status).toBe(201)
+    expect((await owner.del(`/customer-tags/9:${tag.id}`)).status).toBe(204)
+    const log = (await owner.get(`/audit-log?entity=customer-tags&action=delete&sort=-id&limit=1`)).body.data[0]
+    expect(log.entityKey).toBe(`9:${tag.id}`)
+    expect(JSON.parse(log.changes)).toMatchObject({ customerId: [9, null], tagId: [tag.id, null] })
+    expect((await owner.del(`/tags/${tag.id}`)).status).toBe(204)
+    const tagLog = (await owner.get(`/audit-log?entity=tags&entityId=${tag.id}&action=delete`)).body.data[0]
+    expect(tagLog.entityKey).toBe(String(tag.id))
+    expect(JSON.parse(tagLog.changes).name).toEqual(['audited', null])
+  })
+})

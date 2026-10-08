@@ -76,11 +76,17 @@ export const audit = (action: string, entity: string, entityId: unknown, before?
   Effect.gen(function* () {
     const { db, me, requestId } = yield* ctx
     const changes =
-      action === 'update' ? diff(before as never, after as never) : action === 'create' ? diff(undefined, after as never) : {}
+      action === 'update'
+        ? diff(before as never, after as never)
+        : action === 'create'
+          ? diff(undefined, after as never)
+          : action === 'delete'
+            ? diff(before as never, undefined) // what was removed
+            : {}
     yield* sql(() =>
       db
         .prepare(
-          `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, entity_key, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           new Date().toISOString(),
@@ -88,6 +94,7 @@ export const audit = (action: string, entity: string, entityId: unknown, before?
           action,
           entity,
           typeof entityId === 'number' ? entityId : null,
+          entityId === null || entityId === undefined ? null : String(entityId),
           JSON.stringify(changes),
           requestId,
         ),

@@ -776,6 +776,7 @@ export const resources: Record<string, Resource> = {
       action: t('action'),
       entity: t('entity'),
       entityId: n('entity_id'),
+      entityKey: t('entity_key'),
       changes: t('changes'),
       requestId: t('request_id'),
     },

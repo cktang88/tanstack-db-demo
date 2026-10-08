@@ -324,11 +324,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   actor_id    INTEGER REFERENCES users(id),
   action      TEXT NOT NULL,        -- create | update | delete | login | logout | denied
   entity      TEXT NOT NULL,
-  entity_id   INTEGER,
-  changes     TEXT NOT NULL DEFAULT '{}',  -- JSON {field: [before, after]}
+  entity_id   INTEGER,                     -- numeric keys (kept for compatibility)
+  entity_key  TEXT,                        -- every key as text, incl. composite ones ("12:3")
+  changes     TEXT NOT NULL DEFAULT '{}',  -- JSON {field: [before, after]}; deletes: [before, null]
   request_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity_key ON audit_log(entity, entity_key);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
 
 CREATE TABLE IF NOT EXISTS notifications (

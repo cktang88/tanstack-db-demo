@@ -674,9 +674,13 @@ export function seed(db: DB, opts: SeedOptions = {}) {
     }
 
     // ---------------- audit history & notifications ----------------
-    const insAudit = db.prepare(
-      `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    const auditStmt = db.prepare(
+      `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, entity_key, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
+    const insAudit = {
+      run: (at: string, actor: number, action: string, entity: string, id: number | null, changes: string, req: string) =>
+        auditStmt.run(at, actor, action, entity, id, id === null ? null : String(id), changes, req),
+    }
     const auditTimes = Array.from({ length: 400 }, () => now.getTime() - r.int(1, 90 * 24) * 3600 * 1000).sort((a, b) => a - b)
     auditTimes.forEach((t, a) => {
       const at = iso(new Date(t))
