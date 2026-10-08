@@ -1,7 +1,7 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { Me, Permission, Role, User } from '../../shared/domain.ts'
 import type { DB } from '../db/schema.ts'
-import { verifyPassword } from './password.ts'
+import { hashPassword, verifyPassword } from './password.ts'
 
 export const SESSION_COOKIE = 'sid'
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000
@@ -9,31 +9,47 @@ const SESSION_TTL_MS = 7 * 24 * 3600 * 1000
 const userSelect = `id, name, email, role, title, avatar_color AS "avatarColor", active, created_at AS "createdAt"`
 const toUser = (r: any): User => ({ ...r, active: !!r.active })
 
+/** Verified against when the user is unknown or inactive, so every login attempt costs one scrypt (no timing oracle). */
+let dummyHash: string | undefined
+const DUMMY_HASH = () => (dummyHash ??= hashPassword(randomBytes(16).toString('hex')))
+
 /** Verify credentials; returns the user (without hash) or undefined. */
 export function authenticate(db: DB, email: string, password: string): User | undefined {
   const row = db.prepare(`SELECT ${userSelect}, password_hash AS hash FROM users WHERE email = ? COLLATE NOCASE`).get(email) as
     | (User & { hash: string })
     | undefined
-  if (!row || !row.active || !verifyPassword(password, row.hash)) return undefined
+  const ok = verifyPassword(password, row?.hash ?? DUMMY_HASH())
+  if (!row || !row.active || !ok) return undefined
   const { hash: _hash, ...user } = row
   return toUser(user)
 }
 
+/**
+ * Session tokens are bearer secrets: only their SHA-256 is stored (sessions.id),
+ * so a leaked database or backup cannot be replayed. The raw token exists only
+ * in the client's cookie / Authorization header.
+ */
+export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex')
+
+/** Create a session and return its raw token (returned to the client once, never stored). */
 export function createSession(db: DB, userId: number, userAgent?: string) {
-  const id = randomBytes(24).toString('base64url')
+  const token = randomBytes(24).toString('base64url')
   const now = new Date()
   db.prepare(`INSERT INTO sessions (id, user_id, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)`).run(
-    id,
+    hashToken(token),
     userId,
     now.toISOString(),
     new Date(now.getTime() + SESSION_TTL_MS).toISOString(),
     userAgent ?? null,
   )
-  return id
+  return token
 }
 
-export function deleteSession(db: DB, id: string) {
-  db.prepare(`DELETE FROM sessions WHERE id = ?`).run(id)
+/** Delete the session for a raw token; returns its row id + owner (for the change feed), if it existed. */
+export function deleteSession(db: DB, token: string) {
+  return db.prepare(`DELETE FROM sessions WHERE id = ? RETURNING rowid AS id, user_id AS userId`).get(hashToken(token)) as
+    | { id: number; userId: number }
+    | undefined
 }
 
 /** Resolve a session token to the caller's identity, permissions (from role_permissions) and teams. */
@@ -44,7 +60,7 @@ export function resolveSession(db: DB, token: string): Me | undefined {
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.id = ? AND s.expires_at > ? AND u.active = 1`,
     )
-    .get(token, new Date().toISOString())
+    .get(hashToken(token), new Date().toISOString())
   if (!row) return undefined
   return loadMe(db, toUser(row))
 }

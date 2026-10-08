@@ -9,6 +9,9 @@ const { app: api, runtime } = makeApp({
   chaos: { latencyMs: Number(process.env.API_LATENCY_MS ?? 250), failRate: Number(process.env.API_FAIL_RATE ?? 0) },
 })
 
+// open (and, in demo mode, seed) the database now: a schema mismatch outside demo mode fails at startup
+await runtime.context()
+
 const app = new Hono()
 app.route('/', api)
 // In production, also serve the built SPA (with history-API fallback).

@@ -1,5 +1,5 @@
 import { Context, Effect, Schema } from 'effect'
-import { PLAN_PRICE, type Customer, type CustomerStatus, type Plan } from '../shared/domain.ts'
+import type { Customer, CustomerStatus, Plan } from '../shared/domain.ts'
 import {
   CustomerInput,
   CustomerPatch,
@@ -8,9 +8,10 @@ import {
   SubscriptionInput,
   SubscriptionPatch,
   UsageEventInput,
+  toUtcIso,
 } from '../shared/schemas.ts'
 import { deleteRow, diff, getRow, insertRow, listRows, updateRow } from './db/query.ts'
-import type { ListParams } from './db/sql.ts'
+import { lookup, type ListParams } from './db/sql.ts'
 import { resources, type Access } from './resources.ts'
 import {
   BadRequest,
@@ -36,8 +37,10 @@ const ctx = Effect.gen(function* () {
   return { db: yield* Sqlite, me: yield* CurrentUser, outbox: yield* Outbox, requestId: yield* RequestId }
 })
 
-export const resourceOf = (name: string) =>
-  resources[name] ? Effect.succeed(resources[name]) : Effect.fail(new NotFound({ entity: 'resource', id: name }))
+export const resourceOf = (name: string) => {
+  const r = lookup(resources, name)
+  return r ? Effect.succeed(r) : Effect.fail(new NotFound({ entity: 'resource', id: name }))
+}
 
 const checkAccess = (access: Access | undefined, what: string) =>
   Effect.gen(function* () {
@@ -49,8 +52,12 @@ const checkAccess = (access: Access | undefined, what: string) =>
 const decode = <S extends Schema.Top>(schema: S, input: unknown) =>
   Schema.decodeUnknownEffect(schema)(input) as unknown as Effect.Effect<S['Type'], Schema.SchemaError>
 
-/** Re-read a row and queue it for the change feed (or a delete if it no longer exists / left its scope). */
-export const touch = (name: string, id: unknown) =>
+/**
+ * Re-read a row and queue it for the change feed (or a delete if it no longer
+ * exists / left its scope). For per-user resources (ownerField) a delete must
+ * name the row's owner, or the stream delivers it to nobody.
+ */
+export const touch = (name: string, id: unknown, ownerId?: number) =>
   Effect.gen(function* () {
     const { db, outbox } = yield* ctx
     const r = resources[name]!
@@ -58,7 +65,9 @@ export const touch = (name: string, id: unknown) =>
     const scope = r.ownerField ? undefined : r.scope?.({} as Principal)
     const row = yield* sql(() => getRow(db, r, id, scope))
     outbox.messages.push(
-      row ? { kind: 'upsert', entity: name, row: row as never } : { kind: 'delete', entity: name, id: id as number },
+      row
+        ? { kind: 'upsert', entity: name, row: row as never }
+        : { kind: 'delete', entity: name, id: id as number, ...(ownerId !== undefined && { ownerId }) },
     )
     return row
   })
@@ -67,11 +76,17 @@ export const audit = (action: string, entity: string, entityId: unknown, before?
   Effect.gen(function* () {
     const { db, me, requestId } = yield* ctx
     const changes =
-      action === 'update' ? diff(before as never, after as never) : action === 'create' ? diff(undefined, after as never) : {}
+      action === 'update'
+        ? diff(before as never, after as never)
+        : action === 'create'
+          ? diff(undefined, after as never)
+          : action === 'delete'
+            ? diff(before as never, undefined) // what was removed
+            : {}
     yield* sql(() =>
       db
         .prepare(
-          `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO audit_log (at, actor_id, action, entity, entity_id, entity_key, changes, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           new Date().toISOString(),
@@ -79,6 +94,7 @@ export const audit = (action: string, entity: string, entityId: unknown, before?
           action,
           entity,
           typeof entityId === 'number' ? entityId : null,
+          typeof entityId === 'number' || typeof entityId === 'string' ? String(entityId) : null,
           JSON.stringify(changes),
           requestId,
         ),
@@ -151,7 +167,7 @@ export const create = (name: string, input: unknown) =>
     const r = yield* resourceOf(name)
     if (r.mode === 'read-only') return yield* new MethodNotAllowed({ message: `${name} is read-only` })
     yield* checkAccess(r.create, `Creating ${name}`)
-    const custom = business[name]?.create
+    const custom = lookup(business, name)?.create
     if (custom) return yield* custom(input)
     if (!r.createSchema) return yield* new MethodNotAllowed({ message: `Creating ${name} is not supported` })
     const { db, me } = yield* ctx
@@ -161,7 +177,7 @@ export const create = (name: string, input: unknown) =>
     const id = yield* sql(() => insertRow(db, r, data))
     const row = yield* touch(name, id)
     yield* audit('create', name, id, undefined, row)
-    yield* business[name]?.afterCreate?.(row!) ?? Effect.void
+    yield* lookup(business, name)?.afterCreate?.(row!) ?? Effect.void
     return row!
   })
 
@@ -173,16 +189,16 @@ export const update = (name: string, id: unknown, input: unknown) =>
     const { db, me } = yield* ctx
     const before = yield* sql(() => getRow(db, r, id, r.scope?.(me)))
     if (!before) return yield* new NotFound({ entity: name, id })
-    const custom = business[name]?.update
+    const custom = lookup(business, name)?.update
     if (custom) return yield* custom(before, input)
     if (!r.patchSchema) return yield* new MethodNotAllowed({ message: `Updating ${name} is not supported` })
     const patch = (yield* decode(r.patchSchema, input)) as Record<string, unknown>
     yield* deny(r.canWrite?.(me, before, db, 'update'))
-    yield* deny(r.canWrite?.(me, { ...before, ...patch }, db, 'update'))
+    yield* deny(r.canWrite?.(me, { ...before, ...patch }, db, 'update', before))
     yield* sql(() => updateRow(db, r, id, patch))
     const after = yield* touch(name, id)
     yield* audit('update', name, id, before, after!)
-    yield* business[name]?.afterUpdate?.(before, after!) ?? Effect.void
+    yield* lookup(business, name)?.afterUpdate?.(before, after!) ?? Effect.void
     return after!
   })
 
@@ -195,11 +211,12 @@ export const remove = (name: string, id: unknown) =>
     const before = yield* sql(() => getRow(db, r, id, r.scope?.(me)))
     if (!before) return yield* new NotFound({ entity: name, id })
     yield* deny(r.canWrite?.(me, before, db, 'delete'))
-    const custom = business[name]?.remove
+    const custom = lookup(business, name)?.remove
     if (custom) yield* custom(before)
     else yield* sql(() => deleteRow(db, r, id))
-    yield* touch(name, id)
+    yield* touch(name, id, r.ownerField ? (before[r.ownerField] as number) : undefined)
     yield* audit('delete', name, id, before)
+    yield* lookup(business, name)?.afterRemove?.(before) ?? Effect.void
     return null
   })
 
@@ -213,11 +230,46 @@ interface Business {
   remove?: (before: Row) => Effect.Effect<void, any, any>
   afterCreate?: (row: Row) => Effect.Effect<void, any, any>
   afterUpdate?: (before: Row, after: Row) => Effect.Effect<void, any, any>
+  afterRemove?: (before: Row) => Effect.Effect<void, any, any>
 }
 
 const SUB_STATUS: Record<CustomerStatus, string> = { active: 'active', trial: 'trialing', churned: 'canceled' }
-const planProductId = (db: Sqlite['Service'], plan: Plan) =>
-  (db.prepare(`SELECT id FROM products WHERE kind = 'plan' AND plan_code = ?`).get(plan) as { id: number }).id
+/** the catalog's product for a plan (its unit_price is the list price; there is no second price table) */
+const planProduct = (db: Sqlite['Service'], plan: Plan) =>
+  db.prepare(`SELECT id, unit_price AS unitPrice FROM products WHERE kind = 'plan' AND plan_code = ?`).get(plan) as {
+    id: number
+    unitPrice: number
+  }
+
+/** publish MRR movements appended since `lastId` */
+const touchMovementsSince = (lastId: number) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    const ids = yield* sql(() =>
+      (db.prepare(`SELECT id FROM mrr_movements WHERE id > ? ORDER BY id`).all(lastId) as Array<{ id: number }>).map((r) => r.id),
+    )
+    for (const id of ids) yield* touch('mrr-movements', id)
+  })
+
+/**
+ * Run a business operation that may change a customer's MRR in several steps
+ * (e.g. a plan change cancels one subscription and starts another) so that the
+ * MRR ledger records one net movement instead of a fake churn + new pair.
+ */
+const withMrrHold = <A, E, R>(customerId: number, effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    const lastId = yield* sql(() => (db.prepare(`SELECT COALESCE(MAX(id), 0) AS m FROM mrr_movements`).get() as { m: number }).m)
+    yield* sql(() =>
+      db
+        .prepare(`INSERT INTO mrr_hold (customer_id, mrr_before, at) VALUES (?, (SELECT mrr FROM customers WHERE id = ?), ?)`)
+        .run(customerId, customerId, new Date().toISOString()),
+    )
+    const result = yield* effect
+    yield* sql(() => db.prepare(`DELETE FROM mrr_hold WHERE customer_id = ?`).run(customerId))
+    yield* touchMovementsSince(lastId)
+    return result
+  })
 
 /** The customer's current base-plan subscription, if any. */
 const baseSubscription = (db: Sqlite['Service'], customerId: number) =>
@@ -249,30 +301,34 @@ const syncSubscriptions = (customer: Customer, next: { plan: Plan; seats: number
     const { db } = yield* ctx
     const now = new Date().toISOString()
     const base = yield* sql(() => baseSubscription(db, customer.id))
-    yield* sql(() => {
-      if (next.status === 'churned') {
+    yield* withMrrHold(
+      customer.id,
+      sql(() => {
+        if (next.status === 'churned') {
+          db.prepare(
+            `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
+          ).run(now, customer.id)
+          return
+        }
+        const status = SUB_STATUS[next.status]
+        const product = planProduct(db, next.plan)
+        const productId = product.id
+        if (!base || base.productId !== productId) {
+          // plan change (or reactivation): close the old base plan and start a new one at list price
+          if (base) db.prepare(`UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ?`).run(now, base.id)
+          db.prepare(
+            `INSERT INTO subscriptions (customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
+          ).run(customer.id, productId, next.seats, product.unitPrice, status, now)
+        } else {
+          db.prepare(`UPDATE subscriptions SET quantity = ?, status = ? WHERE id = ?`).run(next.seats, status, base.id)
+        }
+        // add-ons follow the account's lifecycle
         db.prepare(
-          `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
-        ).run(now, customer.id)
-        return
-      }
-      const status = SUB_STATUS[next.status]
-      const productId = planProductId(db, next.plan)
-      if (!base || base.productId !== productId) {
-        // plan change (or reactivation): close the old base plan and start a new one at list price
-        if (base) db.prepare(`UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ?`).run(now, base.id)
-        db.prepare(
-          `INSERT INTO subscriptions (customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        ).run(customer.id, productId, next.seats, PLAN_PRICE[next.plan], status, now)
-      } else {
-        db.prepare(`UPDATE subscriptions SET quantity = ?, status = ? WHERE id = ?`).run(next.seats, status, base.id)
-      }
-      // add-ons follow the account's lifecycle
-      db.prepare(
-        `UPDATE subscriptions SET status = ? WHERE customer_id = ? AND status != 'canceled'
+          `UPDATE subscriptions SET status = ? WHERE customer_id = ? AND status != 'canceled'
          AND product_id IN (SELECT id FROM products WHERE kind = 'addon')`,
-      ).run(status, customer.id)
-    })
+        ).run(status, customer.id)
+      }),
+    )
     yield* touchSubscriptions(customer.id)
   })
 
@@ -331,6 +387,7 @@ const business: Record<string, Business> = {
           () => (db.prepare(`SELECT id FROM contacts WHERE customer_id = ?`).get(id) as { id: number }).id,
         )
         yield* touch('contacts', contact)
+        yield* touch('customer-health', id)
         yield* audit('create', 'customers', id, undefined, row!)
         yield* recordEvent('customer.created', id, `New customer ${data.company}`)
         return row!
@@ -369,6 +426,7 @@ const business: Record<string, Business> = {
         if (next.plan !== before.plan || next.seats !== before.seats || next.status !== before.status)
           yield* syncSubscriptions(before as Customer, next)
         const after = (yield* touch('customers', before.id))!
+        yield* touch('customer-health', before.id) // mrr / status feed the health view
         yield* audit('update', 'customers', before.id, before, after)
         yield* recordEvent('customer.updated', before.id, `Updated ${after.company} (${Object.keys(patch).join(', ')})`)
         if (patch.ownerId && patch.ownerId !== before.ownerId)
@@ -385,15 +443,37 @@ const business: Record<string, Business> = {
     remove: (before) =>
       Effect.gen(function* () {
         const { db } = yield* ctx
-        // archiving cancels billing but keeps history (invoices, payments, audit)
-        yield* sql(() => {
-          const now = new Date().toISOString()
-          db.prepare(`UPDATE customers SET deleted_at = ?, status = 'churned' WHERE id = ?`).run(now, before.id)
-          db.prepare(
-            `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
-          ).run(now, before.id)
-        })
+        // archiving cancels billing but keeps history (invoices, payments, audit);
+        // open receivables must not be stranded: unpaid ones are voided, partially paid ones block
+        const open = yield* sql(
+          () =>
+            db
+              .prepare(
+                `SELECT i.id, i.status, (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id) AS paid
+                 FROM invoices i WHERE i.customer_id = ? AND i.status IN ('open', 'overdue')`,
+              )
+              .all(before.id) as Array<{ id: number; status: string; paid: number }>,
+        )
+        if (open.some((i) => i.paid > 0))
+          return yield* new Conflict({
+            message: 'Customer has partially paid open invoices; settle or credit them before archiving',
+          })
+        yield* withMrrHold(
+          before.id,
+          sql(() => {
+            const now = new Date().toISOString()
+            db.prepare(`UPDATE invoices SET status = 'void' WHERE customer_id = ? AND status IN ('open', 'overdue')`).run(
+              before.id,
+            )
+            db.prepare(`UPDATE customers SET deleted_at = ?, status = 'churned' WHERE id = ?`).run(now, before.id)
+            db.prepare(
+              `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE customer_id = ? AND status != 'canceled'`,
+            ).run(now, before.id)
+          }),
+        )
+        for (const i of open) yield* audit('update', 'invoices', i.id, { status: i.status }, { status: 'void' })
         yield* touchSubscriptions(before.id)
+        yield* touchBalances(before.id)
         const invoices = yield* sql(() =>
           (db.prepare(`SELECT id FROM invoices WHERE customer_id = ?`).all(before.id) as Array<{ id: number }>).map((r) => r.id),
         )
@@ -425,27 +505,29 @@ const business: Record<string, Business> = {
           return yield* new Conflict({
             message: 'Change the base plan by editing the customer’s plan; subscriptions here are for add-ons',
           })
+        if (customer.status === 'churned')
+          return yield* new Conflict({ message: 'Churned customers cannot take add-ons; reactivate the account first' })
         const now = new Date().toISOString()
-        const id = yield* sql(
-          () =>
-            (
-              db
-                .prepare(
-                  `INSERT INTO subscriptions (id, customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-                )
-                .get(
-                  data.id ?? null,
-                  data.customerId,
-                  data.productId,
-                  data.quantity,
-                  product.unitPrice,
-                  data.status ?? 'active',
-                  now,
-                ) as { id: number }
-            ).id,
+        // add-ons follow the account's lifecycle (a trial's add-ons are trialing too)
+        const status = SUB_STATUS[customer.status]
+        const id = yield* withMrrHold(
+          data.customerId,
+          sql(
+            () =>
+              (
+                db
+                  .prepare(
+                    `INSERT INTO subscriptions (id, customer_id, product_id, quantity, unit_price, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+                  )
+                  .get(data.id ?? null, data.customerId, data.productId, data.quantity, product.unitPrice, status, now) as {
+                  id: number
+                }
+              ).id,
+          ),
         )
         const row = (yield* touch('subscriptions', id))!
         yield* touch('customers', data.customerId)
+        yield* touch('customer-health', data.customerId)
         yield* audit('create', 'subscriptions', id, undefined, row)
         yield* recordEvent('subscription.changed', data.customerId, `Added add-on to ${customer.company}`)
         return row
@@ -455,24 +537,32 @@ const business: Record<string, Business> = {
         const { db } = yield* ctx
         const patch = yield* decode(SubscriptionPatch, input)
         if (before.status === 'canceled') return yield* new Conflict({ message: 'Canceled subscriptions cannot be changed' })
-        yield* sql(() =>
-          db
-            .prepare(`UPDATE subscriptions SET quantity = ?, status = ?, canceled_at = ? WHERE id = ?`)
-            .run(
-              patch.quantity ?? before.quantity,
-              patch.status ?? before.status,
-              (patch.status ?? before.status) === 'canceled' ? new Date().toISOString() : null,
-              before.id,
-            ),
-        )
-        const after = (yield* touch('subscriptions', before.id))!
-        // keep the customer projection in sync when the base plan's seat count changes
         const isPlan = yield* sql(
           () => (db.prepare(`SELECT kind FROM products WHERE id = ?`).get(before.productId) as { kind: string }).kind === 'plan',
         )
+        if (isPlan && patch.status !== undefined && patch.status !== before.status)
+          return yield* new Conflict({
+            message: 'The base plan’s status follows the customer; change the customer’s status or plan instead',
+          })
+        yield* withMrrHold(
+          before.customerId,
+          sql(() =>
+            db
+              .prepare(`UPDATE subscriptions SET quantity = ?, status = ?, canceled_at = ? WHERE id = ?`)
+              .run(
+                patch.quantity ?? before.quantity,
+                patch.status ?? before.status,
+                (patch.status ?? before.status) === 'canceled' ? new Date().toISOString() : null,
+                before.id,
+              ),
+          ),
+        )
+        const after = (yield* touch('subscriptions', before.id))!
+        // keep the customer projection in sync when the base plan's seat count changes
         if (isPlan && patch.quantity)
           yield* sql(() => db.prepare(`UPDATE customers SET seats = ? WHERE id = ?`).run(patch.quantity, before.customerId))
         yield* touch('customers', before.customerId)
+        yield* touch('customer-health', before.customerId)
         yield* audit('update', 'subscriptions', before.id, before, after)
         yield* recordEvent('subscription.changed', before.customerId, `Subscription #${before.id} changed`)
         return after
@@ -494,14 +584,17 @@ const business: Record<string, Business> = {
             return yield* new Conflict({ message: `Invoices cannot be moved to "${patch.status}" manually` })
           if (before.status === 'paid')
             return yield* new Conflict({ message: 'Paid invoices cannot be voided; issue a credit instead' })
+          if ((yield* paidOn(before.id)) > 0)
+            return yield* new Conflict({ message: 'Partially paid invoices cannot be voided; issue a credit instead' })
         }
-        yield* sql(() =>
-          db
-            .prepare(`UPDATE invoices SET status = ?, due_at = ? WHERE id = ?`)
-            .run(patch.status ?? before.status, patch.dueAt ?? before.dueAt, before.id),
-        )
+        // a date-only due date means "by the end of that day" (UTC)
+        const dueAt = patch.dueAt !== undefined ? toUtcIso(patch.dueAt, { endOfDay: true }) : (before.dueAt as string)
+        let status = patch.status ?? (before.status as string)
+        // open <-> overdue follows the due date (moving it later re-opens an overdue invoice)
+        if (status === 'open' || status === 'overdue') status = dueAt < new Date().toISOString() ? 'overdue' : 'open'
+        yield* sql(() => db.prepare(`UPDATE invoices SET status = ?, due_at = ? WHERE id = ?`).run(status, dueAt, before.id))
         const after = (yield* touch('invoices', before.id))!
-        yield* touch('customer-balances', before.customerId)
+        yield* touchBalances(before.customerId)
         yield* audit('update', 'invoices', before.id, before, after)
         if (patch.status === 'void') yield* recordEvent('invoice.voided', before.customerId, `Invoice ${before.number} voided`)
         return after
@@ -514,26 +607,46 @@ const business: Record<string, Business> = {
     create: (input) =>
       Effect.gen(function* () {
         const { db } = yield* ctx
-        const data = yield* decode(UsageEventInput, input)
+        const decoded = yield* decode(UsageEventInput, input)
+        // stored (and bucketed into usage_daily) as a UTC timestamp, whatever offset the client sent
+        const data = { ...decoded, occurredAt: toUtcIso(decoded.occurredAt) }
         const r = resources['usage-events']!
+        const customer = yield* sql(
+          () =>
+            db.prepare(`SELECT deleted_at AS deletedAt FROM customers WHERE id = ?`).get(data.customerId) as
+              | { deletedAt: string | null }
+              | undefined,
+        )
+        if (!customer) return yield* new NotFound({ entity: 'customers', id: data.customerId })
+        if (customer.deletedAt) return yield* new Conflict({ message: 'Customer is archived; usage is no longer metered' })
         if (data.idempotencyKey) {
-          const existing = yield* sql(
-            () =>
-              db.prepare(`SELECT id FROM usage_events WHERE idempotency_key = ?`).get(data.idempotencyKey) as
-                | { id: number }
-                | undefined,
-          )
-          if (existing) return (yield* sql(() => getRow(db, r, existing.id)))! // exactly-once: replay returns the original
+          // keys are scoped per customer; a replay must be the same event
+          const existing = yield* sql(() => {
+            const hit = db
+              .prepare(`SELECT id FROM usage_events WHERE customer_id = ? AND idempotency_key = ?`)
+              .get(data.customerId, data.idempotencyKey) as { id: number } | undefined
+            return hit ? getRow<Row>(db, r, hit.id) : undefined
+          })
+          if (existing) {
+            if (existing.metric !== data.metric || existing.quantity !== data.quantity || existing.occurredAt !== data.occurredAt)
+              return yield* new Conflict({ message: 'Idempotency key was already used for a different usage event' })
+            return existing // exactly-once: replay returns the original
+          }
         }
         const id = yield* sql(() => insertRow(db, r, data))
         const row = (yield* touch('usage-events', id))!
         yield* touch('usage-daily', `${data.customerId}:${data.metric}:${data.occurredAt.slice(0, 10)}`)
+        yield* touch('customer-health', data.customerId)
         return row
       }),
   },
 
   tasks: {
-    afterCreate: (row) => notify(row.assigneeId, 'assignment', 'New task assigned', row.title, 'tasks', row.id),
+    afterCreate: (row) =>
+      Effect.gen(function* () {
+        yield* touch('project-stats', row.projectId)
+        yield* notify(row.assigneeId, 'assignment', 'New task assigned', row.title, 'tasks', row.id)
+      }),
     afterUpdate: (before, after) =>
       Effect.gen(function* () {
         if (after.assigneeId !== before.assigneeId)
@@ -541,6 +654,8 @@ const business: Record<string, Business> = {
         if (after.status !== before.status)
           yield* recordEvent('task.updated', null, `Moved task "${after.title}" to ${after.status}`)
         yield* touch('project-stats', after.projectId)
+        // moved to another project: the old one lost a task (and its time)
+        if (before.projectId !== after.projectId) yield* touch('project-stats', before.projectId)
       }),
     remove: (before) =>
       Effect.gen(function* () {
@@ -583,6 +698,7 @@ const business: Record<string, Business> = {
   'time-entries': {
     afterCreate: (row) => touchProjectOfTask(row.taskId),
     afterUpdate: (_b, row) => touchProjectOfTask(row.taskId),
+    afterRemove: (before) => touchProjectOfTask(before.taskId),
   },
 
   users: {
@@ -592,6 +708,23 @@ const business: Record<string, Business> = {
         : Effect.void,
   },
 }
+
+/** Σ payments recorded against an invoice */
+const paidOn = (invoiceId: number) =>
+  Effect.gen(function* () {
+    const { db } = yield* ctx
+    return yield* sql(
+      () =>
+        (db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM payments WHERE invoice_id = ?`).get(invoiceId) as { s: number }).s,
+    )
+  })
+
+/** a customer's billing rollups: balances and the health view (overdue feeds it) */
+export const touchBalances = (customerId: number) =>
+  Effect.gen(function* () {
+    yield* touch('customer-balances', customerId)
+    yield* touch('customer-health', customerId)
+  })
 
 const touchProjectOfTask = (taskId: number) =>
   Effect.gen(function* () {
@@ -610,11 +743,7 @@ export const recordPayment = (data: typeof PaymentInput.Type) =>
     const inv = yield* sql(() => getRow<Row>(db, resources.invoices!, data.invoiceId, resources.invoices!.scope!(me)))
     if (!inv) return yield* new NotFound({ entity: 'invoices', id: data.invoiceId })
     if (inv.status === 'void') return yield* new Conflict({ message: 'Cannot pay a void invoice' })
-    const paid = yield* sql(
-      () =>
-        (db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM payments WHERE invoice_id = ?`).get(inv.id) as { s: number }).s,
-    )
-    const remaining = inv.amount - paid
+    const remaining = inv.amount - (yield* paidOn(inv.id))
     if (remaining <= 0) return yield* new Conflict({ message: 'Invoice is already fully paid' })
     const amount = data.amount ?? remaining
     if (amount > remaining) return yield* new BadRequest({ message: `Overpayment: only ${remaining} cents outstanding` })
@@ -641,7 +770,7 @@ export const recordPayment = (data: typeof PaymentInput.Type) =>
     )
     const payment = (yield* touch('payments', id))!
     const invoice = (yield* touch('invoices', inv.id))!
-    yield* touch('customer-balances', inv.customerId)
+    yield* touchBalances(inv.customerId)
     yield* audit('create', 'payments', id, undefined, payment)
     yield* recordEvent(
       invoice.status === 'paid' ? 'invoice.paid' : 'payment.recorded',

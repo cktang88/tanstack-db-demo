@@ -58,7 +58,7 @@ export const PERMISSIONS = {
   'customers:write': 'Create and edit customers (members: only accounts they own)',
   'customers:delete': 'Archive customers',
   'billing:read': 'View subscriptions, invoices, payments and balances',
-  'billing:write': 'Change subscriptions, void invoices, record payments',
+  'billing:write': 'Change subscriptions, void invoices, record payments, run billing jobs (overdue, MRR rollup)',
   'products:read': 'View the product catalog',
   'products:write': 'Edit the product catalog',
   'projects:read': 'View projects, tasks, comments and time',
@@ -70,7 +70,7 @@ export const PERMISSIONS = {
   'team:read': 'View teammates and teams',
   'team:manage': 'Change roles, teams and memberships',
   'audit:read': 'Read the audit log',
-  'admin:dev': 'Developer tools (chaos, reset, jobs)',
+  'admin:dev': 'Developer tools (chaos, reset; demo mode only)',
 } as const
 export type Permission = keyof typeof PERMISSIONS
 
