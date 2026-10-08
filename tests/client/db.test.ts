@@ -22,7 +22,6 @@ import {
   persist,
   resetServerCollections,
   selectionCollection,
-  setUnauthorizedHandler,
   teamMembersCollection,
   tasksCollection,
   toBatchOps,
@@ -33,7 +32,7 @@ import {
 import { applyChange } from '../../src/db/live'
 import { isNewestFirstWindow, loadSubsetToSearch, orderByToSort, whereToParams } from '../../src/db/pushdown'
 import { customersByStatus } from '../../src/db/views'
-import { HttpError } from '../../src/lib/api'
+import { api, HttpError, onUnauthorized } from '../../src/lib/api'
 
 const ref = (field: string) => new IR.PropRef([field])
 const val = (v: unknown) => new IR.Value(v)
@@ -282,16 +281,22 @@ describe('persist', () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining('the server committed'), expect.any(HttpError))
   })
 
-  it('rejects without a request when an op is not allowed, and reports 401s', async () => {
+  it('rejects without a request when an op is not allowed, and reports 401s centrally', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ error: 'Unauthorized' }, { status: 401 }))
     await expect(persist([m({ type: 'delete', key: 1, collection: commentsCollection as never })])).rejects.toThrow(
       UnsupportedMutationError,
     )
     expect(fetch).not.toHaveBeenCalled()
-    const onUnauthorized = vi.fn()
-    setUnauthorizedHandler(onUnauthorized)
+    const handler = vi.fn()
+    onUnauthorized(handler)
     await expect(persist([m({ type: 'update', key: 1, changes: { seats: 2 } })])).rejects.toThrow(HttpError)
-    expect(onUnauthorized).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }))
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }))
+    // any other request too (one-off calls like mark-all-read), but not a failed sign-in
+    handler.mockClear()
+    await expect(api.post('/notifications/read-all', {})).rejects.toThrow(HttpError)
+    expect(handler).toHaveBeenCalledTimes(1)
+    await expect(api.post('/auth/login', { email: 'x', password: 'y' })).rejects.toThrow(HttpError)
+    expect(handler).toHaveBeenCalledTimes(1)
   })
 })
 

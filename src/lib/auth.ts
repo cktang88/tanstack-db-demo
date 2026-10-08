@@ -64,7 +64,8 @@ export async function clearSession(qc: QueryClient) {
 }
 
 /** Only same-origin, absolute paths are followed after sign-in. */
-export const safeRedirect = (r: unknown) => (typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') ? r : '/')
+export const safeRedirect = (r: unknown) =>
+  typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') && !r.startsWith('/login') ? r : '/'
 
 export function useLogin(opts: { redirect?: string } = {}) {
   const qc = useQueryClient()
@@ -77,7 +78,7 @@ export function useLogin(opts: { redirect?: string } = {}) {
       qc.setQueryData(meQuery().queryKey, me)
       // the app route's guard opens the change feed for this user
       const redirectTo = opts.redirect ?? (router.state.location.search as { redirect?: unknown }).redirect
-      await router.navigate({ href: safeRedirect(redirectTo) })
+      await router.navigate({ href: safeRedirect(redirectTo), replace: true })
     },
   })
 }

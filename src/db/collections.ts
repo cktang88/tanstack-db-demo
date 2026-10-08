@@ -108,7 +108,7 @@ export const CommentSchema = Schema.Struct({
 //                      not sent; the real row is re-read after commit
 // ---------------------------------------------------------------------------
 type AnyCollection = Collection<any, any, any>
-type SyncUtils = {
+export type SyncUtils = {
   writeBatch: (fn: () => void) => Promise<void>
   writeUpsert: (row: unknown) => Promise<void>
   writeDelete: (key: number | string) => Promise<void>
@@ -125,7 +125,8 @@ const register = (collection: AnyCollection, entity: string, mode: Mode) => {
   BY_ENTITY[entity] = collection
   MODE_OF[entity] = mode
 }
-const DERIVE: Record<string, (row: any) => any> = { customers: withCustomerDerived, invoices: withInvoiceDerived }
+/** client-side derived columns per entity, applied to every row written from the server (responses and SSE) */
+export const DERIVE: Record<string, (row: any) => any> = { customers: withCustomerDerived, invoices: withInvoiceDerived }
 /** client-side derived buckets — never part of the API */
 const DERIVED_FIELDS = new Set(['createdMonth', 'issuedMonth', 'paidMonth'])
 /**
@@ -224,24 +225,14 @@ async function writeResults(results: BatchResult['results']) {
   )
 }
 
-let onUnauthorized: ((e: HttpError) => void) | undefined
-/** Called when a write is rejected with 401 (the session expired or was revoked). */
-export function setUnauthorizedHandler(fn: (e: HttpError) => void) {
-  onUnauthorized = fn
-}
-
 /** Send mutations to the server atomically and reconcile synced state with the response. */
 export async function persist(mutations: ReadonlyArray<PendingMutation<any>>) {
   // throws (rolling the transaction back) before anything is sent if an op is not allowed
   const ops = toBatchOps(mutations)
   let results: BatchResult['results'] = []
   if (ops.length) {
-    try {
-      results = (await api.post<BatchResult>('/batch', { ops })).results
-    } catch (e) {
-      if (e instanceof HttpError && e.status === 401) onUnauthorized?.(e)
-      throw e
-    }
+    // a 401 here is handled centrally by the API client (sign-out + redirect)
+    results = (await api.post<BatchResult>('/batch', { ops })).results
   }
   // From here on the server has committed: the transaction must not be reported
   // as failed. If reconciling local state goes wrong, log it and resync the
@@ -376,9 +367,7 @@ function onDemandCollection<T extends object, K extends string | number>(
           return opts.pager.read({ offset: subset.offset, limit: subset.limit }, ctx.signal)
         const search = loadSubsetToSearch(subset)
         for (const [k, v] of Object.entries(opts.scope ?? {})) search.set(k, v)
-        const res = await fetch(`/api/${entity}?${search}`, { signal: ctx.signal })
-        if (!res.ok) throw new HttpError(res.status, await res.json().catch(() => undefined))
-        const rows = ((await res.json()) as Page<T>).data
+        const rows = (await api.get<Page<T>>(`/${entity}`, Object.fromEntries(search), ctx.signal)).data
         return opts.map ? rows.map(opts.map) : rows
       },
       ...(opts.mode === 'append-only' && { onInsert: save }),
@@ -611,8 +600,10 @@ export function claimClientState(userId: number) {
 /** Client-side id generation: rows get their final id before the server sees them (no temp-id swap). */
 let lastId = 0
 export function newId() {
-  // ms timestamp * 1000 + counter: unique per tab, increasing, a safe integer
-  const base = Date.now() * 1000
+  // ms timestamp * 1000 + random 0..999 (so two clients in the same millisecond almost never
+  // collide), bumped to stay strictly increasing within this tab; ≈1.8e15, well under the
+  // server's 2^52 cap for client ids
+  const base = Date.now() * 1000 + Math.floor(Math.random() * 1000)
   lastId = Math.max(lastId + 1, base)
-  return lastId % 2_000_000_000_000_000
+  return lastId
 }

@@ -36,7 +36,7 @@ export function TaskDialog({ taskId, onClose }: { taskId: number | null; onClose
 }
 
 function TaskBody({ task }: { task: TaskRow }) {
-  const { me, can, canEditTask, privileged } = useCan()
+  const { me, can, canEditProject, privileged } = useCan()
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
   const { data: project } = useLiveQuery({
     query: (q) =>
@@ -57,7 +57,8 @@ function TaskBody({ task }: { task: TaskRow }) {
             className="input w-44"
             aria-label="Assignee"
             value={task.assigneeId ?? ''}
-            disabled={!canEditTask(project, task)}
+            // the assignee may move their task, but only project editors may reassign it (server rule)
+            disabled={!project || !canEditProject(project)}
             onChange={(e) =>
               tasksCollection
                 .update(task.id, (d) => void (d.assigneeId = e.target.value ? Number(e.target.value) : null))

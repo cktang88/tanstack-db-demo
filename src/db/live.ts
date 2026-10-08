@@ -1,12 +1,12 @@
 import {
   BY_ENTITY,
+  DERIVE,
   eventsByCategory,
   FEED_PAGERS,
   isSyncing,
   queryClient,
-  withCustomerDerived,
-  withInvoiceDerived,
   type EventCategory,
+  type SyncUtils as Utils,
 } from './collections'
 
 // Server-sent change feed -> direct writes into the synced store.
@@ -22,12 +22,6 @@ type Change =
   | { kind: 'delete'; entity: string; id: number | string }
   | { kind: 'reset' }
 
-const DERIVE: Record<string, (row: any) => any> = { customers: withCustomerDerived, invoices: withInvoiceDerived }
-type Utils = {
-  writeUpsert: (row: unknown) => Promise<void>
-  writeDelete: (id: number | string) => Promise<void>
-  refetch: () => Promise<unknown>
-}
 type AnyCollection = (typeof BY_ENTITY)[string]
 
 const serverCollections = () => [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)]

@@ -3,7 +3,8 @@ import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
 import { RouterProvider } from '@tanstack/react-router'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { queryClient, setUnauthorizedHandler } from './db/collections'
+import { queryClient } from './db/collections'
+import { onUnauthorized } from './lib/api'
 import { clearSession, isUnauthorized } from './lib/auth'
 import { makeRouter } from './router'
 import './styles.css'
@@ -19,11 +20,11 @@ const on401 = (e: unknown) => {
   if (pathname === '/login') return
   signingOut = true
   void clearSession(queryClient)
-    .then(() => router.navigate({ to: '/login', search: { redirect: href } }))
+    .then(() => router.navigate({ to: '/login', search: { redirect: href }, replace: true }))
     .finally(() => (signingOut = false))
 }
-queryClient.getQueryCache().subscribe((ev) => ev.type === 'updated' && ev.action.type === 'error' && on401(ev.action.error))
-setUnauthorizedHandler(on401)
+// every request goes through lib/api — reads, collection loads, batch writes and one-off calls
+onUnauthorized(on401)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

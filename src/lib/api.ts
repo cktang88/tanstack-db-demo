@@ -27,6 +27,12 @@ export function toSearch(params: QueryParams = {}): string {
   return s ? `?${s}` : ''
 }
 
+let unauthorized: ((e: HttpError) => void) | undefined
+/** Called for every 401 except a failed sign-in: the session expired or was revoked. */
+export function onUnauthorized(fn: (e: HttpError) => void) {
+  unauthorized = fn
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -40,7 +46,9 @@ async function request<T>(
   })
   if (!res.ok) {
     const body = (await res.json().catch(() => undefined)) as ApiError | undefined
-    throw new HttpError(res.status, body)
+    const error = new HttpError(res.status, body)
+    if (res.status === 401 && path !== '/auth/login') unauthorized?.(error)
+    throw error
   }
   if (res.status === 204) return undefined as T
   return (await res.json()) as T

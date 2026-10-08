@@ -30,7 +30,7 @@ import {
 } from './db/collections'
 import { startLiveSync } from './db/live'
 import { HttpError } from './lib/api'
-import { meQuery } from './lib/auth'
+import { isUnauthorized, meQuery } from './lib/auth'
 import { auditSearch, customersSearch, invoicesSearch } from './lib/search'
 import { ActivityPage } from './routes/activity'
 import { AnalyticsPage } from './routes/analytics'
@@ -77,8 +77,13 @@ const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: 'app',
   beforeLoad: async ({ context: { queryClient }, location }) => {
-    const me = await queryClient.query(meQuery()).catch(() => null)
-    if (!me) throw redirect({ to: '/login', search: { redirect: location.href } })
+    // cached session is enough to navigate ('static': never block on a refetch); only a
+    // 401 means signed out — a 5xx or a network error goes to the error boundary instead
+    const me = await queryClient.query({ ...meQuery(), staleTime: 'static' }).catch((e: unknown) => {
+      if (isUnauthorized(e)) return null
+      throw e
+    })
+    if (!me) throw redirect({ to: '/login', search: { redirect: location.href }, replace: true })
     // idempotent per user: opens (or switches) the per-user change feed
     startLiveSync(me.user.id)
     claimClientState(me.user.id)
