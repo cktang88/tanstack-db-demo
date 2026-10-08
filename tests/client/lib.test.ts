@@ -57,6 +57,11 @@ describe('search param validators', () => {
     })
     expect(s).toMatchObject({ page: 1, pageSize: 25, sort: '-createdAt', status: ['active'], plan: ['pro'] })
   })
+  it('accepts multi-column sorts', () => {
+    expect(customersSearch({ sort: '-createdAt,company' }).sort).toBe('-createdAt,company')
+    expect(invoicesSearch({ sort: 'status,-amount' }).sort).toBe('status,-amount')
+    expect(customersSearch({ sort: 'company,' }).sort).toBe('-createdAt')
+  })
   it('validates invoice dates', () => {
     expect(invoicesSearch({ issuedFrom: '2026-01-01', issuedTo: 'yesterday' })).toMatchObject({
       issuedFrom: '2026-01-01',
