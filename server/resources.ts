@@ -467,9 +467,11 @@ export const resources: Record<string, Resource> = {
     },
     virtual: { customer: t('(SELECT customers.company FROM customers WHERE customers.id = invoices.customer_id)') },
     search: ['number', 'customer'],
+    // the customer's *company* only (a column filter): the index also holds name and email,
+    // which the LIKE search over `customer` never matched
     fullText: (term) => ({
       sql: `(number LIKE ? ESCAPE '\\' OR customer_id IN (SELECT rowid FROM customers_fts WHERE customers_fts MATCH ?))`,
-      params: [likeAny(term), ftsPhrase(term)],
+      params: [likeAny(term), `company : ${ftsPhrase(term)}`],
     }),
     summable: ['amount'],
     defaultSort: '-issuedAt',

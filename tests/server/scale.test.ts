@@ -35,16 +35,36 @@ describe('trigram full-text search', () => {
     },
   )
 
-  it('invoices ?q= matches the number or the customer company', async () => {
-    const term = 'labs'
-    const expected = all<{ id: number }>(
+  /** what the LIKE search over invoices returns: the number or the customer company */
+  const invoicesByLike = (term: string) =>
+    all<{ id: number }>(
       `SELECT i.id FROM invoices i JOIN customers c ON c.id = i.customer_id
        WHERE c.deleted_at IS NULL AND (i.number LIKE @t ESCAPE '\\' OR c.company LIKE @t ESCAPE '\\') ORDER BY i.id`,
       { t: like(term) },
     ).map((r) => r.id)
+
+  it('invoices ?q= matches the number or the customer company', async () => {
+    const term = 'labs'
+    const expected = invoicesByLike(term)
     expect(expected.length).toBeGreaterThan(0)
     const res = await owner.get<Page<Invoice>>(`/invoices?q=${term}&limit=10000`)
     expect(ids(res)).toEqual(expected)
+  })
+
+  it("invoices ?q= does not match the customer's name or email (the index holds them too)", async () => {
+    // a contact's last name that no company contains: the LIKE search finds none of their invoices
+    const [{ term }] = all<{ term: string }>(
+      `SELECT lower(substr(c.name, instr(c.name, ' ') + 1)) AS term FROM customers c
+       WHERE c.deleted_at IS NULL AND length(substr(c.name, instr(c.name, ' ') + 1)) >= 4
+         AND NOT EXISTS (SELECT 1 FROM customers o WHERE o.company LIKE '%' || substr(c.name, instr(c.name, ' ') + 1) || '%')
+       LIMIT 1`,
+    ) as [{ term: string }]
+    const expected = invoicesByLike(term)
+    for (const t of [term, term.toUpperCase(), 'example.com', '@']) {
+      const res = await owner.get<Page<Invoice>>(`/invoices?q=${encodeURIComponent(t)}&limit=10000`)
+      expect(ids(res)).toEqual(invoicesByLike(t))
+    }
+    expect(expected).toEqual([])
   })
 
   it('follows inserts and renames (the index is kept in sync by triggers)', async () => {
