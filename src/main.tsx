@@ -5,7 +5,6 @@ import { RouterProvider } from '@tanstack/react-router'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { HttpError } from './lib/api'
-import { startLiveUpdates } from './lib/live'
 import { makeRouter } from './router'
 import './styles.css'
 
@@ -41,7 +40,6 @@ function signedOut() {
 }
 
 const router = makeRouter(queryClient)
-startLiveUpdates(queryClient)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

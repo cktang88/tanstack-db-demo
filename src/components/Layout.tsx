@@ -1,9 +1,10 @@
 import { Link, Outlet, useRouterState } from '@tanstack/react-router'
-import { useIsFetching, useIsMutating, useQuery } from '@tanstack/react-query'
+import { useIsFetching, useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import type { Permission } from '../../shared/domain'
 import { useCan, useLogout } from '../lib/auth'
 import { relative } from '../lib/format'
+import { startLiveUpdates } from '../lib/live'
 import { useMarkNotificationsRead } from '../lib/mutations'
 import { notificationsQuery } from '../lib/queries'
 import { useSettings } from '../lib/settings'
@@ -121,9 +122,17 @@ function GlobalStatus() {
   )
 }
 
+/** Server-sent change feed for the signed-in user; reopened when the user changes. */
+function useLiveUpdates(userId: number) {
+  const qc = useQueryClient()
+  useEffect(() => startLiveUpdates(qc), [qc, userId])
+}
+
 export function Layout() {
   const [settings, setSettings] = useSettings()
   const nav = useNav()
+  const { me } = useCan()
+  useLiveUpdates(me.user.id)
   return (
     <div className="flex min-h-screen">
       <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-zinc-200 bg-white px-3 py-4 md:flex dark:border-zinc-800 dark:bg-zinc-900">
