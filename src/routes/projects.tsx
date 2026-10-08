@@ -1,10 +1,12 @@
 import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { useDeferredValue, useMemo, useState } from 'react'
-import { PROJECT_STATUSES, type ProjectStatus } from '../../shared/domain'
+import { PROJECT_STATUSES, type ProjectStatus, type Task } from '../../shared/domain'
 import { Avatar, Badge, ChipFilter, Empty, PageHeader } from '../components/ui'
 import { date } from '../lib/format'
-import { projectStatsQuery, projectsQuery, usersQuery } from '../lib/queries'
+import { nextUpTasksQuery, projectStatsQuery, projectsQuery, usersQuery } from '../lib/queries'
+
+const NO_TASKS = new Map<number, Task[]>()
 
 export function ProjectsPage() {
   const { data: projects } = useSuspenseQuery(projectsQuery())
@@ -12,6 +14,8 @@ export function ProjectsPage() {
   // progress comes from a separate SQL view endpoint; stitched together client-side
   const { data: stats = [] } = useQuery(projectStatsQuery())
   const statsById = useMemo(() => new Map(stats.map((s) => [s.projectId, s])), [stats])
+  // "next up" per project: ONE query of every open task, grouped client-side
+  const { data: nextUp = NO_TASKS } = useQuery(nextUpTasksQuery())
   const [q, setQ] = useState('')
   const [status, setStatus] = useState<ProjectStatus[]>([])
   const deferredQ = useDeferredValue(q)
@@ -63,8 +67,16 @@ export function ProjectsPage() {
                   <Badge value={p.status} />
                 </div>
                 <p className="mt-1 line-clamp-2 text-sm text-zinc-500">{p.description}</p>
+                <ul className="mt-3 space-y-1 text-xs text-zinc-600 dark:text-zinc-400">
+                  {(nextUp.get(p.id) ?? []).map((t) => (
+                    <li key={t.id} className="flex items-center justify-between gap-2">
+                      <span className="truncate">→ {t.title}</span>
+                      <Badge value={t.priority} />
+                    </li>
+                  ))}
+                </ul>
                 <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
-                  <div className="h-full rounded-full bg-brand-500" style={{ width: `${pct}%` }} />
+                  <div className="h-full rounded-full bg-brand-500 transition-all" style={{ width: `${pct}%` }} />
                 </div>
                 <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
                   <span data-testid="project-progress">
