@@ -123,7 +123,10 @@ function PaymentLedger() {
   const invoiceIds = useMemo(() => distinctIds(rows.map((r) => r.invoiceId)), [rows])
   const customerIds = useMemo(() => distinctIds(rows.map((r) => r.customerId)), [rows])
   const { data: invoices = NO_INVOICES } = useQuery(invoicesByIdsQuery(invoiceIds))
-  const { data: customers = NO_CUSTOMERS } = useQuery(customersByIdsQuery(customerIds))
+  const customersQuery = useQuery(customersByIdsQuery(customerIds))
+  const customers = customersQuery.data ?? NO_CUSTOMERS
+  // a row the settled lookup did not return belongs to an archived (no longer served) customer
+  const lookedUp = customersQuery.isSuccess && !customersQuery.isPlaceholderData
   const columns = useMemo(
     () =>
       col.columns([
@@ -147,7 +150,7 @@ function PaymentLedger() {
                 {customers.get(i.getValue())!.company}
               </Link>
             ) : (
-              <span className="text-zinc-400">#{i.getValue()}</span>
+              <span className="text-zinc-400">{lookedUp ? `archived #${i.getValue()}` : '…'}</span>
             ),
         }),
         col.accessor('method', {
@@ -161,7 +164,7 @@ function PaymentLedger() {
           cell: (i) => <span className="tabular-nums">{money(i.getValue())}</span>,
         }),
       ]),
-    [invoices, customers],
+    [invoices, customers, lookedUp],
   )
   return (
     <DataTable
