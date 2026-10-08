@@ -11,18 +11,35 @@ await page.request.post(`${base}/api/dev/reset`, { data: {} })
 await page.request.put(`${base}/api/dev/chaos`, { data: { latencyMs: 150, failRate: 0 } })
 
 let reqs = []
+let bytes = 0
+const isApi = (url) => {
+  const u = new URL(url)
+  return u.pathname.startsWith('/api/') && !u.pathname.endsWith('/stream')
+}
 page.on('request', (r) => {
-  const u = new URL(r.url())
-  if (u.pathname.startsWith('/api/') && !u.pathname.endsWith('/stream')) reqs.push(`${r.method()} ${u.pathname}`)
+  if (isApi(r.url())) reqs.push(`${r.method()} ${new URL(r.url()).pathname}`)
+})
+// response body bytes of API calls (what the data layer actually downloads)
+page.on('requestfinished', async (r) => {
+  if (!isApi(r.url())) return
+  const sizes = await r.sizes().catch(() => null)
+  if (sizes) bytes += sizes.responseBodySize
 })
 const results = []
 async function step(name, fn) {
   reqs = []
+  bytes = 0
   const t = performance.now()
   await fn()
   const ms = Math.round(performance.now() - t)
   await page.waitForTimeout(600) // let trailing background refetches show up
-  results.push({ step: name, 'ui ready (ms)': ms, requests: reqs.length, detail: [...new Set(reqs)].join(' ') })
+  results.push({
+    step: name,
+    'ui ready (ms)': ms,
+    requests: reqs.length,
+    kB: Math.round(bytes / 1024),
+    detail: [...new Set(reqs)].join(' '),
+  })
 }
 const nav = (label) => page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: label }).click()
 const table = page.getByTestId('customers-table')
@@ -152,5 +169,7 @@ console.log(
   total,
   ' TOTAL ui ms:',
   results.reduce((s, r) => s + r['ui ready (ms)'], 0),
+  ' TOTAL kB:',
+  results.reduce((s, r) => s + r.kB, 0),
 )
 await browser.close()
