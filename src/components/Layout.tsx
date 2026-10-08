@@ -12,6 +12,7 @@ import {
   usersCollection,
   type CustomerRow,
 } from '../db/collections'
+import { markAllNotificationsRead } from '../db/actions'
 import { usePrefs } from '../db/hooks'
 import { money, number, relative } from '../lib/format'
 import { toast } from '../lib/toast'
@@ -56,12 +57,10 @@ function Notifications() {
     document.addEventListener('click', close)
     return () => document.removeEventListener('click', close)
   }, [])
-  const markAll = () => {
-    const ids = data.filter((n) => !n.readAt).map((n) => n.id)
-    if (!ids.length) return
-    // one transaction, one batch request, instant badge update
-    notificationsCollection.update(ids, (drafts) => drafts.forEach((d) => (d.readAt = new Date().toISOString())))
-  }
+  const markAll = () =>
+    markAllNotificationsRead()
+      .when('settled')
+      .catch((e: Error) => toast.error('Could not mark notifications read — restored', e.message))
   const count_ = unread?.n ?? 0
   return (
     <div className="relative" ref={ref}>
@@ -92,7 +91,12 @@ function Notifications() {
                   {!n.readAt && (
                     <button
                       className="text-xs text-zinc-400 hover:text-zinc-700"
-                      onClick={() => notificationsCollection.update(n.id, (d) => void (d.readAt = new Date().toISOString()))}
+                      onClick={() =>
+                        notificationsCollection
+                          .update(n.id, (d) => void (d.readAt = new Date().toISOString()))
+                          .when('settled')
+                          .catch((e: Error) => toast.error('Could not mark notification read', e.message))
+                      }
                       aria-label="Mark read"
                     >
                       ✓

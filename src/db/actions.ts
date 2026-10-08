@@ -7,7 +7,9 @@ import {
   customersCollection,
   eventsCollection,
   invoicesCollection,
+  isSyncing,
   newId,
+  notificationsCollection,
   paymentsCollection,
   persist,
   productsCollection,
@@ -253,3 +255,23 @@ export function cancelSubscription(sub: Subscription) {
   })
   return tx
 }
+
+/**
+ * Mark every unread notification read — all of them, not just the rows a
+ * list happens to show. The collection holds all of the user's
+ * notifications, so the optimistic patch covers everything; the server does
+ * the same in one statement (POST /notifications/read-all) rather than a
+ * batch of per-row updates.
+ */
+export const markAllNotificationsRead = createOptimisticAction<void>({
+  onMutate: () => {
+    const now = new Date().toISOString()
+    const ids = notificationsCollection.toArray.filter((n) => !n.readAt).map((n) => n.id)
+    if (ids.length) notificationsCollection.update(ids, (drafts) => drafts.forEach((d) => (d.readAt = now)))
+  },
+  mutationFn: async () => {
+    await api.post('/notifications/read-all', {})
+    // land the server's read_at values before the optimistic ones are dropped (one request)
+    if (isSyncing(notificationsCollection)) await notificationsCollection.utils.refetch()
+  },
+})
