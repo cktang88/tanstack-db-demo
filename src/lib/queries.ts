@@ -1,5 +1,23 @@
 import { infiniteQueryOptions, keepPreviousData, mutationOptions, queryOptions } from '@tanstack/react-query'
 import type {
+  Contact,
+  CustomerBalance,
+  CustomerHealth,
+  CustomerTag,
+  InvoiceLineItem,
+  MrrSnapshot,
+  Notification,
+  Payment,
+  Product,
+  ProjectStats,
+  RoleRow,
+  Subscription,
+  Tag,
+  TaskComment,
+  Team,
+  TeamMember,
+  TimeEntry,
+  UsageDaily,
   ActivityEvent,
   BreakdownPoint,
   Customer,
@@ -274,3 +292,84 @@ export const workloadQuery = () =>
   })
 
 export { mutationOptions }
+
+// ----------------------------------------------------------------------------
+// Generic resource lists (every table is exposed through the same grammar).
+// Keys are [resource, 'list', params] so a whole resource can be invalidated.
+// ----------------------------------------------------------------------------
+export const resourceList = <T>(resource: string, params: QueryParams = {}, opts: { staleTime?: number } = {}) =>
+  queryOptions({
+    queryKey: [resource, 'list', params] as const,
+    queryFn: ({ signal }) => api.get<Page<T>>(`/${resource}`, { limit: 1000, ...params }, signal),
+    select: (p: Page<T>) => p.data,
+    staleTime: opts.staleTime ?? STALE,
+  })
+
+export const resourcePage = <T>(resource: string, params: QueryParams) =>
+  queryOptions({
+    queryKey: [resource, 'page', params] as const,
+    queryFn: ({ signal }) => api.get<Page<T>>(`/${resource}`, params, signal),
+    placeholderData: keepPreviousData,
+    staleTime: STALE,
+  })
+
+export const resourceItem = <T>(resource: string, id: number | string) =>
+  queryOptions({
+    queryKey: [resource, 'item', id] as const,
+    queryFn: ({ signal }) => api.get<T>(`/${resource}/${id}`, undefined, signal),
+    staleTime: STALE,
+  })
+
+export const projectStatsQuery = () => resourceList<ProjectStats>('project-stats')
+export const productsQuery = () => resourceList<Product>('products', { sort: 'id' }, { staleTime: 5 * 60_000 })
+export const tagsQuery = () => resourceList<Tag>('tags', { sort: 'name' }, { staleTime: 5 * 60_000 })
+export const teamsQuery = () => resourceList<Team>('teams', { sort: 'name' }, { staleTime: 5 * 60_000 })
+export const teamMembersQuery = () => resourceList<TeamMember>('team-members')
+export const rolesQuery = () => resourceList<RoleRow>('roles', { sort: 'rank' }, { staleTime: Infinity })
+export const rolePermissionsQuery = () =>
+  resourceList<{ id: string; roleId: string; permissionId: string }>('role-permissions', {}, { staleTime: Infinity })
+export const permissionsQuery = () =>
+  resourceList<{ id: string; description: string }>('permissions', {}, { staleTime: Infinity })
+
+export const customerContactsQuery = (customerId: number) => resourceList<Contact>('contacts', { customerId, sort: '-isPrimary' })
+export const customerTagsQuery = (customerId: number) => resourceList<CustomerTag>('customer-tags', { customerId })
+export const customerSubscriptionsQuery = (customerId: number) =>
+  resourceList<Subscription>('subscriptions', { customerId, sort: 'id' })
+export const customerBalanceQuery = (customerId: number) =>
+  queryOptions({
+    queryKey: ['customer-balances', 'item', customerId],
+    queryFn: ({ signal }) => api.get<CustomerBalance>(`/customer-balances/${customerId}`, undefined, signal).catch(() => null),
+  })
+export const customerHealthQuery = (customerId: number) =>
+  queryOptions({
+    queryKey: ['customer-health', 'item', customerId],
+    queryFn: ({ signal }) => api.get<CustomerHealth>(`/customer-health/${customerId}`, undefined, signal).catch(() => null),
+  })
+export const customerUsageQuery = (customerId: number, metric = 'api_calls') =>
+  resourceList<UsageDaily>('usage-daily', { customerId, metric, sort: 'day' })
+
+export const invoiceLineItemsQuery = (invoiceId: number) => resourceList<InvoiceLineItem>('invoice-line-items', { invoiceId })
+export const invoicePaymentsQuery = (invoiceId: number) => resourceList<Payment>('payments', { invoiceId, sort: 'receivedAt' })
+
+export const taskCommentsQuery = (taskId: number) => resourceList<TaskComment>('task-comments', { taskId, sort: 'createdAt' })
+export const taskTimeQuery = (taskId: number) => resourceList<TimeEntry>('time-entries', { taskId, sort: '-spentOn' })
+
+export const mrrSnapshotsQuery = () => resourceList<MrrSnapshot>('mrr-snapshots', { sort: 'month' })
+export const arAgingQuery = () =>
+  queryOptions({
+    queryKey: ['metrics', 'ar-aging'],
+    queryFn: ({ signal }) =>
+      api.get<Array<{ bucket: string; invoices: number; amount: number }>>('/metrics/ar-aging', undefined, signal),
+    staleTime: STALE,
+  })
+
+export const notificationsQuery = () =>
+  queryOptions({
+    queryKey: ['notifications', 'list'],
+    queryFn: ({ signal }) => api.get<Page<Notification>>('/notifications', { limit: 30, sort: '-createdAt' }, signal),
+    select: (p) => p.data,
+    refetchInterval: 30_000,
+  })
+
+export const sessionsQuery = () =>
+  resourceList<{ id: number; userId: number; createdAt: string; expiresAt: string; userAgent: string | null }>('sessions')

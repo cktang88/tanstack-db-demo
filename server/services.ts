@@ -1,23 +1,39 @@
-import { Context, Effect, Layer, Ref, Schema } from 'effect'
-import type { ActivityEvent } from '../shared/domain.ts'
+import { Context, Effect, Layer, Ref, Schema, Semaphore } from 'effect'
+import type { Me, Permission } from '../shared/domain.ts'
 import type { ChaosConfig } from '../shared/schemas.ts'
 import { openDatabase, type DB } from './db/schema.ts'
 import { seed } from './db/seed.ts'
 import { BadQuery } from './db/sql.ts'
 
 // ---------------------------------------------------------------------------
-// Typed errors. Every failure mode of a request is visible in the Effect type.
+// Typed errors. Every failure mode of a request is visible in the Effect type
+// and mapped to exactly one HTTP status at the edge (see app.ts).
 // ---------------------------------------------------------------------------
-export class NotFound extends Schema.TaggedError<NotFound>()('NotFound', { entity: Schema.String, id: Schema.Number }) {}
+export class NotFound extends Schema.TaggedError<NotFound>()('NotFound', { entity: Schema.String, id: Schema.Unknown }) {}
 export class BadRequest extends Schema.TaggedError<BadRequest>()('BadRequest', { message: Schema.String }) {}
+export class Unauthorized extends Schema.TaggedError<Unauthorized>()('Unauthorized', { message: Schema.String }) {}
+export class Forbidden extends Schema.TaggedError<Forbidden>()('Forbidden', { message: Schema.String }) {}
+export class Conflict extends Schema.TaggedError<Conflict>()('Conflict', { message: Schema.String }) {}
+export class MethodNotAllowed extends Schema.TaggedError<MethodNotAllowed>()('MethodNotAllowed', { message: Schema.String }) {}
 export class DbError extends Schema.TaggedError<DbError>()('DbError', { cause: Schema.Defect() }) {}
 export class SimulatedFailure extends Schema.TaggedError<SimulatedFailure>()('SimulatedFailure', {}) {}
 
-export type AppError = NotFound | BadRequest | DbError | SimulatedFailure | Schema.SchemaError
+export type AppError =
+  | NotFound
+  | BadRequest
+  | Unauthorized
+  | Forbidden
+  | Conflict
+  | MethodNotAllowed
+  | DbError
+  | SimulatedFailure
+  | Schema.SchemaError
 
 // ---------------------------------------------------------------------------
 // Sqlite: the database handle as a scoped resource (closed on dispose).
 // ---------------------------------------------------------------------------
+export const SCHEMA_VERSION = 2
+
 export interface SqliteConfig {
   file: string
   seed?: boolean
@@ -31,8 +47,11 @@ export class Sqlite extends Context.Service<Sqlite, DB>()('app/Sqlite') {
       Effect.acquireRelease(
         Effect.sync(() => {
           const db = openDatabase(config.file)
-          const empty = (db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n === 0
-          if (config.seed || empty) seed(db, config.seedOptions)
+          const version = db.pragma('user_version', { simple: true }) as number
+          if (config.seed || version !== SCHEMA_VERSION) {
+            seed(db, config.seedOptions)
+            db.pragma(`user_version = ${SCHEMA_VERSION}`)
+          }
           return db
         }),
         (db) => Effect.sync(() => db.close()),
@@ -44,12 +63,72 @@ export class Sqlite extends Context.Service<Sqlite, DB>()('app/Sqlite') {
 export const sql = <A>(f: () => A) =>
   Effect.try({
     try: f,
-    catch: (cause) =>
-      cause instanceof BadQuery
-        ? new BadRequest({ message: cause.message })
-        : String((cause as { code?: string })?.code).startsWith('SQLITE_CONSTRAINT')
-          ? new BadRequest({ message: (cause as Error).message })
-          : new DbError({ cause }),
+    catch: (cause) => {
+      if (cause instanceof BadQuery) return new BadRequest({ message: cause.message })
+      if (cause instanceof DomainError) return cause.error
+      const code = String((cause as { code?: string })?.code)
+      const message = (cause as Error).message
+      if (code === 'SQLITE_CONSTRAINT_TRIGGER') return new Conflict({ message }) // append-only tables etc.
+      if (code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return new Conflict({ message })
+      if (code.startsWith('SQLITE_CONSTRAINT')) return new BadRequest({ message })
+      return new DbError({ cause })
+    },
+  })
+
+/** Lets synchronous code inside a SQL transaction throw a typed error. */
+export class DomainError extends Error {
+  constructor(readonly error: NotFound | BadRequest | Forbidden | Conflict | MethodNotAllowed) {
+    super(error.message)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Writer: SQLite has one writer. All write programs run through a 1-permit
+// semaphore inside BEGIN IMMEDIATE ... COMMIT/ROLLBACK, so a multi-step Effect
+// (validate -> authorize -> write -> audit) is atomic and never interleaves
+// with another request's writes.
+// ---------------------------------------------------------------------------
+export class Writer extends Context.Service<
+  Writer,
+  { transaction: <A, E, R>(program: Effect.Effect<A, E, R>) => Effect.Effect<A, E | AppError, R> }
+>()('app/Writer') {
+  static layer = Layer.effect(
+    Writer,
+    Effect.gen(function* () {
+      const db = yield* Sqlite
+      const lock = yield* Semaphore.make(1)
+      return Writer.of({
+        transaction: (program) =>
+          lock.withPermits(1)(
+            Effect.acquireUseRelease(
+              sql(() => db.exec('BEGIN IMMEDIATE')),
+              () => program,
+              (_, exit) => Effect.sync(() => db.exec(exit._tag === 'Success' ? 'COMMIT' : 'ROLLBACK')),
+            ),
+          ),
+      })
+    }),
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Request-scoped services: who is calling, and a request id for the audit log.
+// ---------------------------------------------------------------------------
+export interface Principal extends Me {
+  can: (p: Permission) => boolean
+  /** owners/admins bypass row-level ownership rules */
+  privileged: boolean
+}
+
+export class CurrentUser extends Context.Service<CurrentUser, Principal>()('app/CurrentUser') {}
+export class RequestId extends Context.Service<RequestId, string>()('app/RequestId') {}
+
+/** Fail with 403 (and record the denial in the audit log) unless the caller has `permission`. */
+export const requirePermission = (permission: Permission) =>
+  Effect.gen(function* () {
+    const me = yield* CurrentUser
+    if (!me.can(permission)) return yield* new Forbidden({ message: `Missing permission ${permission}` })
+    return me
   })
 
 // ---------------------------------------------------------------------------
@@ -85,10 +164,9 @@ export class Chaos extends Context.Service<
 // ---------------------------------------------------------------------------
 // ChangeFeed: in-process pub/sub that powers the SSE stream.
 // ---------------------------------------------------------------------------
-export type Entity = 'customers' | 'invoices' | 'projects' | 'tasks' | 'users' | 'events'
 export type ChangeMessage =
-  | { kind: 'upsert'; entity: Entity; row: { id: number } & Record<string, unknown> }
-  | { kind: 'delete'; entity: Entity; id: number }
+  | { kind: 'upsert'; entity: string; row: { id: number | string } & Record<string, unknown> }
+  | { kind: 'delete'; entity: string; id: number | string }
   | { kind: 'reset' }
 
 export class ChangeFeed extends Context.Service<
@@ -112,6 +190,3 @@ export class ChangeFeed extends Context.Service<
     })
   })
 }
-
-export const publishEvent = (e: ActivityEvent) =>
-  ChangeFeed.use((f) => f.publish({ kind: 'upsert', entity: 'events', row: e as unknown as { id: number } }))

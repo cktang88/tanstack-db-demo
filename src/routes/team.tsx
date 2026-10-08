@@ -4,10 +4,21 @@ import { ROLES, type Role, type User } from '../../shared/domain'
 import { Avatar, Badge, Card, Empty, PageHeader, Segmented, Skeleton } from '../components/ui'
 import { date, titleCase } from '../lib/format'
 import { useUpdateUser } from '../lib/mutations'
-import { assigneeTasksQuery, usersQuery, workloadQuery } from '../lib/queries'
+import {
+  assigneeTasksQuery,
+  permissionsQuery,
+  rolePermissionsQuery,
+  rolesQuery,
+  teamMembersQuery,
+  teamsQuery,
+  usersQuery,
+  workloadQuery,
+} from '../lib/queries'
+import { useCan } from '../lib/auth'
+import { useTeamMembership } from '../lib/mutations'
 
 export function TeamPage() {
-  const [tab, setTab] = useState<'members' | 'workload'>('members')
+  const [tab, setTab] = useState<'members' | 'teams' | 'roles' | 'workload'>('members')
   const [selected, setSelected] = useState<number | null>(null)
   return (
     <>
@@ -21,6 +32,8 @@ export function TeamPage() {
             onChange={setTab}
             options={[
               { value: 'members', label: 'Members' },
+              { value: 'teams', label: 'Teams' },
+              { value: 'roles', label: 'Roles' },
               { value: 'workload', label: 'Workload' },
             ]}
           />
@@ -32,6 +45,12 @@ export function TeamPage() {
           <Members selected={selected} onSelect={setSelected} />
           <MemberTasks userId={selected} />
         </div>
+      </Activity>
+      <Activity mode={tab === 'teams' ? 'visible' : 'hidden'}>
+        <Teams />
+      </Activity>
+      <Activity mode={tab === 'roles' ? 'visible' : 'hidden'}>
+        <RolesMatrix />
       </Activity>
       <Activity mode={tab === 'workload' ? 'visible' : 'hidden'}>
         <Workload />
@@ -55,6 +74,7 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
 
 function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean; onSelect: () => void }) {
   const update = useUpdateUser()
+  const canManage = useCan().can('team:manage')
   // React 19 useOptimistic: the select shows the new role immediately during the transition
   const [role, setOptimisticRole] = useOptimistic(user.role)
   const [, startTransition] = useTransition()
@@ -77,7 +97,7 @@ function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean
         className="input w-28"
         aria-label={`Role for ${user.name}`}
         value={role}
-        disabled={user.role === 'owner'}
+        disabled={user.role === 'owner' || !canManage}
         onChange={(e) => {
           const next = e.target.value as Role
           startTransition(async () => {
@@ -151,6 +171,114 @@ function Workload() {
           </li>
         ))}
       </ul>
+    </Card>
+  )
+}
+
+function Teams() {
+  const { data: teams = [] } = useQuery(teamsQuery())
+  const { data: members = [] } = useQuery(teamMembersQuery())
+  const { data: users = [] } = useQuery(usersQuery())
+  const toggle = useTeamMembership()
+  const canManage = useCan().can('team:manage')
+  const byId = new Map(users.map((u) => [u.id, u]))
+  return (
+    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3" data-testid="teams">
+      {teams.map((t) => {
+        const ids = members.filter((m) => m.teamId === t.id).map((m) => m.userId)
+        const lead = t.leadId ? byId.get(t.leadId) : undefined
+        return (
+          <Card key={t.id} title={`${t.name} (${ids.length})`}>
+            <p className="mb-3 text-xs text-zinc-500">
+              {t.description}
+              {lead && ` · lead: ${lead.name}`}
+            </p>
+            <ul className="flex flex-wrap gap-1.5">
+              {ids.map((id) => {
+                const u = byId.get(id)
+                return u ? (
+                  <li
+                    key={id}
+                    className="flex items-center gap-1 rounded-full bg-zinc-100 py-0.5 pr-2 pl-0.5 text-xs dark:bg-zinc-800"
+                  >
+                    <Avatar name={u.name} color={u.avatarColor} size={18} /> {u.name}
+                    {canManage && (
+                      <button
+                        aria-label={`Remove ${u.name} from ${t.name}`}
+                        className="text-zinc-400 hover:text-red-600"
+                        onClick={() => toggle.mutate({ teamId: t.id, userId: id, member: true })}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </li>
+                ) : null
+              })}
+            </ul>
+            {canManage && (
+              <select
+                className="input mt-3"
+                aria-label={`Add member to ${t.name}`}
+                value=""
+                onChange={(e) => e.target.value && toggle.mutate({ teamId: t.id, userId: Number(e.target.value), member: false })}
+              >
+                <option value="">+ Add member…</option>
+                {users
+                  .filter((u) => !ids.includes(u.id))
+                  .map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name}
+                    </option>
+                  ))}
+              </select>
+            )}
+          </Card>
+        )
+      })}
+    </div>
+  )
+}
+
+function RolesMatrix() {
+  const { data: roles = [] } = useQuery(rolesQuery())
+  const { data: perms = [] } = useQuery(permissionsQuery())
+  const { data: grants = [] } = useQuery(rolePermissionsQuery())
+  const granted = new Set(grants.map((g) => g.id))
+  return (
+    <Card title="Role → permission matrix (role_permissions)">
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm" data-testid="roles-matrix">
+          <thead>
+            <tr>
+              <th className="th">Permission</th>
+              {roles.map((r) => (
+                <th key={r.id} className="th text-center">
+                  {r.name}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+            {perms.map((p) => (
+              <tr key={p.id}>
+                <td className="td">
+                  <div className="font-mono text-xs">{p.id}</div>
+                  <div className="text-xs text-zinc-500">{p.description}</div>
+                </td>
+                {roles.map((r) => (
+                  <td key={r.id} className="td text-center">
+                    {granted.has(`${r.id}:${p.id}`) ? (
+                      <span className="text-emerald-600">✓</span>
+                    ) : (
+                      <span className="text-zinc-300">—</span>
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </Card>
   )
 }

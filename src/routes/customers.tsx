@@ -11,6 +11,7 @@ import { useBulkUpdateCustomers, useCreateCustomer, useDeleteCustomers } from '.
 import { customerQuery, customersListQuery, usersQuery, type CustomerListParams } from '../lib/queries'
 import { formatSort, parseSort } from '../lib/search'
 import { customersRoute } from '../router'
+import { useCan } from '../lib/auth'
 
 const col = createColumnHelper<ServerFeatures, Customer>()
 const EMPTY: Customer[] = []
@@ -67,6 +68,7 @@ function useColumns(users: User[]) {
 }
 
 export function CustomersPage() {
+  const { can } = useCan()
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
   const qc = useQueryClient()
@@ -100,9 +102,11 @@ export function CustomersPage() {
         title="Customers"
         description="Server-side pagination, sorting and filtering — every interaction is a new API request."
         actions={
-          <button className="btn-primary" onClick={() => setCreating(true)}>
-            + New customer
-          </button>
+          can('customers:write') && (
+            <button className="btn-primary" onClick={() => setCreating(true)}>
+              + New customer
+            </button>
+          )
         }
       />
       <DataTable
@@ -166,27 +170,33 @@ export function CustomersPage() {
             </select>
           </div>
         }
-        bulkActions={(ids, clear) => (
-          <>
-            {CUSTOMER_STATUSES.map((s) => (
-              <button
-                key={s}
-                className="btn-secondary py-1 text-xs"
-                onClick={() => bulk.mutate({ ids, patch: { status: s } }, { onSuccess: clear })}
-              >
-                Mark {s}
-              </button>
-            ))}
-            <button
-              className="btn-danger py-1 text-xs"
-              onClick={() => {
-                if (confirm(`Delete ${ids.length} customers?`)) del.mutate(ids, { onSuccess: clear })
-              }}
-            >
-              Delete
-            </button>
-          </>
-        )}
+        bulkActions={(ids, clear) =>
+          !can('customers:write') ? (
+            <span className="text-zinc-500">read-only</span>
+          ) : (
+            <>
+              {CUSTOMER_STATUSES.map((s) => (
+                <button
+                  key={s}
+                  className="btn-secondary py-1 text-xs"
+                  onClick={() => bulk.mutate({ ids, patch: { status: s } }, { onSuccess: clear })}
+                >
+                  Mark {s}
+                </button>
+              ))}
+              {can('customers:delete') && (
+                <button
+                  className="btn-danger py-1 text-xs"
+                  onClick={() => {
+                    if (confirm(`Archive ${ids.length} customers?`)) del.mutate(ids, { onSuccess: clear })
+                  }}
+                >
+                  Archive
+                </button>
+              )}
+            </>
+          )
+        }
       />
       <Dialog open={creating} onClose={() => setCreating(false)} title="New customer">
         <CustomerForm submitLabel="Create customer" onSubmit={(v) => create.mutateAsync(v)} onDone={() => setCreating(false)} />

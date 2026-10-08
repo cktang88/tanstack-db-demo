@@ -19,7 +19,14 @@ export default defineConfig({
         ? { executablePath: process.env.CHROME_PATH ?? '/opt/pw-browsers/chromium' }
         : {},
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } }],
+  projects: [
+    { name: 'setup', testMatch: /auth\.setup\.ts/ },
+    {
+      name: 'chromium',
+      dependencies: ['setup'],
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 }, storageState: 'e2e/.auth/owner.json' },
+    },
+  ],
   webServer: [
     {
       command: `tsx server/index.ts`,

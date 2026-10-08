@@ -2,6 +2,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useActionState } from 'react'
 import { Card, PageHeader, Segmented } from '../components/ui'
 import { api } from '../lib/api'
+import { useCan } from '../lib/auth'
+import { relative } from '../lib/format'
+import { useRevokeSession } from '../lib/mutations'
+import { sessionsQuery } from '../lib/queries'
 import { useSettings } from '../lib/settings'
 import { toast } from '../lib/toast'
 
@@ -12,6 +16,7 @@ interface Chaos {
 
 export function SettingsPage() {
   const [settings, setSettings] = useSettings()
+  const { can } = useCan()
   return (
     <>
       <PageHeader title="Settings" description="Workspace preferences and developer tools." />
@@ -48,8 +53,9 @@ export function SettingsPage() {
             </label>
           </div>
         </Card>
-        <ChaosCard />
-        <ResetCard />
+        <SessionsCard />
+        {can('admin:dev') && <ChaosCard />}
+        {can('admin:dev') && <ResetCard />}
       </div>
     </>
   )
@@ -110,6 +116,28 @@ function ResetCard() {
       <button className="btn-danger" onClick={() => reset.mutate()} disabled={reset.isPending}>
         {reset.isPending ? 'Resetting…' : 'Reset database'}
       </button>
+    </Card>
+  )
+}
+
+function SessionsCard() {
+  const { data: sessions = [] } = useQuery(sessionsQuery())
+  const revoke = useRevokeSession()
+  return (
+    <Card title="Your sessions">
+      <ul className="space-y-2 text-sm" data-testid="sessions">
+        {sessions.map((s) => (
+          <li key={s.id} className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate">
+              {s.userAgent?.slice(0, 40) ?? 'unknown client'}{' '}
+              <span className="text-xs text-zinc-500">· signed in {relative(s.createdAt)}</span>
+            </span>
+            <button className="btn-ghost text-xs" onClick={() => revoke.mutate(s.id)}>
+              Revoke
+            </button>
+          </li>
+        ))}
+      </ul>
     </Card>
   )
 }

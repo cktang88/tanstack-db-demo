@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient, type QueryClient, type QueryKey } from '@tanstack/react-query'
-import type { Customer, Invoice, Page, Task, User } from '../../shared/domain'
+import type { Customer, Invoice, Page, Payment, Task, User } from '../../shared/domain'
 import { api } from './api'
 import { keys } from './queries'
 import { toast } from './toast'
@@ -151,7 +151,8 @@ export function useMarkInvoicePaid() {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['invoices', 'mark-paid'],
-    mutationFn: (id: number) => api.patch<Invoice>(`/invoices/${id}`, { status: 'paid' }),
+    // paying = appending a payment to the ledger for the outstanding remainder
+    mutationFn: (id: number) => api.post(`/invoices/${id}/pay`, { method: 'card' }),
     onMutate: async (id) => {
       const snap = await snapshot(qc, keys.invoices.all)
       patchEverywhere<Invoice>(qc, keys.invoices.all, id, (i) => ({ ...i, status: 'paid', paidAt: new Date().toISOString() }))
@@ -164,11 +165,194 @@ export function useMarkInvoicePaid() {
     onSettled: () =>
       Promise.all([
         qc.invalidateQueries({ queryKey: keys.invoices.all }),
+        qc.invalidateQueries({ queryKey: ['payments'] }),
+        qc.invalidateQueries({ queryKey: ['customer-balances'] }),
+        qc.invalidateQueries({ queryKey: ['customer-health'] }),
         qc.invalidateQueries({ queryKey: keys.metrics.all }),
         qc.invalidateQueries({ queryKey: keys.events.all }),
       ]),
   })
 }
+
+// ----------------------------------------------------------------------------
+// Generic "call the API, then invalidate everything that might be affected".
+// This is the honest default with TanStack Query once a write touches rows
+// that live in many caches (e.g. a payment changes the invoice, the ledger,
+// the balance rollup, health, MRR metrics and the activity feed).
+// ----------------------------------------------------------------------------
+export function useApiAction<V, R = unknown>(opts: {
+  key: string[]
+  fn: (v: V) => Promise<R>
+  invalidate: ReadonlyArray<readonly unknown[]>
+  success?: string | ((r: R, v: V) => string)
+  error: string
+}) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationKey: opts.key,
+    mutationFn: opts.fn,
+    onSuccess: (r, v) => opts.success && toast.success(typeof opts.success === 'function' ? opts.success(r, v) : opts.success),
+    onError: onError(opts.error),
+    onSettled: () => Promise.all(opts.invalidate.map((queryKey) => qc.invalidateQueries({ queryKey: [...queryKey] }))),
+  })
+}
+
+const BILLING_KEYS = [
+  ['invoices'],
+  ['payments'],
+  ['customer-balances'],
+  ['customer-health'],
+  ['subscriptions'],
+  ['customers'],
+  ['mrr-snapshots'],
+  ['metrics'],
+  ['events'],
+] as const
+
+export const useRecordPayment = () =>
+  useApiAction({
+    key: ['payments', 'create'],
+    fn: (v: { invoiceId: number; amount?: number; method: 'card' | 'ach' | 'wire' }) => api.post<Payment>('/payments', v),
+    invalidate: BILLING_KEYS,
+    success: 'Payment recorded',
+    error: 'Could not record payment',
+  })
+
+export const useVoidInvoice = () =>
+  useApiAction({
+    key: ['invoices', 'void'],
+    fn: (id: number) => api.patch(`/invoices/${id}`, { status: 'void' }),
+    invalidate: BILLING_KEYS,
+    success: 'Invoice voided',
+    error: 'Could not void invoice',
+  })
+
+export const useAddSubscription = () =>
+  useApiAction({
+    key: ['subscriptions', 'create'],
+    fn: (v: { customerId: number; productId: number; quantity: number }) => api.post('/subscriptions', v),
+    invalidate: BILLING_KEYS,
+    success: 'Add-on added',
+    error: 'Could not add subscription',
+  })
+
+export const useUpdateSubscription = () =>
+  useApiAction({
+    key: ['subscriptions', 'update'],
+    fn: ({ id, patch }: { id: number; patch: { quantity?: number; status?: string } }) =>
+      api.patch(`/subscriptions/${id}`, patch),
+    invalidate: BILLING_KEYS,
+    success: 'Subscription updated',
+    error: 'Could not update subscription',
+  })
+
+export const useAddContact = () =>
+  useApiAction({
+    key: ['contacts', 'create'],
+    fn: (v: { customerId: number; name: string; email: string; title: string; isPrimary: boolean }) => api.post('/contacts', v),
+    invalidate: [['contacts']],
+    success: 'Contact added',
+    error: 'Could not add contact',
+  })
+
+export const useDeleteContact = () =>
+  useApiAction({
+    key: ['contacts', 'delete'],
+    fn: (id: number) => api.delete(`/contacts/${id}`),
+    invalidate: [['contacts']],
+    error: 'Could not remove contact',
+  })
+
+export const useTagCustomer = () =>
+  useApiAction({
+    key: ['customer-tags', 'create'],
+    fn: (v: { customerId: number; tagId: number }) => api.post('/customer-tags', v),
+    invalidate: [['customer-tags']],
+    error: 'Could not tag customer',
+  })
+
+export const useUntagCustomer = () =>
+  useApiAction({
+    key: ['customer-tags', 'delete'],
+    fn: (id: string) => api.delete(`/customer-tags/${id}`),
+    invalidate: [['customer-tags']],
+    error: 'Could not remove tag',
+  })
+
+export const useAddComment = () =>
+  useApiAction({
+    key: ['task-comments', 'create'],
+    fn: (v: { taskId: number; body: string }) => api.post('/task-comments', v),
+    invalidate: [['task-comments'], ['notifications'], ['events']],
+    error: 'Could not post comment',
+  })
+
+export const useLogTime = () =>
+  useApiAction({
+    key: ['time-entries', 'create'],
+    fn: (v: { taskId: number; minutes: number; spentOn: string; billable: boolean; note: string }) =>
+      api.post('/time-entries', v),
+    invalidate: [['time-entries'], ['project-stats']],
+    success: 'Time logged',
+    error: 'Could not log time',
+  })
+
+export const useDeleteTime = () =>
+  useApiAction({
+    key: ['time-entries', 'delete'],
+    fn: (id: number) => api.delete(`/time-entries/${id}`),
+    invalidate: [['time-entries'], ['project-stats']],
+    error: 'Could not delete time entry',
+  })
+
+export const useMarkNotificationsRead = () =>
+  useApiAction({
+    key: ['notifications', 'read'],
+    fn: (id: number | 'all') =>
+      id === 'all'
+        ? api.post('/notifications/read-all', {})
+        : api.patch(`/notifications/${id}`, { readAt: new Date().toISOString() }),
+    invalidate: [['notifications']],
+    error: 'Could not update notifications',
+  })
+
+export const useTeamMembership = () =>
+  useApiAction({
+    key: ['team-members', 'toggle'],
+    fn: (v: { teamId: number; userId: number; member: boolean }) =>
+      v.member
+        ? api.delete(`/team-members/${v.teamId}:${v.userId}`)
+        : api.post('/team-members', { teamId: v.teamId, userId: v.userId }),
+    invalidate: [['team-members'], ['auth']],
+    error: 'Could not change membership',
+  })
+
+export const useUpdateProduct = () =>
+  useApiAction({
+    key: ['products', 'update'],
+    fn: ({ id, patch }: { id: number; patch: { unitPrice?: number; active?: boolean; name?: string } }) =>
+      api.patch(`/products/${id}`, patch),
+    invalidate: [['products']],
+    success: 'Product updated',
+    error: 'Could not update product',
+  })
+
+export const useRunJob = () =>
+  useApiAction({
+    key: ['jobs'],
+    fn: (job: 'mark-overdue' | 'rebuild-mrr') => api.post<Record<string, number>>(`/jobs/${job}`, {}),
+    invalidate: BILLING_KEYS,
+    success: (r, job) => `${job} done (${JSON.stringify(r)})`,
+    error: 'Job failed',
+  })
+
+export const useRevokeSession = () =>
+  useApiAction({
+    key: ['sessions', 'delete'],
+    fn: (id: number) => api.delete(`/sessions/${id}`),
+    invalidate: [['sessions']],
+    error: 'Could not revoke session',
+  })
 
 // ----------------------------------------------------------------------------
 // Tasks

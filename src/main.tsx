@@ -1,4 +1,5 @@
-import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { isUnauthorized } from './lib/auth'
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
 import { RouterProvider } from '@tanstack/react-router'
 import { StrictMode } from 'react'
@@ -14,10 +15,16 @@ const queryClient = new QueryClient({
       staleTime: 15_000,
       // don't retry 4xx — they won't fix themselves
       retry: (count, error) => !(error instanceof HttpError && error.status < 500) && count < 2,
+      throwOnError: (error) => error instanceof HttpError && error.status === 403,
     },
   },
+  // a 401 anywhere means the session expired or was revoked: go to the login page
+  queryCache: new QueryCache({ onError: (e) => isUnauthorized(e) && void router.navigate({ to: '/login' }) }),
   mutationCache: new MutationCache({
-    onError: (error) => console.warn('[mutation failed]', error.message),
+    onError: (error) => {
+      if (isUnauthorized(error)) void router.navigate({ to: '/login' })
+      else console.warn('[mutation failed]', error.message)
+    },
   }),
 })
 

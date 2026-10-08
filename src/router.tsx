@@ -1,4 +1,5 @@
 import { noop, QueryClient } from '@tanstack/react-query'
+import { redirect } from '@tanstack/react-router'
 import { createRootRouteWithContext, createRoute, createRouter, Link, stripSearchParams } from '@tanstack/react-router'
 import { Layout } from './components/Layout'
 import { Empty } from './components/ui'
@@ -16,7 +17,16 @@ import {
   revenueQuery,
   usersQuery,
 } from './lib/queries'
-import { customersSearch, invoicesSearch } from './lib/search'
+import { HttpError } from './lib/api'
+import { meQuery } from './lib/auth'
+import { arAgingQuery, mrrSnapshotsQuery, productsQuery, projectStatsQuery } from './lib/queries'
+import { auditSearch, customersSearch, invoicesSearch } from './lib/search'
+import type { Me, Permission } from '../shared/domain'
+import type { SearchSchemaInput } from '@tanstack/react-router'
+import { LoginPage } from './routes/login'
+import { BillingPage } from './routes/billing'
+import { ProductsPage } from './routes/products'
+import { AuditPage } from './routes/audit'
 import { OverviewPage } from './routes/overview'
 import { AnalyticsPage } from './routes/analytics'
 import { CustomersPage } from './routes/customers'
@@ -34,7 +44,6 @@ export interface RouterContext {
 }
 
 const rootRoute = createRootRouteWithContext<RouterContext>()({
-  component: Layout,
   notFoundComponent: () => (
     <Empty>
       Page not found. <Link to="/">Go home</Link>
@@ -42,10 +51,39 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
   ),
 })
 
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/login',
+  validateSearch: (s: { redirect?: unknown } & SearchSchemaInput) => ({
+    redirect: typeof s.redirect === 'string' ? s.redirect : undefined,
+  }),
+  component: LoginPage,
+})
+
+/** Everything else requires a session: the guard resolves /auth/me before any child loader runs. */
+const appRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  id: 'app',
+  beforeLoad: async ({ context: { queryClient }, location }) => {
+    const me = await queryClient.query(meQuery()).catch(() => null)
+    if (!me) throw redirect({ to: '/login', search: { redirect: location.href } })
+    return { me }
+  },
+  component: Layout,
+})
+
+/** Route-level permission check (the server enforces it too; this just avoids showing a dead page). */
+const requires =
+  (permission: Permission) =>
+  ({ context }: { context: { me: Me } }) => {
+    if (!context.me.permissions.includes(permission))
+      throw new HttpError(403, { error: 'Forbidden', message: `You need the "${permission}" permission to view this page` })
+  }
+
 // Loaders use `ensureQueryData` so navigations render instantly from cache and
 // data starts loading in parallel with the route's JS, not in a useEffect waterfall.
 const overviewRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/',
   loader: ({ context: { queryClient } }) =>
     Promise.all([queryClient.query(overviewQuery()), queryClient.query(revenueQuery(12))]),
@@ -53,13 +91,13 @@ const overviewRoute = createRoute({
 })
 
 const analyticsRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/analytics',
   component: AnalyticsPage,
 })
 
 export const customersRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/customers',
   validateSearch: customersSearch,
   // keep URLs short: don't serialise default values
@@ -74,7 +112,7 @@ export const customersRoute = createRoute({
 })
 
 export const customerDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/customers/$customerId',
   params: {
     parse: (p) => ({ customerId: Number(p.customerId) }),
@@ -90,7 +128,7 @@ export const customerDetailRoute = createRoute({
 })
 
 export const invoicesRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/invoices',
   validateSearch: invoicesSearch,
   search: { middlewares: [stripSearchParams({ page: 1, pageSize: 25, sort: '-issuedAt' })] },
@@ -100,14 +138,15 @@ export const invoicesRoute = createRoute({
 })
 
 const projectsRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/projects',
-  loader: ({ context: { queryClient } }) => queryClient.query(projectsQuery()),
+  loader: ({ context: { queryClient } }) =>
+    Promise.all([queryClient.query(projectsQuery()), queryClient.query(projectStatsQuery())]),
   component: ProjectsPage,
 })
 
 export const projectBoardRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/projects/$projectId',
   params: {
     parse: (p) => ({ projectId: Number(p.projectId) }),
@@ -124,36 +163,67 @@ export const projectBoardRoute = createRoute({
 })
 
 const teamRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/team',
   loader: ({ context: { queryClient } }) => queryClient.query(usersQuery()),
   component: TeamPage,
 })
 
 const activityRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/activity',
   loader: ({ context: { queryClient } }) => queryClient.infiniteQuery(activityFeedQuery()),
   component: ActivityPage,
 })
 
 const settingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/settings',
   component: SettingsPage,
 })
 
+const billingRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/billing',
+  beforeLoad: requires('billing:read'),
+  loader: ({ context: { queryClient } }) =>
+    Promise.all([queryClient.query(mrrSnapshotsQuery()), queryClient.query(arAgingQuery())]),
+  component: BillingPage,
+})
+
+const productsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/products',
+  beforeLoad: requires('products:read'),
+  loader: ({ context: { queryClient } }) => queryClient.query(productsQuery()),
+  component: ProductsPage,
+})
+
+export const auditRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/audit',
+  beforeLoad: requires('audit:read'),
+  validateSearch: auditSearch,
+  component: AuditPage,
+})
+
 const routeTree = rootRoute.addChildren([
-  overviewRoute,
-  analyticsRoute,
-  customersRoute,
-  customerDetailRoute,
-  invoicesRoute,
-  projectsRoute,
-  projectBoardRoute,
-  teamRoute,
-  activityRoute,
-  settingsRoute,
+  loginRoute,
+  appRoute.addChildren([
+    overviewRoute,
+    billingRoute,
+    productsRoute,
+    auditRoute,
+    analyticsRoute,
+    customersRoute,
+    customerDetailRoute,
+    invoicesRoute,
+    projectsRoute,
+    projectBoardRoute,
+    teamRoute,
+    activityRoute,
+    settingsRoute,
+  ]),
 ])
 
 export function makeRouter(queryClient: QueryClient) {

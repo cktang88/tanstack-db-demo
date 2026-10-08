@@ -7,9 +7,10 @@ export function ErrorView({ error: rawError, reset }: ErrorComponentProps) {
   const router = useRouter()
   const { reset: resetQueries } = useQueryErrorResetBoundary()
   const notFound = error instanceof HttpError && error.status === 404
+  const forbidden = error instanceof HttpError && error.status === 403
   return (
     <div className="card mx-auto mt-10 max-w-md p-6 text-center" role="alert">
-      <div className="text-lg font-semibold">{notFound ? 'Not found' : 'Something went wrong'}</div>
+      <div className="text-lg font-semibold">{notFound ? 'Not found' : forbidden ? 'Access denied' : 'Something went wrong'}</div>
       <p className="mt-2 text-sm text-zinc-500">{error.message}</p>
       <button
         className="btn-secondary mt-4"

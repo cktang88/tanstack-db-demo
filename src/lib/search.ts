@@ -56,3 +56,20 @@ export function parseSort(sort: string | undefined) {
 export function formatSort(sorting: Array<{ id: string; desc: boolean }>) {
   return sorting.map((s) => (s.desc ? `-${s.id}` : s.id)).join(',') || undefined
 }
+
+export interface AuditParams {
+  page: number
+  pageSize: number
+  action?: string
+  entity?: string
+  actorId?: number
+}
+export function auditSearch(s: Input<AuditParams>): AuditParams {
+  return {
+    page: int(s.page, 1, 1, 100_000),
+    pageSize: int(s.pageSize, 50, 5, 200),
+    action: str(s.action),
+    entity: str(s.entity),
+    actorId: s.actorId !== undefined ? int(s.actorId, 0, 1, 1_000_000) || undefined : undefined,
+  }
+}

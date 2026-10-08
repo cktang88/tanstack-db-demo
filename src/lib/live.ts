@@ -5,11 +5,26 @@ import { keys } from './queries'
 // generic thing we can do with "customer 42 changed" is to invalidate every
 // query that *might* contain customer 42 and refetch them all.
 const ENTITY_KEYS: Record<string, ReadonlyArray<readonly unknown[]>> = {
-  customers: [keys.customers.all, keys.metrics.all],
-  invoices: [keys.invoices.all, keys.metrics.all],
+  customers: [keys.customers.all, keys.metrics.all, ['customer-health']],
+  invoices: [keys.invoices.all, keys.metrics.all, ['customer-health']],
+  payments: [['payments'], keys.metrics.all],
+  'customer-balances': [['customer-balances'], keys.metrics.all],
+  subscriptions: [['subscriptions'], keys.metrics.all],
+  'mrr-snapshots': [['mrr-snapshots']],
+  contacts: [['contacts']],
+  'customer-tags': [['customer-tags']],
+  tags: [['tags']],
+  products: [['products']],
   tasks: [keys.tasks.all, keys.projects.all, keys.metrics.workload()],
+  'task-comments': [['task-comments']],
+  'time-entries': [['time-entries']],
+  'project-stats': [['project-stats']],
   projects: [keys.projects.all],
   users: [keys.users.all],
+  teams: [['teams']],
+  'team-members': [['team-members']],
+  'usage-daily': [['usage-daily'], ['customer-health']],
+  notifications: [['notifications']],
   events: [keys.events.all],
 }
 

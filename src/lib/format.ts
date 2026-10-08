@@ -40,3 +40,9 @@ export const initials = (name: string) =>
     .toUpperCase()
 
 export const titleCase = (s: string) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+
+/** Read a text field from FormData ('' when missing or a File). */
+export const field = (form: FormData, name: string) => {
+  const v = form.get(name)
+  return typeof v === 'string' ? v : ''
+}

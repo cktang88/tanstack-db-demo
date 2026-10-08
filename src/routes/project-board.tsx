@@ -2,6 +2,7 @@ import { useMutationState, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { useActionState, useMemo, useState, ViewTransition } from 'react'
 import { TASK_PRIORITIES, TASK_STATUSES, type Task, type TaskStatus, type User } from '../../shared/domain'
+import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { date, titleCase } from '../lib/format'
 import { useCreateTask, useDeleteTask, useUpdateTask, type NewTask } from '../lib/mutations'
@@ -14,6 +15,7 @@ export function ProjectBoardPage() {
   const { data: tasks } = useSuspenseQuery(projectTasksQuery(projectId))
   const { data: users } = useSuspenseQuery(usersQuery())
   const [assignee, setAssignee] = useState<number | 'all'>('all')
+  const [openId, setOpenId] = useState<number | null>(null)
 
   // Pending creates are rendered "via the UI" from mutation state, in addition
   // to the optimistic cache entry — shows how many moving parts are involved.
@@ -60,16 +62,36 @@ export function ProjectBoardPage() {
           </select>
         }
       />
+      <TaskDialog task={tasks.find((t) => t.id === openId) ?? null} users={users} onClose={() => setOpenId(null)} />
       <div className="grid gap-4 lg:grid-cols-4" data-testid="board">
         {columns.map((col) => (
-          <Column key={col.status} status={col.status} tasks={col.tasks} users={users} projectId={projectId} />
+          <Column
+            key={col.status}
+            status={col.status}
+            tasks={col.tasks}
+            users={users}
+            projectId={projectId}
+            onOpen={(t) => setOpenId(t.id)}
+          />
         ))}
       </div>
     </>
   )
 }
 
-function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks: Task[]; users: User[]; projectId: number }) {
+function Column({
+  status,
+  tasks,
+  users,
+  projectId,
+  onOpen,
+}: {
+  status: TaskStatus
+  tasks: Task[]
+  users: User[]
+  projectId: number
+  onOpen: (t: Task) => void
+}) {
   const update = useUpdateTask()
   const [over, setOver] = useState(false)
   return (
@@ -97,7 +119,7 @@ function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} users={users} />
+            <TaskCard task={t} users={users} onOpen={onOpen} />
           </ViewTransition>
         ))}
       </ul>
@@ -106,7 +128,7 @@ function Column({ status, tasks, users, projectId }: { status: TaskStatus; tasks
   )
 }
 
-function TaskCard({ task, users }: { task: Task; users: User[] }) {
+function TaskCard({ task, users, onOpen }: { task: Task; users: User[]; onOpen: (t: Task) => void }) {
   const update = useUpdateTask()
   const del = useDeleteTask()
   const assignee = users.find((u) => u.id === task.assigneeId)
@@ -120,9 +142,9 @@ function TaskCard({ task, users }: { task: Task; users: User[] }) {
       className={`card group cursor-grab p-3 text-sm ${optimistic ? 'opacity-60' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <span className="font-medium" data-testid="task-title">
+        <button className="text-left font-medium hover:text-brand-600" data-testid="task-title" onClick={() => onOpen(task)}>
           {task.title}
-        </span>
+        </button>
         <button
           className="text-xs text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-red-600"
           aria-label={`Delete ${task.title}`}

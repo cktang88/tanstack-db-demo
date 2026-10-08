@@ -4,11 +4,14 @@ import { useDeferredValue, useMemo, useState } from 'react'
 import { PROJECT_STATUSES, type ProjectStatus } from '../../shared/domain'
 import { Avatar, Badge, ChipFilter, Empty, PageHeader } from '../components/ui'
 import { date } from '../lib/format'
-import { projectsQuery, usersQuery } from '../lib/queries'
+import { projectStatsQuery, projectsQuery, usersQuery } from '../lib/queries'
 
 export function ProjectsPage() {
   const { data: projects } = useSuspenseQuery(projectsQuery())
   const { data: users = [] } = useQuery(usersQuery())
+  // progress comes from a separate SQL view endpoint; stitched together client-side
+  const { data: stats = [] } = useQuery(projectStatsQuery())
+  const statsById = useMemo(() => new Map(stats.map((s) => [s.projectId, s])), [stats])
   const [q, setQ] = useState('')
   const [status, setStatus] = useState<ProjectStatus[]>([])
   const deferredQ = useDeferredValue(q)
@@ -42,7 +45,11 @@ export function ProjectsPage() {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3" data-testid="project-grid">
           {filtered.map((p) => {
             const owner = users.find((u) => u.id === p.ownerId)
-            const pct = p.taskCount ? Math.round((p.doneCount / p.taskCount) * 100) : 0
+            const st = statsById.get(p.id)
+            const taskCount = st?.taskCount ?? 0
+            const doneCount = st?.doneCount ?? 0
+            const hours = Math.round((st?.minutesLogged ?? 0) / 60)
+            const pct = taskCount ? Math.round((doneCount / taskCount) * 100) : 0
             return (
               <Link
                 key={p.id}
@@ -61,7 +68,7 @@ export function ProjectsPage() {
                 </div>
                 <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
                   <span data-testid="project-progress">
-                    {p.doneCount}/{p.taskCount} tasks · {pct}%
+                    {doneCount}/{taskCount} tasks · {pct}% · {hours}/{p.budgetHours}h
                   </span>
                   <span className="flex items-center gap-2">
                     {date(p.createdAt)}

@@ -10,6 +10,7 @@ import { useMarkInvoicePaid } from '../lib/mutations'
 import { customerQuery, invoicesListQuery, type InvoiceListParams } from '../lib/queries'
 import { formatSort, parseSort } from '../lib/search'
 import { invoicesRoute } from '../router'
+import { useCan } from '../lib/auth'
 
 const col = createColumnHelper<ServerFeatures, Invoice>()
 const EMPTY: Invoice[] = []
@@ -20,6 +21,7 @@ export function InvoicesPage() {
   const qc = useQueryClient()
   const query = useQuery(invoicesListQuery(search))
   const markPaid = useMarkInvoicePaid()
+  const canPay = useCan().can('billing:write')
   const rows = query.data?.data ?? EMPTY
 
   // The invoice API only returns customerId. To show the company name we fan
@@ -67,14 +69,14 @@ export function InvoicesPage() {
           id: 'actions',
           header: '',
           cell: ({ row }) =>
-            row.original.status === 'open' || row.original.status === 'overdue' ? (
+            canPay && (row.original.status === 'open' || row.original.status === 'overdue') ? (
               <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => markPaid.mutate(row.original.id)}>
                 Mark paid
               </button>
             ) : null,
         }),
       ]),
-    [customers, markPaid],
+    [customers, markPaid, canPay],
   )
 
   const pageTotal = rows.reduce((s, r) => s + r.amount, 0)
