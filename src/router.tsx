@@ -13,6 +13,7 @@ import { ErrorView } from './components/ErrorView'
 import { Layout } from './components/Layout'
 import { Empty } from './components/ui'
 import {
+  claimClientState,
   customersCollection,
   invoicesCollection,
   mrrSnapshotsCollection,
@@ -72,17 +73,15 @@ const loginRoute = createRoute({
  * the collections a page reads are synced; afterwards navigation is instant —
  * pages query the local DB, not the network.
  */
-let liveStarted = false
 const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: 'app',
   beforeLoad: async ({ context: { queryClient }, location }) => {
     const me = await queryClient.query(meQuery()).catch(() => null)
     if (!me) throw redirect({ to: '/login', search: { redirect: location.href } })
-    if (!liveStarted) {
-      liveStarted = true
-      startLiveSync()
-    }
+    // idempotent per user: opens (or switches) the per-user change feed
+    startLiveSync(me.user.id)
+    claimClientState(me.user.id)
     return { me }
   },
   loader: () => void preloadAll(),

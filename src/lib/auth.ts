@@ -1,8 +1,8 @@
-import { queryOptions, useMutation, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
+import { queryOptions, useMutation, useQueryClient, useSuspenseQuery, type QueryClient } from '@tanstack/react-query'
 import { useRouter } from '@tanstack/react-router'
 import type { Me, Permission, Role } from '../../shared/domain'
 import { resetServerCollections } from '../db/collections'
-import { startLiveSync, stopLiveSync } from '../db/live'
+import { stopLiveSync } from '../db/live'
 import { api, HttpError } from './api'
 
 export const meQuery = () =>
@@ -43,6 +43,21 @@ export function useCan() {
   }
 }
 
+/**
+ * Forget the current session on this client: close the per-user change feed,
+ * drop every server-backed collection (and the views over them) and the cached
+ * identity, so route guards ask the server again. Used on sign-in, sign-out
+ * and when any request comes back 401.
+ */
+export async function clearSession(qc: QueryClient) {
+  stopLiveSync()
+  await resetServerCollections()
+  qc.removeQueries({ queryKey: ['auth'] })
+}
+
+/** Only same-origin, absolute paths are followed after sign-in. */
+export const safeRedirect = (r: unknown) => (typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') ? r : '/')
+
 export function useLogin() {
   const qc = useQueryClient()
   const router = useRouter()
@@ -50,10 +65,11 @@ export function useLogin() {
     mutationFn: (creds: { email: string; password: string }) => api.post<Me & { token: string }>('/auth/login', creds),
     onSuccess: async ({ token: _token, ...me }) => {
       // never leak another user's rows: drop every collection, then sync fresh as the new user
-      await resetServerCollections()
+      await clearSession(qc)
       qc.setQueryData(meQuery().queryKey, me)
-      startLiveSync()
-      await router.navigate({ to: '/' })
+      // the app route's guard opens the change feed for this user
+      const redirectTo = (router.state.location.search as { redirect?: unknown }).redirect
+      await router.navigate({ href: safeRedirect(redirectTo) })
     },
   })
 }
@@ -64,9 +80,7 @@ export function useLogout() {
   return useMutation({
     mutationFn: () => api.post('/auth/logout', {}),
     onSettled: async () => {
-      stopLiveSync()
-      await resetServerCollections()
-      qc.removeQueries({ queryKey: ['auth', 'me'] })
+      await clearSession(qc)
       await router.navigate({ to: '/login' })
     },
   })

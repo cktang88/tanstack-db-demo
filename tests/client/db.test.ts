@@ -29,6 +29,7 @@ import {
   usersCollection,
   withInvoiceDerived,
 } from '../../src/db/collections'
+import { applyChange } from '../../src/db/live'
 import { isNewestFirstWindow, loadSubsetToSearch, orderByToSort, whereToParams } from '../../src/db/pushdown'
 import { customersByStatus } from '../../src/db/views'
 import { HttpError } from '../../src/lib/api'
@@ -305,6 +306,24 @@ describe('sign-in/out reset', () => {
     rows = [{ ...customer, status: 'trial', mrr: 0 }]
     await customersByStatus.preload()
     expect(customersByStatus.toArray).toEqual([expect.objectContaining({ status: 'trial', customers: 1, mrr: 0 })])
+    await resetServerCollections()
+  })
+
+  it('drops live changes for collections that are not syncing instead of throwing', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ data: [], total: 0 }))
+    await resetServerCollections()
+    const event = { id: 5, type: 'invoice.paid', category: 'invoice', actorId: null, customerId: 1, message: 'x', createdAt: '' }
+    expect(() => applyChange({ kind: 'upsert', entity: 'events', row: event })).not.toThrow()
+    expect(() => applyChange({ kind: 'upsert', entity: 'customers', row: customer })).not.toThrow()
+    expect(() => applyChange({ kind: 'delete', entity: 'customers', id: 1 })).not.toThrow()
+    expect(customersCollection.status).toBe('cleaned-up')
+  })
+
+  it('writes live changes into a syncing eager collection', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ data: [], total: 0 }))
+    await customersCollection.preload()
+    await applyChange({ kind: 'upsert', entity: 'customers', row: customer })
+    expect(customersCollection.get(1)).toMatchObject({ company: 'Acme', createdMonth: '2026-01' })
     await resetServerCollections()
   })
 })

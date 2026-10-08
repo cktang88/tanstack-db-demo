@@ -1,8 +1,9 @@
 import {
   BY_ENTITY,
   eventsByCategory,
-  queryClient,
   FEED_PAGERS,
+  isSyncing,
+  queryClient,
   withCustomerDerived,
   withInvoiceDerived,
   type EventCategory,
@@ -27,40 +28,97 @@ type Utils = {
   writeDelete: (id: number | string) => Promise<void>
   refetch: () => Promise<unknown>
 }
+type AnyCollection = (typeof BY_ENTITY)[string]
+
+const serverCollections = () => [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)]
+
+/**
+ * Re-read everything after the stream may have missed changes (a server-side
+ * reset, or a reconnect after a network gap). Only collections that are
+ * actually syncing are refetched; idle/cleaned-up ones load fresh when used.
+ */
+function resync({ includeAuth }: { includeAuth: boolean }) {
+  for (const p of FEED_PAGERS) p.reset()
+  void queryClient.invalidateQueries(includeAuth ? undefined : { predicate: (q) => q.queryKey[0] !== 'auth' })
+  return Promise.all(
+    serverCollections()
+      .filter(isSyncing)
+      .map((c) => (c.utils as Utils).refetch().catch(() => {})),
+  )
+}
+
+/**
+ * Whether an SSE change should be written into this collection.
+ *  - idle / cleaned-up collections have no sync to write into (the write would
+ *    throw); they load current server state when next used.
+ *  - on-demand collections only hold the windows their live queries asked for:
+ *    with nobody subscribed there is nothing to keep fresh, and an unowned row
+ *    would just accumulate.
+ */
+function accepts(c: AnyCollection) {
+  if (!isSyncing(c)) return false
+  return !(c.config.syncMode === 'on-demand' && c.subscriberCount === 0)
+}
+
+function write(c: AnyCollection, change: Exclude<Change, { kind: 'reset' }>): Promise<void> | undefined {
+  if (!accepts(c)) return
+  const utils = c.utils as Utils
+  try {
+    // Rows may be unknown locally (not loaded yet / already removed): ignore those rejections.
+    if (change.kind === 'delete') return utils.writeDelete(change.id).catch(() => {})
+    const derive = DERIVE[change.entity] ?? ((r: unknown) => r)
+    // an upsert that fails is a real problem (e.g. a schema rejection) — surface it
+    return utils.writeUpsert(derive(change.row)).catch((e: unknown) => console.error(`[live] ${change.entity}`, e))
+  } catch (e) {
+    // a sync that went away between the check and the write: the next load is fresh anyway
+    console.error(`[live] ${change.entity}`, e)
+  }
+}
 
 export function applyChange(change: Change) {
-  if (change.kind === 'reset') {
-    for (const p of FEED_PAGERS) p.reset()
-    void queryClient.invalidateQueries()
-    return Promise.all(
-      [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)].map((c) => (c.utils as Utils).refetch().catch(() => {})),
-    )
-  }
+  if (change.kind === 'reset') return resync({ includeAuth: true })
+  // rollups we compute live on the client (e.g. customer-balances) have no collection and are ignored
+  const collection = BY_ENTITY[change.entity]
+  const main = collection ? write(collection, change) : undefined
   if (change.entity === 'events' && change.kind === 'upsert') {
+    // A new head event shifts every offset by one. Live queries count offsets
+    // over local rows (which now include it), so the cursor pages cached for
+    // the old head must be rebuilt from page 1 on the next window read.
+    void queryClient.invalidateQueries({ queryKey: ['event-feed-pages'], refetchType: 'none' })
     // fan out to the scoped collection for this event's category as well
     const scoped = eventsByCategory[change.row.category as EventCategory]
-    if (scoped) void (scoped.utils as Utils).writeUpsert(change.row).catch(() => {})
+    if (scoped) void write(scoped, change)
   }
-  const collection = BY_ENTITY[change.entity]
-  if (!collection) return // rollups we compute live on the client (e.g. customer-balances) are ignored
-  const utils = collection.utils as Utils
-  // Rows may be unknown locally (not loaded yet / already removed): ignore those rejections.
-  if (change.kind === 'delete') return utils.writeDelete(change.id).catch(() => {})
-  const derive = DERIVE[change.entity] ?? ((r: unknown) => r)
-  // an upsert that fails is a real problem (e.g. a schema rejection) — surface it
-  return utils.writeUpsert(derive(change.row)).catch((e: unknown) => console.error(`[live] ${change.entity}`, e))
+  return main
 }
 
 let source: EventSource | undefined
-/** (Re)connect the change feed — called after sign-in since the stream is per-user. */
-export function startLiveSync() {
-  if (typeof EventSource === 'undefined') return () => {}
+let sourceUser: number | undefined
+
+/**
+ * Open the change feed for the signed-in user. The stream is per-user, so this
+ * is the single owner of the connection: calling it again for the same user is
+ * a no-op, for another user it reconnects.
+ */
+export function startLiveSync(userId: number) {
+  if (typeof EventSource === 'undefined') return
+  if (source && sourceUser === userId && source.readyState !== EventSource.CLOSED) return
   source?.close()
-  source = new EventSource('/api/events/stream')
-  source.addEventListener('change', (e) => void applyChange(JSON.parse((e as MessageEvent).data) as Change))
-  return () => source?.close()
+  sourceUser = userId
+  const es = new EventSource('/api/events/stream')
+  source = es
+  let connectedBefore = false
+  // `ready` is sent on every (re)connect. Changes made while the connection was
+  // down were never delivered, so a reconnect resyncs everything.
+  es.addEventListener('ready', () => {
+    if (connectedBefore) void resync({ includeAuth: false })
+    connectedBefore = true
+  })
+  es.addEventListener('change', (e) => void applyChange(JSON.parse((e as MessageEvent).data) as Change))
 }
-export const stopLiveSync = () => {
+
+export function stopLiveSync() {
   source?.close()
   source = undefined
+  sourceUser = undefined
 }
