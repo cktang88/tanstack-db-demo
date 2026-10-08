@@ -39,18 +39,6 @@ export function SettingsPage() {
               Wide layout
               <input type="checkbox" checked={settings.compact} onChange={(e) => setSettings({ compact: e.target.checked })} />
             </label>
-            <label className="flex items-center justify-between text-sm">
-              Default rows per page
-              <select
-                className="input w-24"
-                value={settings.defaultPageSize}
-                onChange={(e) => setSettings({ defaultPageSize: Number(e.target.value) })}
-              >
-                {[10, 25, 50, 100].map((n) => (
-                  <option key={n}>{n}</option>
-                ))}
-              </select>
-            </label>
           </div>
         </Card>
         <SessionsCard />

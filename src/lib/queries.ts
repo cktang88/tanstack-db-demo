@@ -270,7 +270,7 @@ export const activityFeedQuery = (type?: string) =>
       api.get<CursorPage<ActivityEvent>>('/events/feed', { cursor: pageParam, limit: 30, type }, signal),
     initialPageParam: null as number | null,
     getNextPageParam: (last) => last.nextCursor,
-    maxPages: 20,
+    // no maxPages: without getPreviousPageParam, capping would drop the newest pages
   })
 
 export const recentActivityQuery = () =>
@@ -278,8 +278,7 @@ export const recentActivityQuery = () =>
     queryKey: keys.events.recent(),
     queryFn: ({ signal }) => api.get<CursorPage<ActivityEvent>>('/events/feed', { limit: 8 }, signal),
     select: (p) => p.data,
-    // the dashboard "live" widget polls; polling pauses automatically when the tab is hidden
-    refetchInterval: 10_000,
+    // no polling: the SSE change feed invalidates ['events'] on every write
   })
 
 export const customerActivityQuery = (customerId: number) =>
@@ -398,7 +397,7 @@ export const notificationsQuery = () =>
     queryKey: ['notifications', 'list'],
     queryFn: ({ signal }) => api.get<Page<Notification>>('/notifications', { limit: 30, sort: '-createdAt' }, signal),
     select: (p) => p.data,
-    refetchInterval: 30_000,
+    // no polling: the SSE change feed invalidates ['notifications']
   })
 
 export const sessionsQuery = () =>

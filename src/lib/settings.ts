@@ -6,11 +6,10 @@ import { useEffect, useSyncExternalStore } from 'react'
 export interface Settings {
   theme: 'light' | 'dark'
   compact: boolean
-  defaultPageSize: number
 }
 
 const KEY = 'saasly:settings'
-const DEFAULTS: Settings = { theme: 'light', compact: false, defaultPageSize: 25 }
+const DEFAULTS: Settings = { theme: 'light', compact: false }
 
 const listeners = new Set<() => void>()
 let cache: Settings | null = null

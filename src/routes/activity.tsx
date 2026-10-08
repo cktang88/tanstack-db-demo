@@ -46,13 +46,17 @@ function Feed({ type }: { type?: string }) {
   const onVisible = useEffectEvent(() => {
     if (hasNextPage && !isFetchingNextPage) void fetchNextPage()
   })
+  // An observer only reports transitions, so if the sentinel is still on screen
+  // after a page lands (short pages, tall window) nothing would fire again.
+  // Re-observing after every load delivers a fresh initial entry.
+  const loaded = data.length
   useEffect(() => {
     const el = sentinel.current
-    if (!el) return
+    if (!el || isFetchingNextPage) return
     const io = new IntersectionObserver((entries) => entries[0]?.isIntersecting && onVisible(), { rootMargin: '400px' })
     io.observe(el)
     return () => io.disconnect()
-  }, [])
+  }, [loaded, isFetchingNextPage])
 
   // group by the user's local calendar day
   const groups = useMemo(() => {
