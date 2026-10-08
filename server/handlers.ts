@@ -186,7 +186,7 @@ export const update = (name: string, id: unknown, input: unknown) =>
     if (!r.patchSchema) return yield* new MethodNotAllowed({ message: `Updating ${name} is not supported` })
     const patch = (yield* decode(r.patchSchema, input)) as Record<string, unknown>
     yield* deny(r.canWrite?.(me, before, db, 'update'))
-    yield* deny(r.canWrite?.(me, { ...before, ...patch }, db, 'update'))
+    yield* deny(r.canWrite?.(me, { ...before, ...patch }, db, 'update', before))
     yield* sql(() => updateRow(db, r, id, patch))
     const after = yield* touch(name, id)
     yield* audit('update', name, id, before, after!)

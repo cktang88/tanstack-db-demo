@@ -240,3 +240,59 @@ describe('change stream authorization', () => {
     await s.until(s.closed)
   })
 })
+
+describe('project & task row-level rules', () => {
+  const setup = async () => {
+    const owner = t.as('owner')
+    const memberTeams: number[] = (await t.as('member').get('/auth/me')).body.teamIds
+    const teams: Array<{ id: number }> = (await owner.get('/teams')).body.data
+    const otherTeam = teams.find((x) => !memberTeams.includes(x.id))!.id
+    const project = (
+      await owner.post('/projects', {
+        name: 'Elsewhere',
+        description: '',
+        customerId: null,
+        ownerId: 1,
+        teamId: otherTeam,
+        status: 'active',
+        budgetHours: 10,
+      })
+    ).body
+    const task = (
+      await owner.post('/tasks', {
+        projectId: project.id,
+        title: 'Assigned to member',
+        status: 'todo',
+        priority: 'low',
+        assigneeId: 4,
+        dueDate: null,
+      })
+    ).body
+    return { otherTeam, project, task }
+  }
+
+  it('members cannot move a project to another team or hand it to someone else', async () => {
+    const { otherTeam } = await setup()
+    const member = t.as('member')
+    expect((await member.patch('/projects/1', { teamId: otherTeam, ownerId: 4 })).status).toBe(403)
+    expect((await member.patch('/projects/1', { ownerId: 2 })).status).toBe(403)
+    expect((await member.patch('/projects/1', { ownerId: 4 })).status).toBe(200)
+    const input = { name: 'Mine', description: '', customerId: null, teamId: 1, status: 'planning', budgetHours: 1 }
+    expect((await member.post('/projects', { ...input, ownerId: 2 })).status).toBe(403)
+    expect((await member.post('/projects', { ...input, ownerId: 4 })).status).toBe(201)
+    expect((await member.post('/projects', { ...input, ownerId: null, teamId: otherTeam })).status).toBe(403)
+  })
+
+  it('a task assignee outside the project team may only move the card', async () => {
+    const { project, task } = await setup()
+    const member = t.as('member')
+    expect((await member.patch(`/tasks/${task.id}`, { status: 'in_progress', position: 3 })).status).toBe(200)
+    expect((await member.patch(`/tasks/${task.id}`, { title: 'Renamed by assignee' })).status).toBe(403)
+    expect((await member.patch(`/tasks/${task.id}`, { projectId: 1 })).status).toBe(403)
+    expect((await member.del(`/tasks/${task.id}`)).status).toBe(403)
+    const input = { title: 'Sneaky', status: 'todo', priority: 'low', assigneeId: 4, dueDate: null }
+    expect((await member.post('/tasks', { ...input, projectId: project.id })).status).toBe(403)
+    const own = (await member.post('/tasks', { ...input, projectId: 1 })).body
+    expect((await member.patch(`/tasks/${own.id}`, { projectId: project.id })).status).toBe(403)
+  })
+})
