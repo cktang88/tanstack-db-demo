@@ -3,7 +3,7 @@ import { Link } from '@tanstack/react-router'
 import { useEffect, useEffectEvent, useMemo, useRef, useState, useTransition } from 'react'
 import type { User } from '../../shared/domain'
 import { Avatar, Badge, Card, PageHeader, Segmented, Spinner } from '../components/ui'
-import { date, relative } from '../lib/format'
+import { date, localToday, relative } from '../lib/format'
 import { activityFeedQuery, usersQuery } from '../lib/queries'
 
 const TYPES = [
@@ -54,11 +54,11 @@ function Feed({ type }: { type?: string }) {
     return () => io.disconnect()
   }, [])
 
-  // group by day
+  // group by the user's local calendar day
   const groups = useMemo(() => {
     const m = new Map<string, typeof data>()
     for (const e of data) {
-      const d = e.createdAt.slice(0, 10)
+      const d = localToday(new Date(e.createdAt))
       m.set(d, [...(m.get(d) ?? []), e])
     }
     return [...m]

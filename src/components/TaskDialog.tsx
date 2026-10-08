@@ -3,12 +3,10 @@ import { useMutationState, useQuery } from '@tanstack/react-query'
 import { useActionState } from 'react'
 import type { Task, User } from '../../shared/domain'
 import { useCan } from '../lib/auth'
-import { relative } from '../lib/format'
+import { localToday, relative } from '../lib/format'
 import { useAddComment, useDeleteTime, useLogTime, useUpdateTask } from '../lib/mutations'
 import { taskCommentsQuery, taskTimeQuery } from '../lib/queries'
 import { Avatar, Badge, Dialog } from './ui'
-
-const today = () => new Date().toISOString().slice(0, 10)
 
 export function TaskDialog({ task, users, onClose }: { task: Task | null; users: User[]; onClose: () => void }) {
   return (
@@ -153,7 +151,7 @@ function TimeLog({ taskId, byId, meId, canLog }: { taskId: number; byId: Map<num
           }
         >
           <input name="minutes" type="number" min={1} max={1440} defaultValue={30} className="input w-20" aria-label="Minutes" />
-          <input name="spentOn" type="date" defaultValue={today()} className="input w-36" aria-label="Date" />
+          <input name="spentOn" type="date" defaultValue={localToday()} className="input w-36" aria-label="Date" />
           <label className="flex items-center gap-1 text-xs">
             <input name="billable" type="checkbox" defaultChecked /> billable
           </label>

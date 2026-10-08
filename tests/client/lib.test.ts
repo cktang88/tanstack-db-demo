@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test'
 import { toSearch } from '../../src/lib/api'
-import { money, moneyCompact, month, relative, initials, titleCase } from '../../src/lib/format'
+import { date, localToday, money, moneyCompact, month, relative, initials, titleCase } from '../../src/lib/format'
 import { customersSearch as cs, formatSort, invoicesSearch as is, parseSort } from '../../src/lib/search'
 
 const customersSearch = (s: Record<string, unknown>) => cs(s as never)
@@ -15,6 +15,11 @@ describe('format', () => {
   it('formats months and relative times', () => {
     expect(month('2026-03')).toBe('Mar 26')
     expect(relative(new Date(Date.now() - 3 * 86400_000).toISOString())).toBe('3 days ago')
+  })
+  it('formats date-only strings without a time-zone shift', () => {
+    expect(date('2026-10-08')).toBe('Oct 8, 2026')
+    expect(date(null)).toBe('—')
+    expect(localToday(new Date(2026, 0, 2, 23, 30))).toBe('2026-01-02')
   })
   it('formats names', () => {
     expect(initials('Grace Brewster Hopper')).toBe('GB')
