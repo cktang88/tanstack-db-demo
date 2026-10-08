@@ -11,6 +11,7 @@ import { customersByIdsQuery, distinctIds, invoicesListQuery, type InvoiceListPa
 import { formatSort, parseSort } from '../lib/search'
 import { invoicesRoute } from '../router'
 import { useCan } from '../lib/auth'
+import { useDebouncedParam } from '../lib/hooks'
 
 const col = createColumnHelper<ServerFeatures, Invoice>()
 const EMPTY: Invoice[] = []
@@ -37,6 +38,15 @@ export function InvoicesPage() {
   useEffect(() => {
     if (search.page < pageCount) void qc.query(invoicesListQuery({ ...search, page: search.page + 1 })).catch(noop)
   }, [qc, search, pageCount])
+
+  // Past the end (e.g. a stale link, or paid invoices leaving a filter): go to the last page.
+  const lastPage = query.data && !query.isPlaceholderData ? Math.max(1, query.data.pageCount) : undefined
+  useEffect(() => {
+    if (lastPage !== undefined && search.page > lastPage)
+      void navigate({ search: (prev) => ({ ...prev, page: lastPage }), replace: true })
+  }, [navigate, search.page, lastPage])
+
+  const [q, setQ] = useDebouncedParam(search.q, (q) => setSearch({ q }))
 
   const columns = useMemo(
     () =>
@@ -99,8 +109,8 @@ export function InvoicesPage() {
             <input
               className="input w-44"
               placeholder="Invoice #"
-              defaultValue={search.q}
-              onChange={(e) => setSearch({ q: e.target.value || undefined })}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
               aria-label="Search invoices"
             />
             <ChipFilter

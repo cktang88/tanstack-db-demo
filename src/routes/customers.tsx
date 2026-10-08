@@ -1,6 +1,6 @@
 import { noop, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { createColumnHelper } from '@tanstack/react-table'
+import { createColumnHelper, type RowSelectionState } from '@tanstack/react-table'
 import { useEffect, useMemo, useState } from 'react'
 import { COUNTRIES, CUSTOMER_STATUSES, PLANS, type Customer, type User } from '../../shared/domain'
 import { CustomerForm } from '../components/CustomerForm'
@@ -12,6 +12,7 @@ import { customerQuery, customersListQuery, usersQuery, type CustomerListParams 
 import { formatSort, parseSort } from '../lib/search'
 import { customersRoute } from '../router'
 import { useCan } from '../lib/auth'
+import { useDebouncedParam } from '../lib/hooks'
 
 const col = createColumnHelper<ServerFeatures, Customer>()
 const EMPTY: Customer[] = []
@@ -90,12 +91,24 @@ export function CustomersPage() {
     if (search.page < pageCount) void qc.query(customersListQuery({ ...search, page: search.page + 1 })).catch(noop)
   }, [qc, search, pageCount])
 
-  // Debounced search box that writes to the URL.
-  const [q, setQ] = useState(search.q ?? '')
+  // Past the end (e.g. after archiving the last rows, or a stale link): go to the last page.
+  const lastPage = query.data && !query.isPlaceholderData ? Math.max(1, query.data.pageCount) : undefined
   useEffect(() => {
-    const t = setTimeout(() => q !== (search.q ?? '') && setSearch({ q: q || undefined }), 250)
-    return () => clearTimeout(t)
-  }, [q])
+    if (lastPage !== undefined && search.page > lastPage)
+      void navigate({ search: (prev) => ({ ...prev, page: lastPage }), replace: true })
+  }, [navigate, search.page, lastPage])
+
+  // Selection only makes sense for the rows on screen: clear it when the page, sort or filters change.
+  const [selection, setSelection] = useState<RowSelectionState>({})
+  const searchKey = JSON.stringify(search)
+  const [selectionFor, setSelectionFor] = useState(searchKey)
+  if (selectionFor !== searchKey) {
+    setSelectionFor(searchKey)
+    setSelection({})
+  }
+
+  // Debounced search box that writes to the URL.
+  const [q, setQ] = useDebouncedParam(search.q, (q) => setSearch({ q }))
 
   return (
     <>
@@ -117,6 +130,8 @@ export function CustomersPage() {
         rowCount={query.data?.total ?? 0}
         isFetching={query.isFetching}
         isPlaceholder={query.isPlaceholderData}
+        rowSelection={selection}
+        onRowSelectionChange={setSelection}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
