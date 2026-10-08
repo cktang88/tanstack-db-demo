@@ -30,8 +30,16 @@ import {
   withInvoiceDerived,
 } from '../../src/db/collections'
 import { applyChange } from '../../src/db/live'
-import { isNewestFirstWindow, loadSubsetToSearch, orderByToSort, whereToParams } from '../../src/db/pushdown'
-import { customersByStatus } from '../../src/db/views'
+import {
+  isNewestFirstWindow,
+  loadSubsetToSearch,
+  MAX_ROWS,
+  orderByToSort,
+  searchPattern,
+  sortKey,
+  uniqueLookup,
+  whereToParams,
+} from '../../src/db/pushdown'
 import { api, HttpError, onUnauthorized } from '../../src/lib/api'
 
 const ref = (field: string) => new IR.PropRef([field])
@@ -66,8 +74,19 @@ describe('predicate push-down', () => {
     expect(decodeURIComponent(sp.toString())).toBe('category[eq]=task&sort=-createdAt,id&limit=31&offset=30')
   })
 
-  it('asks for everything when the subset is unbounded', () => {
+  it('asks for everything when the subset is unbounded (the caller refuses a truncated answer)', () => {
     expect(loadSubsetToSearch({} as never).get('limit')).toBe('10000')
+    // order only matters to cut a window: an unbounded subset is sorted locally, so no sort is sent
+    // (and none is refused, e.g. a descending boolean with NULLs first)
+    const byPrimary = [{ expression: ref('isPrimary'), compareOptions: { direction: 'desc', nulls: 'first' } }]
+    expect(loadSubsetToSearch({ where: fn('eq', ref('customerId'), val(7)), orderBy: byPrimary } as never).toString()).toBe(
+      'customerId%5Beq%5D=7&limit=10000',
+    )
+  })
+
+  it('refuses a window deeper than the API serves instead of letting the server cap it', () => {
+    expect(() => loadSubsetToSearch({ limit: MAX_ROWS + 1 } as never)).toThrow(/larger than the API serves/)
+    expect(loadSubsetToSearch({ limit: MAX_ROWS } as never).get('limit')).toBe(String(MAX_ROWS))
   })
 
   it('refuses predicates the API cannot express instead of returning a wrong window', () => {
@@ -96,6 +115,87 @@ describe('predicate push-down', () => {
     // ids are never NULL: the default (nulls first) is fine in both directions
     expect(orderByToSort(by('id', 'desc', 'first') as never)).toBe('-id')
     expect(() => orderByToSort(by('name', 'asc', 'first', 'custom') as never)).toThrow(/custom/)
+  })
+})
+
+describe('push-down of the server search and composite sort keys', () => {
+  const spec = { search: 'searchText', sorts: { mrr: 'mrr', owner: 'owner', company: 'customerCompany' } }
+  const order = (key: string) => new IR.PropRef(['order', key])
+  const by = (key: string, direction: 'asc' | 'desc', stringSort = 'lexical') => [
+    { expression: order(key), compareOptions: { direction, nulls: 'first', stringSort } },
+  ]
+
+  it("sends ilike over the derived search field as the server's ?q= (wildcards stay literal)", () => {
+    const where = fn(
+      'and',
+      fn('in', ref('status'), val(['active'])),
+      fn('ilike', ref('searchText'), val(searchPattern('Ac_me 50%'))),
+    )
+    expect(whereToParams(where as never, spec)).toEqual([
+      ['status[in]', 'active'],
+      ['q', 'ac_me 50%'],
+    ])
+  })
+
+  it('refuses any other ilike/like: on another field, without a search field, or a hand-written pattern', () => {
+    expect(() => whereToParams(fn('ilike', ref('company'), val('%x%')) as never, spec)).toThrow(/search field/)
+    expect(() => whereToParams(fn('ilike', ref('searchText'), val('%x%')) as never)).toThrow(/search field/)
+    expect(() => whereToParams(fn('ilike', ref('searchText'), val('x%')) as never, spec)).toThrow(/searchPattern/)
+    expect(() => whereToParams(fn('ilike', ref('searchText'), val('%a%b%')) as never, spec)).toThrow(/searchPattern/)
+    expect(() => whereToParams(fn('ilike', ref('searchText'), val('%a_b%')) as never, spec)).toThrow(/searchPattern/)
+  })
+
+  it('sorts by a composite key as <field>,id in one direction (a unique, exact window)', () => {
+    expect(orderByToSort(by('mrr', 'desc') as never, spec)).toBe('-mrr,-id')
+    expect(orderByToSort(by('owner', 'asc') as never, spec)).toBe('owner,id')
+    expect(orderByToSort(by('company', 'asc') as never, spec)).toBe('customerCompany,id')
+    // locale collation would cut a different window than SQLite's byte order
+    expect(() => orderByToSort(by('mrr', 'desc', 'locale') as never, spec)).toThrow(/lexically/)
+    expect(() => orderByToSort(by('seats', 'desc') as never, spec)).toThrow(/Unknown sort key/)
+  })
+
+  it("turns the loader's tie request on a sort key into that one row, and refuses ranges over it", () => {
+    const tie = fn('and', fn('eq', ref('status'), val('active')), fn('eq', order('mrr'), val(sortKey(12_900, 42))))
+    expect(whereToParams(tie as never, spec)).toEqual([
+      ['status[eq]', 'active'],
+      ['id[eq]', '42'],
+    ])
+    expect(uniqueLookup(tie as never)).toEqual({ id: 42, field: 'mrr', key: sortKey(12_900, 42) })
+    expect(uniqueLookup(fn('eq', ref('id'), val(7)) as never)).toEqual({ id: 7 })
+    expect(uniqueLookup(fn('eq', ref('customerId'), val(7)) as never)).toBeUndefined()
+    expect(() => whereToParams(fn('gt', order('mrr'), val(sortKey(1, 1))) as never, spec)).toThrow(/sort key/)
+    expect(() => whereToParams(fn('eq', order('seats'), val(sortKey(1, 1))) as never, spec)).toThrow(/Unknown sort key/)
+  })
+
+  it("orders sort keys exactly like SQLite's ORDER BY value, id (NULLs first, byte order, numbers)", async () => {
+    const { default: Database } = await import('better-sqlite3')
+    const db = new Database(':memory:')
+    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, n INTEGER)')
+    const rows: Array<[number, string | null, number | null]> = [
+      [1, 'Acme', 5],
+      [2, 'Acme Labs', -3],
+      [3, null, 0],
+      [4, 'acme', 5],
+      [5, 'Acme', 1_000_000],
+      [6, '', null],
+      [7, 'Zeta', 12],
+      [8, 'Acme', -3],
+      [9, 'Ácme', 7],
+      [10, null, 5],
+    ]
+    const insert = db.prepare('INSERT INTO t VALUES (?, ?, ?)')
+    for (const r of rows) insert.run(...r)
+    const lexical = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+    for (const col of ['s', 'n'] as const) {
+      for (const dir of ['ASC', 'DESC'] as const) {
+        const sqlite = (db.prepare(`SELECT id FROM t ORDER BY ${col} ${dir}, id ${dir}`).all() as Array<{ id: number }>).map(
+          (r) => r.id,
+        )
+        const keys = rows.map(([id, s, n]) => ({ id, key: sortKey(col === 's' ? s : n, id) }))
+        keys.sort((a, b) => (dir === 'ASC' ? 1 : -1) * lexical(a.key, b.key))
+        expect(keys.map((k) => k.id)).toEqual(sqlite)
+      }
+    }
   })
 })
 
@@ -318,22 +418,21 @@ describe('sign-in/out reset', () => {
     updatedAt: '2026-01-01T00:00:00Z',
   }
 
-  it('tears down views with their sources, clears the selection, and the views recompute afterwards', async () => {
+  it('clears every collection and the selection, and the next session loads fresh rows', async () => {
     let rows = [customer]
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ data: rows, total: rows.length }))
-    await customersByStatus.preload()
-    expect(customersByStatus.toArray).toEqual([expect.objectContaining({ status: 'active', customers: 1, mrr: 100 })])
+    await usersCollection.preload()
+    expect(usersCollection.size).toBe(1)
     selectionCollection.insert({ id: 1 })
 
     await resetServerCollections()
     expect(selectionCollection.size).toBe(0)
-    expect(customersByStatus.status).toBe('cleaned-up')
-    expect(customersCollection.status).toBe('cleaned-up')
+    expect(usersCollection.status).toBe('cleaned-up')
 
-    // the next session's data, not the previous session's frozen numbers
-    rows = [{ ...customer, status: 'trial', mrr: 0 }]
-    await customersByStatus.preload()
-    expect(customersByStatus.toArray).toEqual([expect.objectContaining({ status: 'trial', customers: 1, mrr: 0 })])
+    // the next session's data, not the previous session's rows
+    rows = [{ ...customer, id: 2 }]
+    await usersCollection.preload()
+    expect([...usersCollection.keys()]).toEqual([2])
     await resetServerCollections()
   })
 
@@ -349,9 +448,10 @@ describe('sign-in/out reset', () => {
 
   it('writes live changes into a syncing eager collection', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ data: [], total: 0 }))
-    await customersCollection.preload()
-    await applyChange({ kind: 'upsert', entity: 'customers', row: customer })
-    expect(customersCollection.get(1)).toMatchObject({ company: 'Acme', createdMonth: '2026-01' })
+    await usersCollection.preload()
+    const user = { id: 3, name: 'Grace', email: 'g@x.io', role: 'admin', title: 'CTO', avatarColor: '#000', active: true }
+    await applyChange({ kind: 'upsert', entity: 'users', row: user })
+    expect(usersCollection.get(3)).toMatchObject({ name: 'Grace' })
     await resetServerCollections()
   })
 })

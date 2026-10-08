@@ -1,20 +1,14 @@
-import { count, eq, gt, isNull, useLiveQuery, useLiveQueryEffect } from '@tanstack/react-db'
+import { count, isNull, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import type { Permission } from '../../shared/domain'
 import { useCan, useLogout } from '../lib/auth'
 import { Link, Outlet, useRouterState } from '@tanstack/react-router'
-import {
-  notificationsCollection,
-  customersCollection,
-  invoicesCollection,
-  projectsCollection,
-  tasksCollection,
-  usersCollection,
-  type CustomerRow,
-} from '../db/collections'
+import { notificationsCollection, projectsCollection, tasksCollection, usersCollection } from '../db/collections'
 import { markAllNotificationsRead } from '../db/actions'
+import { listTotalQuery } from '../db/aggregates'
 import { usePrefs } from '../db/hooks'
-import { money, number, relative } from '../lib/format'
+import { number, relative } from '../lib/format'
 import { toast } from '../lib/toast'
 import { Avatar, Badge, cx, Spinner, Toaster } from './ui'
 
@@ -133,21 +127,32 @@ function UserMenu() {
   )
 }
 
-/** Live row counts of the local database — these are reactive queries too. */
+/**
+ * Row counts. Customers and invoices are on-demand collections (the client
+ * holds windows, not tables): their counts are server totals (`?limit=0`),
+ * re-read when the change feed reports a write. The small eager collections
+ * are counted locally, live.
+ */
 function DbStats() {
-  const sizes = [
-    ['customers', customersCollection],
-    ['invoices', invoicesCollection],
-    ['tasks', tasksCollection],
-    ['projects', projectsCollection],
-    ['users', usersCollection],
-  ] as const
+  const { can } = useCan()
   return (
     <dl className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5" data-testid="db-stats">
-      {sizes.map(([name, c]) => (
-        <CollectionSize key={name} name={name} collection={c} />
-      ))}
+      {can('customers:read') && <ServerCount name="customers" />}
+      {can('billing:read') && <ServerCount name="invoices" />}
+      <CollectionSize name="tasks" collection={tasksCollection} />
+      <CollectionSize name="projects" collection={projectsCollection} />
+      <CollectionSize name="users" collection={usersCollection} />
     </dl>
+  )
+}
+
+function ServerCount({ name }: { name: 'customers' | 'invoices' }) {
+  const { data, isError } = useQuery(listTotalQuery(name, {}))
+  return (
+    <>
+      <dt>{name}</dt>
+      <dd className="text-right tabular-nums">{data ? number(data.total) : isError ? '—' : <Spinner className="size-2.5" />}</dd>
+    </>
   )
 }
 
@@ -165,27 +170,6 @@ function CollectionSize({ name, collection }: { name: string; collection: unknow
       <dd className="text-right tabular-nums">{isReady ? number(data?.n ?? 0) : <Spinner className="size-2.5" />}</dd>
     </>
   )
-}
-
-/** Reactive alerts: fire when rows *enter* a query result, whoever changed them (this tab, another tab, the server). */
-function LiveAlerts() {
-  useLiveQueryEffect<CustomerRow, number>(
-    {
-      query: (q) => q.from({ c: customersCollection }).where(({ c }) => eq(c.status, 'churned')),
-      skipInitial: true,
-      onEnter: ({ value }) => void toast.info(`⚠ ${value.company} churned`, 'Detected by a live query effect'),
-    },
-    [],
-  )
-  useLiveQueryEffect<CustomerRow, number>(
-    {
-      query: (q) => q.from({ c: customersCollection }).where(({ c }) => gt(c.mrr, 2_000_000)),
-      skipInitial: true,
-      onEnter: ({ value }) => void toast.success(`🎉 ${value.company} is now a $20k+ MRR account`, money(value.mrr)),
-    },
-    [],
-  )
-  return null
 }
 
 export function Layout() {
@@ -247,7 +231,6 @@ export function Layout() {
           <Outlet />
         </main>
       </div>
-      <LiveAlerts />
       <Toaster />
     </div>
   )

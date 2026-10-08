@@ -1,31 +1,21 @@
-import { count, eq, inArray, multiply, sum, useLiveQuery } from '@tanstack/react-db'
+import { useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { Badge, Card, PageHeader } from '../components/ui'
-import { productsCollection, subscriptionsCollection } from '../db/collections'
+import { productAdoptionQuery } from '../db/aggregates'
+import { productsCollection } from '../db/collections'
 import { useCan } from '../lib/auth'
 import { money, number } from '../lib/format'
 import { toast } from '../lib/toast'
 
 export function ProductsPage() {
   const { can } = useCan()
-  // products ⨝ (subscriptions GROUP BY product): adoption & MRR per SKU, live
-  const { data: products } = useLiveQuery({
-    query: (q) => {
-      const adoption = q
-        .from({ s: subscriptionsCollection })
-        .where(({ s }) => inArray(s.status, ['active', 'past_due']))
-        .groupBy(({ s }) => s.productId)
-        .select(({ s }) => ({
-          productId: s.productId,
-          subs: count(s.id),
-          units: sum(s.quantity),
-          mrr: sum(multiply(s.quantity, s.unitPrice)),
-        }))
-      return q
-        .from({ p: productsCollection })
-        .leftJoin({ a: adoption }, ({ p, a }) => eq(p.id, a.productId))
-        .orderBy(({ p }) => p.id)
-        .select(({ p, a }) => ({ ...p, subs: a?.subs, units: a?.units, mrr: a?.mrr }))
-    },
+  // the catalog is a small eager collection (optimistic edits); adoption counts every live
+  // subscription (hundreds of thousands at scale): a server aggregate, joined in by product id
+  const { data: catalog } = useLiveQuery({ query: (q) => q.from({ p: productsCollection }).orderBy(({ p }) => p.id) })
+  const { data: adoption } = useQuery(productAdoptionQuery())
+  const products = catalog.map((p) => {
+    const a = adoption?.get(p.id)
+    return { ...p, $hasPendingWrites: p.$hasPendingWrites, subs: a?.subscriptions, units: a?.units, mrr: a?.mrr }
   })
   const editable = can('products:write')
   const save = (id: number, mutate: (d: { unitPrice: number; active: boolean }) => void) =>
@@ -41,7 +31,7 @@ export function ProductsPage() {
     <>
       <PageHeader
         title="Products"
-        description="Catalog ⨝ live adoption from every subscription. Prices are locked into subscriptions at signup."
+        description="Catalog (local, optimistic edits) ⨝ adoption across every subscription (server aggregate). Prices are locked into subscriptions at signup."
       />
       <Card>
         <table className="w-full" data-testid="products-table">

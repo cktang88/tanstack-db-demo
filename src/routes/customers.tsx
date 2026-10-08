@@ -1,4 +1,5 @@
-import { and, count, eq, ilike, inArray, or, sum, useLiveQuery, type InitialQueryBuilder } from '@tanstack/react-db'
+import { and, count, eq, ilike, inArray, sum, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { createColumnHelper, type RowSelectionState } from '@tanstack/react-table'
 import { useMemo, useState } from 'react'
@@ -7,16 +8,22 @@ import { CustomerForm } from '../components/CustomerForm'
 import { DataTable, selectColumn, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, ChipFilter, Dialog, PageHeader } from '../components/ui'
 import { createCustomer, deleteCustomers, updateCustomers } from '../db/actions'
-import { customersCollection, selectionCollection, usersCollection } from '../db/collections'
+import { listTotalQuery } from '../db/aggregates'
+import { CUSTOMER_SORTS, customersCollection, selectionCollection, usersCollection, type CustomerSort } from '../db/collections'
+import { useUsersById, useWindow, WINDOW } from '../db/hooks'
+import { MAX_ROWS, searchPattern } from '../db/pushdown'
 import { date, money, number } from '../lib/format'
+import { useDebouncedParam } from '../lib/hooks'
 import { formatSort, parseSort, type CustomerListParams } from '../lib/search'
 import { useCan } from '../lib/auth'
 import { toast } from '../lib/toast'
 import { customersRoute } from '../router'
 
-const like = (s: string) => `%${s}%`
-
-/** Filters that only touch customer columns. */
+/**
+ * Every filter is pushed down to the API by the on-demand customers
+ * collection (status/plan/country IN, owner =, search -> `?q=`), and
+ * re-evaluated locally on whatever rows the collection holds.
+ */
 function customerFilters(s: CustomerListParams) {
   return (c: any) =>
     [
@@ -24,75 +31,48 @@ function customerFilters(s: CustomerListParams) {
       s.plan ? inArray(c.plan, s.plan) : undefined,
       s.country ? inArray(c.country, s.country) : undefined,
       s.ownerId ? eq(c.ownerId, s.ownerId) : undefined,
+      // the server's search (name, email, company, owner name): see searchText in collections.ts
+      s.q ? ilike(c.searchText, searchPattern(s.q)) : undefined,
     ].filter((p) => p !== undefined)
 }
+const hasFilters = (s: CustomerListParams) => !!(s.status || s.plan || s.country || s.ownerId || s.q)
 const allOf = (parts: any[]) => (parts.length === 1 ? parts[0] : and(parts[0], parts[1], ...parts.slice(2)))
 
-/** customers ⨝ owner, filtered — needed when searching or sorting by the owner's name. */
-function joinedThenFiltered(q: InitialQueryBuilder, s: CustomerListParams) {
-  const base = q.from({ c: customersCollection }).leftJoin({ u: usersCollection }, ({ c, u }) => eq(c.ownerId, u.id))
-  const parts = (c: any, u: any) =>
-    [
-      ...customerFilters(s)(c),
-      // search spans the customer AND the joined owner — something the REST API couldn't do
-      s.q
-        ? or(ilike(c.name, like(s.q)), ilike(c.email, like(s.q)), ilike(c.company, like(s.q)), ilike(u?.name, like(s.q)))
-        : undefined,
-    ].filter((p) => p !== undefined)
-  if (!s.status && !s.plan && !s.country && !s.ownerId && !s.q) return base
-  return base.where(({ c, u }) => allOf(parts(c, u)))
-}
+/** The same filters in the REST grammar, for the server totals. */
+const listParams = (s: CustomerListParams) => ({ q: s.q, status: s.status, plan: s.plan, country: s.country, ownerId: s.ownerId })
 
-/** customers only, filtered — cheaper when the owner isn't involved in filtering/sorting. */
-function filteredOnly(q: InitialQueryBuilder, s: CustomerListParams) {
-  const base = q.from({ c: customersCollection })
-  if (!s.status && !s.plan && !s.country && !s.ownerId) return base
-  return base.where(({ c }) => allOf(customerFilters(s)(c)))
-}
-
-const SORTABLE = new Set(['company', 'name', 'plan', 'status', 'country', 'seats', 'mrr', 'createdAt', 'owner'])
+const isSortable = (id: string): id is CustomerSort => Object.hasOwn(CUSTOMER_SORTS, id)
 
 function useCustomerRows(s: CustomerListParams) {
   const [sort] = parseSort(s.sort)
-  const field = sort && SORTABLE.has(sort.id) ? sort.id : 'createdAt'
+  const field: CustomerSort = sort && isSortable(sort.id) ? sort.id : 'createdAt'
   const direction = sort?.desc === false ? 'asc' : 'desc'
-  const joinFirst = field === 'owner' || !!s.q
-
-  // Path A: join first, because the filter/sort needs the owner (sorting by a joined column!).
-  const joined = useLiveQuery({
-    query: (q) =>
-      joinFirst
-        ? joinedThenFiltered(q, s)
-            .orderBy(({ c, u }) => (field === 'owner' ? u?.name : c[field as 'company']), { direction, nulls: 'last' })
-            .orderBy(({ c }) => c.id)
-            .limit(s.pageSize)
-            .offset((s.page - 1) * s.pageSize)
-            .select(({ c, u }) => ({ ...c, ownerName: u?.name, ownerColor: u?.avatarColor }))
-        : undefined, // disabled query
-  })
-  // Path B: page the customers first (index-backed orderBy+limit), then join just the visible rows.
-  const paged = useLiveQuery({
+  // One on-demand window: pushed down as ?<filters>&sort=<field>,id&limit=<offset+size> (the
+  // composite sort key is unique, so the window is exact and its tie request is a single row).
+  const page = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
-      if (joinFirst) return undefined
-      const page = filteredOnly(q, s)
-        .orderBy(({ c }) => c[field as 'company'], { direction, nulls: 'last' })
-        .orderBy(({ c }) => c.id)
+      const base = q.from({ c: customersCollection })
+      return (hasFilters(s) ? base.where(({ c }) => allOf(customerFilters(s)(c))) : base)
+        .orderBy(({ c }) => c.order[field], direction)
         .limit(s.pageSize)
         .offset((s.page - 1) * s.pageSize)
-      return q
-        .from({ c: page })
-        .leftJoin({ u: usersCollection }, ({ c, u }) => eq(c.ownerId, u.id))
-        .orderBy(({ c }) => c[field as 'company'], { direction, nulls: 'last' })
-        .orderBy(({ c }) => c.id)
-        .select(({ c, u }) => ({ ...c, ownerName: u?.name, ownerColor: u?.avatarColor }))
     },
   })
-  const total = useLiveQuery({
-    query: (q) =>
-      (s.q ? joinedThenFiltered(q, s) : filteredOnly(q, s)).select(({ c }) => ({ n: count(c.id), mrr: sum(c.mrr) })).findOne(),
-  })
-  const rows = (joinFirst ? joined.data : paged.data) ?? []
-  return { rows, total: total.data?.n ?? 0, totalMrr: total.data?.mrr ?? 0 }
+  // count and MRR of *every* match: a server aggregate (the collection only holds windows)
+  const totals = useQuery(listTotalQuery('customers', listParams(s), 'mrr'))
+  const usersById = useUsersById()
+  const { rows, isPlaceholder } = useWindow(page)
+  return {
+    rows: useMemo(
+      () => rows.map((c) => ({ ...c, ownerColor: c.ownerId ? usersById.get(c.ownerId)?.avatarColor : undefined })),
+      [rows, usersById],
+    ),
+    isPlaceholder,
+    total: totals.data?.total ?? 0,
+    totalMrr: totals.data?.sums.mrr ?? 0,
+    isFetching: totals.isFetching || page.isLoading,
+  }
 }
 
 type Row = ReturnType<typeof useCustomerRows>['rows'][number]
@@ -156,7 +136,7 @@ const columns = col.columns([
 export function CustomersPage() {
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
-  const { rows, total, totalMrr } = useCustomerRows(search)
+  const { rows, total, totalMrr, isPlaceholder, isFetching } = useCustomerRows(search)
   const { can, canEditCustomer, privileged } = useCan()
   const [creating, setCreating] = useState(false)
 
@@ -164,12 +144,16 @@ export function CustomersPage() {
   // and can be joined with customers for a live summary.
   const { data: selected } = useLiveQuery({ query: (q) => q.from({ s: selectionCollection }) })
   const rowSelection = useMemo<RowSelectionState>(() => Object.fromEntries(selected.map((s) => [String(s.id), true])), [selected])
-  const { data: selectionSummary } = useLiveQuery({
+  // The selected customers are loaded by id, wherever they were selected: a LEFT join keeps the
+  // (local) selection as the side that drives the query and loads the customers lazily by key
+  // (`id[in]=…`). (An inner join lets TanStack DB pick the side with fewer *loaded* rows as the
+  // driver, which can be the 250k-row on-demand collection.) count/sum skip unmatched rows.
+  const { data: selectionSummary, isReady: selectionLoaded } = useLiveQuery({
     query: (q) =>
       q
         .from({ s: selectionCollection })
-        .innerJoin({ c: customersCollection }, ({ s, c }) => eq(s.id, c.id))
-        .select(({ c }) => ({ n: count(c.id), mrr: sum(c.mrr) }))
+        .leftJoin({ c: customersCollection }, ({ s, c }) => eq(s.id, c.id))
+        .select(({ c }) => ({ n: count(c?.id), mrr: sum(c?.mrr) }))
         .findOne(),
   })
 
@@ -195,7 +179,8 @@ export function CustomersPage() {
       const c = customersCollection.get(id)
       return c !== undefined && canEditCustomer(c)
     })
-    const gone = ids.filter((id) => !customersCollection.has(id) && selectionCollection.has(id))
+    // only once the selected rows have loaded is a missing row really gone (archived elsewhere)
+    const gone = selectionLoaded ? ids.filter((id) => !customersCollection.has(id) && selectionCollection.has(id)) : []
     if (gone.length) selectionCollection.delete(gone)
     const skipped = ids.length - ok.length
     if (skipped)
@@ -207,7 +192,7 @@ export function CustomersPage() {
     <>
       <PageHeader
         title="Customers"
-        description={`${number(total)} matching · ${money(totalMrr)} MRR — filtering, sorting & paging run locally, no requests.`}
+        description={`${number(total)} matching · ${money(totalMrr)} MRR — each window is loaded on demand (filters, search and sort pushed down to the API).`}
         actions={
           can('customers:write') && (
             <button className="btn-primary" onClick={() => setCreating(true)}>
@@ -221,6 +206,9 @@ export function CustomersPage() {
         columns={columns}
         data={rows}
         rowCount={total}
+        maxRows={MAX_ROWS}
+        isPlaceholder={isPlaceholder}
+        isFetching={isFetching}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
@@ -232,14 +220,7 @@ export function CustomersPage() {
         }
         toolbar={
           <div className="flex flex-wrap items-center gap-3">
-            {/* no debounce needed: each keystroke re-runs an in-memory query */}
-            <input
-              className="input w-64"
-              placeholder="Search name, email, company, owner…"
-              value={search.q ?? ''}
-              onChange={(e) => setSearch({ q: e.target.value || undefined })}
-              aria-label="Search customers"
-            />
+            <SearchBox value={search.q} onChange={(q) => setSearch({ q })} />
             <ChipFilter
               label="Status"
               options={CUSTOMER_STATUSES}
@@ -335,6 +316,20 @@ export function CustomersPage() {
         />
       </Dialog>
     </>
+  )
+}
+
+/** Search pushes `?q=` down to the server's index: wait for a pause in typing (250ms) first. */
+function SearchBox({ value, onChange }: { value?: string; onChange: (q?: string) => void }) {
+  const [text, setText] = useDebouncedParam(value, onChange)
+  return (
+    <input
+      className="input w-64"
+      placeholder="Search name, email, company, owner…"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      aria-label="Search customers"
+    />
   )
 }
 

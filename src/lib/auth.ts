@@ -53,8 +53,8 @@ export function useCan() {
 
 /**
  * Forget the current session on this client: close the per-user change feed,
- * drop every server-backed collection (and the views over them) and the cached
- * identity, so route guards ask the server again. Used on sign-in, sign-out
+ * drop every server-backed collection, cached query (metrics, totals) and the
+ * cached identity, so route guards ask the server again. Used on sign-in, sign-out
  * and when any request comes back 401.
  */
 export async function clearSession(qc: QueryClient) {

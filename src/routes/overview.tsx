@@ -1,67 +1,30 @@
-import { and, eq, gte, inArray, lt, sum, useLiveQuery } from '@tanstack/react-db'
+import { and, eq, inArray, sum, useLiveQuery } from '@tanstack/react-db'
+import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { useState } from 'react'
 import { DonutChart, RevenueChart, SignupsChart } from '../components/charts'
 import { Avatar, Badge, Card, PageHeader, Segmented, Stat } from '../components/ui'
+import { breakdownQuery, overviewQuery, revenueQuery, signupsQuery } from '../db/aggregates'
 import { customersCollection, eventsCollection, invoicesCollection, pinsCollection, usersCollection } from '../db/collections'
-import { customersByStatus, mrrByPlan, openTaskCount, outstandingByStatus, revenueByMonth, signupsByMonth } from '../db/views'
+import { WINDOW } from '../db/hooks'
 import { money, moneyCompact, number, percent, relative } from '../lib/format'
 
-/** YYYY-MM of `n` months ago. */
-export const monthsAgo = (n: number) => {
-  const d = new Date()
-  d.setUTCDate(1)
-  d.setUTCMonth(d.getUTCMonth() - n)
-  return d.toISOString().slice(0, 7)
-}
-export const thisMonth = () => new Date().toISOString().slice(0, 7)
-
-/** KPI numbers read from materialized views (see db/views.ts). */
+/**
+ * KPIs span every customer and invoice: a server aggregate (/metrics/overview),
+ * re-read when the change feed reports a write that moves it (see live.ts).
+ */
 export function useKpis() {
-  const { data: byStatus } = useLiveQuery(customersByStatus)
-  const { data: billing } = useLiveQuery(outstandingByStatus)
-  const { data: openTasks } = useLiveQuery(openTaskCount)
-  const get = (s: string) => byStatus.find((r) => r.status === s)
-  const mrr = get('active')?.mrr ?? 0
-  const active = get('active')?.customers ?? 0
-  return {
-    mrr,
-    arr: mrr * 12,
-    activeCustomers: active,
-    trialCustomers: get('trial')?.customers ?? 0,
-    churnedCustomers: get('churned')?.customers ?? 0,
-    outstanding: billing.reduce((s, r) => s + r.amount, 0),
-    overdueCount: billing.find((r) => r.status === 'overdue')?.n ?? 0,
-    openTasks: openTasks?.n ?? 0,
-    arpa: active ? Math.round(mrr / active) : 0,
-  }
+  return useSuspenseQuery(overviewQuery()).data
 }
 
-/** Monthly collected revenue (complete months only) — a query over a materialized view. */
+/** Monthly collected revenue (complete months only) from the server's revenue rollup. */
 export function useRevenue(months: number) {
-  const from = monthsAgo(months)
-  const to = thisMonth()
-  const { data } = useLiveQuery({
-    query: (q) =>
-      q
-        .from({ r: revenueByMonth })
-        .where(({ r }) => and(gte(r.month, from), lt(r.month, to)))
-        .orderBy(({ r }) => r.month),
-  })
-  return data.filter((d): d is typeof d & { month: string } => d.month !== null)
+  return useQuery(revenueQuery(months)).data ?? []
 }
 
-/** New signups per month by plan. */
+/** New signups per month by plan (server aggregate). */
 export function useSignups(months: number) {
-  const from = monthsAgo(months - 1)
-  const { data } = useLiveQuery({
-    query: (q) =>
-      q
-        .from({ s: signupsByMonth })
-        .where(({ s }) => gte(s.month, from))
-        .orderBy(({ s }) => s.month),
-  })
-  return data
+  return useQuery(signupsQuery(months)).data ?? []
 }
 
 export function OverviewPage() {
@@ -74,7 +37,10 @@ export function OverviewPage() {
 
   return (
     <>
-      <PageHeader title="Overview" description="Every number on this page is a live query over the local database." />
+      <PageHeader
+        title="Overview"
+        description="KPIs and charts are server aggregates kept fresh by the change feed; the lists are on-demand windows of the local database."
+      />
       <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="MRR" value={money(kpi.mrr)} hint={`ARR ${moneyCompact(kpi.arr)}`} testId="kpi-mrr" />
         <Stat
@@ -86,7 +52,7 @@ export function OverviewPage() {
         <Stat
           label="Outstanding"
           value={money(kpi.outstanding)}
-          hint={`${number(kpi.overdueCount)} overdue · open invoices before partial payments`}
+          hint={`${number(kpi.overdueCount)} overdue invoices`}
           testId="kpi-outstanding"
         />
         <Stat label="ARPA" value={money(kpi.arpa)} hint={`${number(kpi.openTasks)} open tasks`} testId="kpi-arpa" />
@@ -104,7 +70,7 @@ export function OverviewPage() {
             </span>
           }
           actions={
-            // no transition/spinner needed: switching range re-runs a local query in < 1ms
+            // the previous range stays on screen while the next one loads (placeholder data)
             <Segmented
               label="Revenue range"
               value={String(months) as '6' | '12' | '18'}
@@ -164,14 +130,16 @@ export function OverviewPage() {
 }
 
 function PlanDonut() {
-  const { data } = useLiveQuery({ query: (q) => q.from({ p: mrrByPlan }).orderBy(({ p }) => p.value, 'desc') })
-  return <DonutChart label="Plan" data={data} format={moneyCompact} />
+  // active MRR per plan, over every customer (server aggregate)
+  const { data = [] } = useQuery(breakdownQuery('plan'))
+  return <DonutChart label="Plan" data={data.map((d) => ({ key: d.key, value: d.mrr }))} format={moneyCompact} />
 }
 
 function RecentActivity() {
   // On-demand collection: this pushes `?sort=-id&limit=8` to the API.
   // New events arrive over SSE and are written straight into the collection.
   const { data, isLoading } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ e: eventsCollection })
@@ -197,13 +165,14 @@ function RecentActivity() {
 }
 
 function TopCustomers() {
+  // on-demand window: ?status[eq]=active&sort=-mrr,-id&limit=6
   const { data } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ c: customersCollection })
         .where(({ c }) => eq(c.status, 'active'))
-        .orderBy(({ c }) => c.mrr, 'desc')
-        .orderBy(({ c }) => c.id)
+        .orderBy(({ c }) => c.order.mrr, 'desc')
         .limit(6),
   })
   return (
@@ -224,23 +193,22 @@ function TopCustomers() {
 }
 
 function OverdueInvoices() {
-  // A join the REST API never offered: invoice + customer name in one query.
+  // on-demand window: ?status[eq]=overdue&sort=dueAt,id&limit=6 — each invoice carries its company
   const { data } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ i: invoicesCollection })
-        .innerJoin({ c: customersCollection }, ({ i, c }) => eq(i.customerId, c.id))
         .where(({ i }) => eq(i.status, 'overdue'))
-        .orderBy(({ i }) => i.dueAt)
-        .orderBy(({ i }) => i.id)
+        .orderBy(({ i }) => i.order.dueAt)
         .limit(6)
-        .select(({ i, c }) => ({
+        .select(({ i }) => ({
           id: i.id,
           number: i.number,
           dueAt: i.dueAt,
           amount: i.amount,
-          customerId: c.id,
-          company: c.company,
+          customerId: i.customerId,
+          company: i.customerCompany,
         })),
   })
   return (
@@ -263,17 +231,22 @@ function OverdueInvoices() {
 }
 
 function PinnedAccounts() {
-  // Join a localStorage collection (pins) with a server collection (customers) + an aggregate subquery.
-  const { data } = useLiveQuery({
+  const { data: pins } = useLiveQuery({ query: (q) => q.from({ p: pinsCollection }) })
+  const ids = pins.map((p) => p.id)
+  // Pins live in localStorage; only the pinned customers and their open invoices are loaded
+  // (?id[in]=… and ?customerId[in]=…&status[in]=open,overdue), then joined with the pins locally.
+  const { data = [] } = useLiveQuery({
     query: (q) => {
+      if (!ids.length) return undefined
       const openByCustomer = q
         .from({ i: invoicesCollection })
-        .where(({ i }) => inArray(i.status, ['open', 'overdue']))
+        .where(({ i }) => and(inArray(i.customerId, ids), inArray(i.status, ['open', 'overdue'])))
         .groupBy(({ i }) => i.customerId)
         .select(({ i }) => ({ customerId: i.customerId, outstanding: sum(i.amount) }))
       return q
-        .from({ p: pinsCollection })
-        .innerJoin({ c: customersCollection }, ({ p, c }) => eq(p.id, c.id))
+        .from({ c: customersCollection })
+        .where(({ c }) => inArray(c.id, ids))
+        .innerJoin({ p: pinsCollection }, ({ c, p }) => eq(c.id, p.id))
         .leftJoin({ o: openByCustomer }, ({ c, o }) => eq(c.id, o.customerId))
         .orderBy(({ p }) => p.pinnedAt, 'desc')
         .select(({ c, o, p }) => ({
@@ -289,7 +262,7 @@ function PinnedAccounts() {
   return (
     <Card
       title={`Pinned accounts (${data.length})`}
-      actions={<span className="text-xs text-zinc-400">localStorage ⨝ server data</span>}
+      actions={<span className="text-xs text-zinc-400">localStorage ⨝ on-demand server rows</span>}
     >
       {data.length === 0 ? (
         <p className="text-sm text-zinc-500">

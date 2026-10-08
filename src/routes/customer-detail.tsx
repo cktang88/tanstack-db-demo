@@ -44,6 +44,7 @@ import {
   pinsCollection,
   usersCollection,
 } from '../db/collections'
+import { WINDOW } from '../db/hooks'
 import { date, field, money, number, relative } from '../lib/format'
 import { toast } from '../lib/toast'
 import { customerDetailRoute } from '../router'
@@ -227,7 +228,8 @@ function PinButton({ customerId }: { customerId: number }) {
 }
 
 function CustomerInvoices({ customerId }: { customerId: number }) {
-  // Uses the customerId index — no per-customer endpoint, no cache key.
+  // On-demand: pushed down as customerId[eq]=… (a customer has a few dozen invoices at most);
+  // the open-invoice total below is covered by the same load (subset dedupe), no extra request.
   const { data: invoices } = useLiveQuery({
     query: (q) =>
       q
@@ -318,6 +320,7 @@ function CustomerInvoices({ customerId }: { customerId: number }) {
 function CustomerActivity({ customerId }: { customerId: number }) {
   // On-demand: pushes `customerId[eq]=…&sort=-id&limit=20` to the API.
   const { data, isLoading } = useLiveQuery({
+    ...WINDOW,
     query: (q) =>
       q
         .from({ e: eventsCollection })
@@ -372,9 +375,10 @@ function HealthStat({ customerId, status }: { customerId: number; status: string
 }
 
 /**
- * Replaces the server's customer_balances rollup with two live aggregates:
- * invoices (eager) and this customer's slice of the payment ledger (on-demand,
- * pushed down as customerId[eq]=…). An optimistic payment moves the balance at once.
+ * Replaces the server's customer_balances rollup with two live aggregates over
+ * bounded data: this customer's invoices and its slice of the payment ledger
+ * (both on-demand, pushed down as customerId[eq]=…). An optimistic payment
+ * moves the balance at once.
  */
 function BalanceStat({ customerId }: { customerId: number }) {
   const { data: invoiced } = useLiveQuery({
@@ -392,7 +396,8 @@ function BalanceStat({ customerId }: { customerId: number }) {
         .where(({ p }) => eq(p.customerId, customerId))
         // compound join condition (db 0.12): same invoice AND same customer
         .innerJoin({ i: invoicesCollection }, ({ p, i }) => and(eq(p.invoiceId, i.id), eq(p.customerId, i.customerId)))
-        .where(({ i }) => inArray(i.status, ['open', 'overdue']))
+        // also bounds the invoices side to this customer, whichever side the join drives from
+        .where(({ i }) => and(eq(i.customerId, customerId), inArray(i.status, ['open', 'overdue'])))
         .select(({ p }) => ({ paid: sum(p.amount) }))
         .findOne(),
   })
@@ -486,7 +491,7 @@ function Contacts({ customerId, editable }: { customerId: number; editable: bool
       q
         .from({ c: contactsCollection })
         .where(({ c }) => eq(c.customerId, customerId))
-        .orderBy(({ c }) => c.isPrimary, 'desc')
+        .orderBy(({ c }) => c.isPrimary, { direction: 'desc', nulls: 'last' })
         .orderBy(({ c }) => c.name),
   })
   // controlled + onSubmit (a form action would reset the inputs) so a rejected entry stays editable

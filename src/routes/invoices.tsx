@@ -1,95 +1,79 @@
-import { and, count, eq, gte, ilike, inArray, lte, or, sum, useLiveQuery, type InitialQueryBuilder } from '@tanstack/react-db'
+import { and, eq, gte, ilike, inArray, lte, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
 import { INVOICE_STATUSES } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Badge, ChipFilter, PageHeader, Stat } from '../components/ui'
 import { markInvoicePaid } from '../db/actions'
-import { customersCollection, invoicesCollection } from '../db/collections'
+import { listTotalQuery } from '../db/aggregates'
+import { INVOICE_SORTS, invoicesCollection, type InvoiceSort } from '../db/collections'
+import { useWindow, WINDOW } from '../db/hooks'
+import { MAX_ROWS, searchPattern } from '../db/pushdown'
 import { date, money, number } from '../lib/format'
+import { useDebouncedParam } from '../lib/hooks'
 import { formatSort, parseSort, type InvoiceListParams } from '../lib/search'
 import { useCan } from '../lib/auth'
 import { toast } from '../lib/toast'
 import { invoicesRoute } from '../router'
 
+const endOfDay = (d: string) => `${d}T23:59:59.999Z`
 const invoiceFilters = (s: InvoiceListParams) => (i: any) =>
   [
     s.status ? inArray(i.status, s.status) : undefined,
     s.customerId ? eq(i.customerId, s.customerId) : undefined,
     s.issuedFrom ? gte(i.issuedAt, s.issuedFrom) : undefined,
-    s.issuedTo ? lte(i.issuedAt, `${s.issuedTo}T23:59:59.999Z`) : undefined,
+    s.issuedTo ? lte(i.issuedAt, endOfDay(s.issuedTo)) : undefined,
+    // invoice number or customer company, like the server's ?q= (see searchText in collections.ts)
+    s.q ? ilike(i.searchText, searchPattern(s.q)) : undefined,
   ].filter((p) => p !== undefined)
 const allOf = (parts: any[]) => (parts.length === 1 ? parts[0] : and(parts[0], parts[1], ...parts.slice(2)))
-const hasInvoiceFilter = (s: InvoiceListParams) => !!(s.status || s.customerId || s.issuedFrom || s.issuedTo)
+const hasFilters = (s: InvoiceListParams) => !!(s.status || s.customerId || s.issuedFrom || s.issuedTo || s.q)
 
-/** invoices ⨝ customers, filtered — needed to search or sort by company. */
-function joinedThenFiltered(q: InitialQueryBuilder, s: InvoiceListParams) {
-  const base = q.from({ i: invoicesCollection }).innerJoin({ c: customersCollection }, ({ i, c }) => eq(i.customerId, c.id))
-  if (!hasInvoiceFilter(s) && !s.q) return base
-  return base.where(({ i, c }) =>
-    allOf([
-      ...invoiceFilters(s)(i),
-      // search by invoice number OR the joined customer's company
-      ...(s.q ? [or(ilike(i.number, `%${s.q}%`), ilike(c.company, `%${s.q}%`))] : []),
-    ]),
-  )
-}
+/** The same filters in the REST grammar, for the server totals. */
+const listParams = (s: InvoiceListParams) => ({
+  q: s.q,
+  status: s.status,
+  customerId: s.customerId,
+  'issuedAt[gte]': s.issuedFrom,
+  'issuedAt[lte]': s.issuedTo && endOfDay(s.issuedTo),
+})
 
-function filteredOnly(q: InitialQueryBuilder, s: InvoiceListParams) {
-  const base = q.from({ i: invoicesCollection })
-  return hasInvoiceFilter(s) ? base.where(({ i }) => allOf(invoiceFilters(s)(i))) : base
-}
-
-const SORTS = new Set(['number', 'company', 'status', 'issuedAt', 'dueAt', 'paidAt', 'amount'])
+const isSortable = (id: string): id is InvoiceSort => Object.hasOwn(INVOICE_SORTS, id)
 
 function useInvoiceRows(s: InvoiceListParams) {
   const [sort] = parseSort(s.sort)
-  const field = sort && SORTS.has(sort.id) ? sort.id : 'issuedAt'
+  const field: InvoiceSort = sort && isSortable(sort.id) ? sort.id : 'issuedAt'
   const direction = sort?.desc === false ? 'asc' : 'desc'
-  const joinFirst = field === 'company' || !!s.q
-  const joined = useLiveQuery({
-    query: (q) =>
-      joinFirst
-        ? joinedThenFiltered(q, s)
-            .orderBy(({ i, c }) => (field === 'company' ? c.company : i[field as 'number']), { direction, nulls: 'last' })
-            .orderBy(({ i }) => i.id)
-            .limit(s.pageSize)
-            .offset((s.page - 1) * s.pageSize)
-            .select(({ i, c }) => ({ ...i, company: c.company }))
-        : undefined,
-  })
-  // page the invoices first, then join only the 25 visible rows with their customer
-  const paged = useLiveQuery({
+  // one on-demand window; the customer's company comes with each invoice (customerCompany)
+  const page = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
-      if (joinFirst) return undefined
-      const page = filteredOnly(q, s)
-        .orderBy(({ i }) => i[field as 'number'], { direction, nulls: 'last' })
-        .orderBy(({ i }) => i.id)
+      const base = q.from({ i: invoicesCollection })
+      return (hasFilters(s) ? base.where(({ i }) => allOf(invoiceFilters(s)(i))) : base)
+        .orderBy(({ i }) => i.order[field], direction)
         .limit(s.pageSize)
         .offset((s.page - 1) * s.pageSize)
-      return q
-        .from({ i: page })
-        .innerJoin({ c: customersCollection }, ({ i, c }) => eq(i.customerId, c.id))
-        .orderBy(({ i }) => i[field as 'number'], { direction, nulls: 'last' })
-        .orderBy(({ i }) => i.id)
-        .select(({ i, c }) => ({ ...i, company: c.company }))
     },
   })
-  const totals = useLiveQuery({
-    query: (q) =>
-      (s.q ? joinedThenFiltered(q, s) : filteredOnly(q, s))
-        .select(({ i }) => ({ n: count(i.id), amount: sum(i.amount) }))
-        .findOne(),
-  })
-  const rows = (joinFirst ? joined.data : paged.data) ?? []
-  return { rows, total: totals.data?.n ?? 0, amount: totals.data?.amount ?? 0 }
+  // count and amount of every match: a server aggregate
+  const totals = useQuery(listTotalQuery('invoices', listParams(s), 'amount'))
+  const { rows, isPlaceholder } = useWindow(page)
+  return {
+    rows,
+    isPlaceholder,
+    isFetching: totals.isFetching || page.isLoading,
+    total: totals.data?.total ?? 0,
+    amount: totals.data?.sums.amount ?? 0,
+  }
 }
 
 type Row = ReturnType<typeof useInvoiceRows>['rows'][number]
 const col = createColumnHelper<ServerFeatures, Row>()
 const columns = col.columns([
   col.accessor('number', { header: 'Invoice', cell: (i) => <span className="font-mono text-xs">{i.getValue()}</span> }),
-  col.accessor('company', {
+  col.accessor('customerCompany', {
+    id: 'company',
     header: 'Customer',
     cell: (i) => (
       <Link to="/customers/$customerId" params={{ customerId: i.row.original.customerId }} className="hover:text-brand-600">
@@ -137,41 +121,45 @@ function MarkPaid({ invoice }: { invoice: Row }) {
 export function InvoicesPage() {
   const search = invoicesRoute.useSearch()
   const navigate = useNavigate({ from: '/invoices' })
-  const { rows, total, amount } = useInvoiceRows(search)
+  const { rows, total, amount, isPlaceholder, isFetching } = useInvoiceRows(search)
   const setSearch = (patch: Partial<InvoiceListParams>, resetPage = true) =>
     navigate({ search: (prev) => ({ ...prev, ...patch, ...(resetPage ? { page: 1 } : {}) }), replace: true })
 
   return (
     <>
-      <PageHeader title="Invoices" description="Invoices ⨝ customers, joined, filtered, sorted and paged locally." />
+      <PageHeader
+        title="Invoices"
+        description="An on-demand window of invoices: filters, search and sort are pushed down to the API; totals are a server aggregate."
+      />
       <div className="mb-4 grid gap-4 sm:grid-cols-3">
         <Stat label="Matching invoices" value={number(total)} testId="invoice-count" />
         <Stat
           label="Total of all matches"
           value={money(amount)}
-          hint="Live aggregate over every matching row"
+          hint="Server total over every matching row"
           testId="invoice-total"
         />
-        <Stat label="Requests for this page" value={0} hint="Customer names come from a local join" />
+        <Stat
+          label="Rows held locally"
+          value={number(rows.length)}
+          hint="Only this window — the company comes with each invoice"
+        />
       </div>
       <DataTable
         testId="invoices-table"
         columns={columns}
         data={rows}
         rowCount={total}
+        maxRows={MAX_ROWS}
+        isPlaceholder={isPlaceholder}
+        isFetching={isFetching}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => setSearch({ page: p.pageIndex + 1, pageSize: p.pageSize }, p.pageSize !== search.pageSize)}
         sorting={parseSort(search.sort)}
         onSortingChange={(s) => setSearch({ sort: formatSort(s) })}
         toolbar={
           <div className="flex flex-wrap items-center gap-3">
-            <input
-              className="input w-56"
-              placeholder="Invoice # or company"
-              value={search.q ?? ''}
-              onChange={(e) => setSearch({ q: e.target.value || undefined })}
-              aria-label="Search invoices"
-            />
+            <SearchBox value={search.q} onChange={(q) => setSearch({ q })} />
             <ChipFilter
               label="Status"
               options={INVOICE_STATUSES}
@@ -200,5 +188,19 @@ export function InvoicesPage() {
         }
       />
     </>
+  )
+}
+
+/** Search pushes `?q=` down to the server: wait for a pause in typing (250ms) first. */
+function SearchBox({ value, onChange }: { value?: string; onChange: (q?: string) => void }) {
+  const [text, setText] = useDebouncedParam(value, onChange)
+  return (
+    <input
+      className="input w-56"
+      placeholder="Invoice # or company"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      aria-label="Search invoices"
+    />
   )
 }

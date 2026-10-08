@@ -1,59 +1,30 @@
-import { caseWhen, count, eq, gte, inArray, sum, useLiveQuery } from '@tanstack/react-db'
+import { eq, inArray, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { PAYMENT_METHODS } from '../../shared/domain'
 import { GroupedBars, HBarChart, RevenueChart } from '../components/charts'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Badge, Card, ChipFilter, PageHeader, Stat } from '../components/ui'
+import { arAgingQuery, listTotalQuery } from '../db/aggregates'
 import { customersCollection, invoicesCollection, mrrSnapshotsCollection, paymentsCollection } from '../db/collections'
+import { useWindow, WINDOW } from '../db/hooks'
+import { MAX_ROWS } from '../db/pushdown'
 import { api } from '../lib/api'
 import { useCan } from '../lib/auth'
 import { date, money, moneyCompact, month, number } from '../lib/format'
 import { toast } from '../lib/toast'
 
 const BUCKETS = ['current', '1-30', '31-60', '60+']
-/**
- * Bucket boundaries at UTC midnight. The live query's identity is derived from
- * its IR (captured values included), so a millisecond-precision "now" would
- * rebuild the query on every render.
- */
-const daysAgo = (n: number) => {
-  const d = new Date()
-  d.setUTCHours(0, 0, 0, 0)
-  return new Date(d.getTime() - n * 86_400_000).toISOString()
-}
 
 export function BillingPage() {
   const { can } = useCan()
   const [running, setRunning] = useState(false)
-  // the job-maintained rollup is a read-only collection; a rebuild streams new rows in over SSE
+  // the job-maintained rollup is a small read-only collection; a rebuild streams new rows in over SSE
   const { data: snapshots } = useLiveQuery({ query: (q) => q.from({ s: mrrSnapshotsCollection }).orderBy(({ s }) => s.month) })
-  // AR aging computed live from invoices: bucket with caseWhen, then GROUP BY the bucket
-  const { data: aging } = useLiveQuery({
-    query: (q) => {
-      const bucketed = q
-        .from({ i: invoicesCollection })
-        .where(({ i }) => inArray(i.status, ['open', 'overdue']))
-        .select(({ i }) => ({
-          id: i.id,
-          amount: i.amount,
-          bucket: caseWhen(
-            gte(i.dueAt, daysAgo(0)),
-            'current',
-            gte(i.dueAt, daysAgo(30)),
-            '1-30',
-            gte(i.dueAt, daysAgo(60)),
-            '31-60',
-            '60+',
-          ),
-        }))
-      return q
-        .from({ b: bucketed })
-        .groupBy(({ b }) => b.bucket)
-        .select(({ b }) => ({ bucket: b.bucket, amount: sum(b.amount), invoices: count(b.id) }))
-    },
-  })
+  // AR aging spans every unpaid invoice (net of partial payments): a server aggregate
+  const { data: aging = [] } = useQuery(arAgingQuery())
   const last = snapshots.at(-1)
   const prev = snapshots.at(-2)
   const outstanding = aging.reduce((s, b) => s + b.amount, 0)
@@ -81,7 +52,7 @@ export function BillingPage() {
     <>
       <PageHeader
         title="Billing"
-        description="MRR rollup (job-maintained, streamed in), AR aging computed live from invoices, and the append-only payment ledger."
+        description="MRR rollup (job-maintained, streamed in), AR aging (server aggregate), and the append-only payment ledger (on-demand)."
         actions={
           can('billing:write') && (
             <>
@@ -115,7 +86,7 @@ export function BillingPage() {
         <Stat
           label="Accounts receivable"
           value={money(outstanding)}
-          hint={`${number(aging.reduce((s, b) => s + b.invoices, 0))} unpaid invoices · before partial payments`}
+          hint={`${number(aging.reduce((s, b) => s + b.invoices, 0))} unpaid invoices · net of partial payments`}
           testId="billing-ar"
         />
       </div>
@@ -128,7 +99,7 @@ export function BillingPage() {
         </Card>
       </div>
       <div className="mb-6 grid gap-6 lg:grid-cols-[1fr_2fr]">
-        <Card title="AR aging (live)">
+        <Card title="AR aging">
           <HBarChart
             label="Unpaid by days past due"
             height={220}
@@ -143,9 +114,11 @@ export function BillingPage() {
 }
 
 function usePaymentRows(pageIndex: number, pageSize: number, methods: string[]) {
-  // On-demand ledger window (pushed down as sort=-id&limit&offset[&method[in]]) joined with
-  // eager invoices + customers locally: no per-row lookups.
+  // On-demand ledger window (pushed down as sort=-id&limit&offset[&method[in]]), joined with the
+  // invoices and customers it references — on-demand too, loaded by key for just these rows
+  // (?id[in]=…, one request each), not per row.
   const rows = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
       const base = q.from({ p: paymentsCollection })
       const page = (methods.length ? base.where(({ p }) => inArray(p.method, methods)) : base)
@@ -160,10 +133,10 @@ function usePaymentRows(pageIndex: number, pageSize: number, methods: string[]) 
         .select(({ p, i, c }) => ({ ...p, number: i?.number, company: c?.company }))
     },
   })
-  return rows.data
+  return useWindow(rows)
 }
 
-type LedgerRow = ReturnType<typeof usePaymentRows>[number]
+type LedgerRow = ReturnType<typeof usePaymentRows>['rows'][number]
 const col = createColumnHelper<ServerFeatures, LedgerRow>()
 const columns = col.columns([
   col.accessor('receivedAt', { header: 'Received', enableSorting: false, cell: (i) => date(i.getValue()) }),
@@ -196,21 +169,17 @@ const columns = col.columns([
 function PaymentLedger() {
   const [page, setPage] = useState({ pageIndex: 0, pageSize: 10 })
   const [methods, setMethods] = useState<string[]>([])
-  const rows = usePaymentRows(page.pageIndex, page.pageSize, methods)
+  const { rows, isPlaceholder } = usePaymentRows(page.pageIndex, page.pageSize, methods)
   // total for the pager: a tiny server count (the ledger itself is never loaded in full)
-  const [total, setTotal] = useState(0)
-  useEffect(() => {
-    void api
-      .get<{ total: number }>('/payments', { limit: 0, method: methods.length ? methods : undefined })
-      .then((r) => setTotal(r.total))
-      .catch(() => {})
-  }, [methods])
+  const total = useQuery(listTotalQuery('payments', { method: methods.length ? methods : undefined })).data?.total ?? 0
   return (
     <DataTable
       testId="payments-table"
       columns={columns}
       data={rows}
       rowCount={total}
+      maxRows={MAX_ROWS}
+      isPlaceholder={isPlaceholder}
       pagination={page}
       onPaginationChange={setPage}
       sorting={[]}

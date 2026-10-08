@@ -38,7 +38,17 @@ import {
 } from '../../shared/domain'
 import type { BatchOp } from '../../shared/schemas'
 import { api, HttpError, type QueryParams } from '../lib/api'
-import { isNewestFirstWindow, loadSubsetToSearch } from './pushdown'
+import { aggregatesChanged } from './aggregates'
+import { customerAlertsDetector } from './alerts'
+import {
+  isNewestFirstWindow,
+  loadSubsetToSearch,
+  MAX_ROWS,
+  searchText,
+  sortKey,
+  uniqueLookup,
+  type PushdownSpec,
+} from './pushdown'
 
 // ---------------------------------------------------------------------------
 // One QueryClient is still the cache + fetch engine underneath every
@@ -56,20 +66,103 @@ export const queryClient = new QueryClient({
 })
 
 // ---------------------------------------------------------------------------
-// Row types. Derived month buckets are added at load time so charts can
-// `groupBy` them with no server aggregation endpoint.
+// Row types. Client-derived fields are added to every row written from the
+// server (responses and SSE) and never sent back (see DERIVED_FIELDS):
+//  - month buckets, so charts over bounded data can `groupBy` them
+//  - `searchText` / `order`, so the big on-demand collections can push the
+//    server's search and sort down (see pushdown.ts)
 // ---------------------------------------------------------------------------
-export type CustomerRow = Customer & { createdMonth: string }
-export type InvoiceRow = Invoice & { issuedMonth: string; paidMonth: string | null }
+/** sort keys of the customers table -> the server's sort field (`owner` is a virtual sort key) */
+export const CUSTOMER_SORTS = {
+  company: 'company',
+  name: 'name',
+  plan: 'plan',
+  status: 'status',
+  country: 'country',
+  seats: 'seats',
+  mrr: 'mrr',
+  createdAt: 'createdAt',
+  owner: 'owner',
+} as const
+/** sort keys of the invoices table -> the server's sort field */
+export const INVOICE_SORTS = {
+  number: 'number',
+  company: 'customerCompany',
+  status: 'status',
+  issuedAt: 'issuedAt',
+  dueAt: 'dueAt',
+  paidAt: 'paidAt',
+  amount: 'amount',
+} as const
+export type CustomerSort = keyof typeof CUSTOMER_SORTS
+export type InvoiceSort = keyof typeof INVOICE_SORTS
+
+export type CustomerRow = Customer & {
+  createdMonth: string
+  /** the owner's name, looked up in the (eager) users collection */
+  ownerName: string | null
+  /** name, email, company and owner name: what the server's `?q=` searches */
+  searchText: string
+  order: Record<CustomerSort, string>
+}
+export type InvoiceRow = Invoice & {
+  issuedMonth: string
+  paidMonth: string | null
+  /** invoice number and customer company: what the server's `?q=` searches */
+  searchText: string
+  order: Record<InvoiceSort, string>
+}
 export type ProjectRow = Project
 export type { User, ActivityEvent }
 
-export const withCustomerDerived = (c: Customer): CustomerRow => ({ ...c, createdMonth: c.createdAt.slice(0, 7) })
+const ownerNameOf = (ownerId: number | null) =>
+  ownerId === null ? null : ((usersCollection.get(ownerId) as User | undefined)?.name ?? null)
+
+export const withCustomerDerived = (c: Customer): CustomerRow => {
+  const ownerName = ownerNameOf(c.ownerId)
+  return {
+    ...c,
+    createdMonth: c.createdAt.slice(0, 7),
+    ownerName,
+    searchText: searchText(c.name, c.email, c.company, ownerName),
+    order: {
+      company: sortKey(c.company, c.id),
+      name: sortKey(c.name, c.id),
+      plan: sortKey(c.plan, c.id),
+      status: sortKey(c.status, c.id),
+      country: sortKey(c.country, c.id),
+      seats: sortKey(c.seats, c.id),
+      mrr: sortKey(c.mrr, c.id),
+      createdAt: sortKey(c.createdAt, c.id),
+      owner: sortKey(ownerName, c.id),
+    },
+  }
+}
 export const withInvoiceDerived = (i: Invoice): InvoiceRow => ({
   ...i,
   issuedMonth: i.issuedAt.slice(0, 7),
   paidMonth: i.status === 'paid' ? (i.paidAt ?? i.issuedAt).slice(0, 7) : null,
+  searchText: searchText(i.number, i.customerCompany),
+  order: {
+    number: sortKey(i.number, i.id),
+    company: sortKey(i.customerCompany, i.id),
+    status: sortKey(i.status, i.id),
+    issuedAt: sortKey(i.issuedAt, i.id),
+    dueAt: sortKey(i.dueAt, i.id),
+    paidAt: sortKey(i.paidAt, i.id),
+    amount: sortKey(i.amount, i.id),
+  },
 })
+
+/** Recompute the derived fields of an optimistic draft after its source fields changed. */
+export const rederiveCustomer = (d: CustomerRow) => {
+  const { createdMonth, ownerName, searchText, order } = withCustomerDerived(d)
+  Object.assign(d, { createdMonth, ownerName, searchText, order })
+}
+export const rederiveInvoice = (d: InvoiceRow) => {
+  const { issuedMonth, paidMonth, searchText, order } = withInvoiceDerived(d)
+  Object.assign(d, { issuedMonth, paidMonth, searchText, order })
+}
 
 // Effect Schema doubles as the collection's Standard Schema: every optimistic
 // insert/update on tasks is validated client-side *before* it touches the UI.
@@ -128,7 +221,7 @@ const register = (collection: AnyCollection, entity: string, mode: Mode) => {
 /** client-side derived columns per entity, applied to every row written from the server (responses and SSE) */
 export const DERIVE: Record<string, (row: any) => any> = { customers: withCustomerDerived, invoices: withInvoiceDerived }
 /** client-side derived buckets — never part of the API */
-const DERIVED_FIELDS = new Set(['createdMonth', 'issuedMonth', 'paidMonth'])
+const DERIVED_FIELDS = new Set(['createdMonth', 'issuedMonth', 'paidMonth', 'ownerName', 'searchText', 'order'])
 /**
  * Fields the server computes or forces itself (see server/resources.ts and the
  * business handlers). They exist on optimistic rows so the UI can show them,
@@ -137,7 +230,7 @@ const DERIVED_FIELDS = new Set(['createdMonth', 'issuedMonth', 'paidMonth'])
 const SERVER_FIELDS: Record<string, ReadonlySet<string>> = {
   '*': new Set(['createdAt', 'updatedAt']),
   customers: new Set(['mrr', 'teamId']),
-  invoices: new Set(['number', 'customerId', 'amount', 'issuedAt', 'paidAt']),
+  invoices: new Set(['number', 'customerId', 'amount', 'issuedAt', 'paidAt', 'customerCompany']),
   payments: new Set(['customerId', 'reference', 'receivedAt', 'recordedBy']),
   subscriptions: new Set(['unitPrice', 'startedAt', 'canceledAt']),
   'task-comments': new Set(['authorId']),
@@ -197,24 +290,51 @@ const utilsOf = (entity: string) => {
   return isSyncing(c) ? (c.utils as SyncUtils) : undefined
 }
 
+/** Whether a server row (already derived) carries nothing new over the synced row. */
+export function sameRow(next: Record<string, unknown>, synced: unknown) {
+  if (!synced || typeof synced !== 'object') return false
+  const current = synced as Record<string, unknown>
+  return Object.keys(next).every((k) => {
+    const a = next[k]
+    const b = current[k]
+    return a === b || (typeof a === 'object' && a !== null && JSON.stringify(a) === JSON.stringify(b))
+  })
+}
+
+/**
+ * Hook for every server version of a row about to be written into the synced
+ * store (batch results and SSE): live alerts compare it with the synced row.
+ */
+export function landing(entity: string, row: { id: number | string } & Record<string, any>, opts: { created?: boolean } = {}) {
+  if (entity !== 'customers') return
+  const synced = BY_ENTITY.customers?.base.get(row.id) as CustomerRow | undefined
+  customerAlertsDetector.landed(row as CustomerRow, synced, opts)
+}
+
 async function writeResults(results: BatchResult['results']) {
   const byEntity = new Map<string, BatchResult['results']>()
   for (const r of results) byEntity.set(r.entity, [...(byEntity.get(r.entity) ?? []), r])
+  for (const entity of byEntity.keys()) aggregatesChanged(entity)
   await Promise.all(
     [...byEntity].map(async ([entity, rs]) => {
+      const collection = BY_ENTITY[entity]
       const utils = utilsOf(entity)
-      if (!utils) return
       const derive = DERIVE[entity] ?? ((r: unknown) => r)
       // last write per key wins (a row can appear twice, e.g. written and re-read)
-      const upserts = new Map(rs.filter((r) => r.op !== 'delete' && r.row).map((r) => [r.id, r.row!]))
+      const upserts = new Map(rs.filter((r) => r.op !== 'delete' && r.row).map((r) => [r.id, r]))
+      const created = new Set(rs.filter((r) => r.op === 'insert').map((r) => r.id))
+      for (const r of upserts.values()) landing(entity, r.row!, { created: created.has(r.id) })
+      if (!utils || !collection) return
+      // a row the synced store already holds as-is (e.g. the change feed was faster) needs no write
+      const rows = [...upserts.values()].map((r) => derive(r.row!)).filter((row) => !sameRow(row, collection.base.get(row.id)))
       // since query-db-collection 1.4 direct writes report validation failures by
       // rejecting (not throwing), so every inner write promise is awaited too
       const inner: Array<Promise<void>> = []
       await Promise.all([
-        upserts.size
+        rows.length
           ? utils
               .writeBatch(() => {
-                for (const row of upserts.values()) inner.push(utils.writeUpsert(derive(row)))
+                for (const row of rows) inner.push(utils.writeUpsert(row))
               })
               .then(() => Promise.all(inner))
           : undefined,
@@ -288,12 +408,11 @@ const indexing = { autoIndex: 'eager', defaultIndexType: BTreeIndex } as const
 /**
  * Eager collections load a whole table in one request, capped by the server
  * at 10,000 rows (MAX_PAGE_SIZE). Past that the table would be silently
- * truncated — every local aggregate would be wrong — so say so loudly. A
- * table that big should become an on-demand collection.
+ * truncated — every local aggregate would be wrong — so say so loudly. Only
+ * small, bounded tables are eager; the big ones are on-demand below.
  */
-const EAGER_LIMIT = 10_000
 async function fetchAll<T>(entity: string, params: QueryParams | undefined, signal: AbortSignal) {
-  const page = await api.get<Page<T>>(`/${entity}`, { limit: EAGER_LIMIT, ...params }, signal)
+  const page = await api.get<Page<T>>(`/${entity}`, { limit: MAX_ROWS, ...params }, signal)
   if (page.total > page.data.length)
     console.error(
       `[collections] ${entity}: loaded ${page.data.length} of ${page.total} rows — the eager collection is truncated; ` +
@@ -311,7 +430,7 @@ async function fetchAll<T>(entity: string, params: QueryParams | undefined, sign
 function serverCollection<T extends object, K extends string | number>(
   entity: string,
   getKey: (row: T) => K,
-  opts: { mode?: 'crud' | 'append-only' | 'read-only'; params?: QueryParams; map?: (row: any) => T } = {},
+  opts: { mode?: Mode; params?: QueryParams; map?: (row: any) => T } = {},
 ) {
   const mode = opts.mode ?? 'crud'
   const collection = createCollection(
@@ -333,10 +452,25 @@ function serverCollection<T extends object, K extends string | number>(
   return collection
 }
 
+/** Thrown (and logged) when an on-demand subset with no limit matches more rows than one request returns. */
+export class SubsetTooLargeError extends Error {
+  constructor(entity: string, total: number) {
+    super(`${entity}: an unbounded subset matched ${total} rows (more than ${MAX_ROWS}) — add a limit or a narrower filter`)
+    this.name = 'SubsetTooLargeError'
+  }
+}
+
 /**
  * On-demand collection: nothing is loaded up front. Each live query's
- * where/orderBy/limit/offset is pushed down to the REST API, and identical or
- * overlapping requests are deduplicated.
+ * where/orderBy/limit/offset is pushed down to the REST API (see pushdown.ts),
+ * identical or overlapping requests are deduplicated, and a subset's rows
+ * leave the collection again when no live query needs them.
+ *
+ * Writes work like on eager collections (one atomic batch, canonical rows
+ * written back), with one library difference: after a direct write the query
+ * collection re-reads every *active* window of the collection, because a
+ * changed row can move into or out of a window that only the server can
+ * refill (@tanstack/query-db-collection ≥ 1.3, #1826).
  */
 function onDemandCollection<T extends object, K extends string | number>(
   entity: string,
@@ -344,13 +478,19 @@ function onDemandCollection<T extends object, K extends string | number>(
   opts: {
     id?: string
     scope?: Record<string, string>
-    /** defaults to read-only */
-    mode?: 'append-only' | 'read-only'
+    /** what the server accepts (mirrors server/resources.ts); defaults to read-only */
+    mode?: Mode
     map?: (row: any) => T
+    /** derived search/sort fields the rows carry */
+    pushdown?: PushdownSpec
+    /** sources the row mapping reads (e.g. users for the owner name) */
+    before?: () => Promise<unknown>
     /** serves unfiltered newest-first windows from a cursor-paginated endpoint instead */
     pager?: CursorPager<T>
   } = {},
 ) {
+  const mode = opts.mode ?? 'read-only'
+  let self: AnyCollection | undefined
   const collection = createCollection(
     queryCollectionOptions({
       id: opts.id ?? entity,
@@ -359,21 +499,45 @@ function onDemandCollection<T extends object, K extends string | number>(
       queryClient,
       syncMode: 'on-demand',
       getKey,
-      staleTime: 10_000,
+      // windows are kept fresh by the change feed (live.ts), not by polling
+      staleTime: 5 * 60_000,
       ...indexing,
+      // order strings like SQLite does (byte order), so pushed-down windows are the same rows
+      defaultStringCollation: { stringSort: 'lexical' },
       queryFn: async (ctx) => {
         const subset = ctx.meta?.loadSubsetOptions
         if (opts.pager && isNewestFirstWindow(subset))
           return opts.pager.read({ offset: subset.offset, limit: subset.limit }, ctx.signal)
-        const search = loadSubsetToSearch(subset)
+        // A by-key lookup of a row we already hold — typically the tie request TanStack DB sends
+        // after every ordered window, for the window's own last row — is answered from the synced
+        // store instead of a second round trip. (The live query re-applies its filter anyway.)
+        const lookup = subset?.limit === undefined ? uniqueLookup(subset?.where) : undefined
+        if (lookup) {
+          const row = self?.base.get(lookup.id) as { order?: Record<string, string> } | undefined
+          if (row && (!lookup.field || row.order?.[lookup.field] === lookup.key)) return [row as T]
+        }
+        const search = loadSubsetToSearch(subset, opts.pushdown)
         for (const [k, v] of Object.entries(opts.scope ?? {})) search.set(k, v)
-        const rows = (await api.get<Page<T>>(`/${entity}`, Object.fromEntries(search), ctx.signal)).data
-        return opts.map ? rows.map(opts.map) : rows
+        // Deliberately not wired to ctx.signal: TanStack Query only aborts a query whose fn
+        // consumed the signal. An aborted window (the user clicked on before it arrived) is a
+        // *failed* acquisition for TanStack DB's ordered loader, which then "repairs" it with a
+        // full-source load — the unbounded where-only request we refuse at scale. A window that
+        // finishes in the background just lands in the cache (and serves the next visit).
+        const [page] = await Promise.all([api.get<Page<T>>(`/${entity}`, Object.fromEntries(search)), opts.before?.()])
+        // an unbounded subset is "every matching row": refuse instead of returning a truncated set
+        if (subset?.limit === undefined && page.total > page.data.length) {
+          const error = new SubsetTooLargeError(entity, page.total)
+          console.error(`[collections] ${error.message}`, subset)
+          throw error
+        }
+        return opts.map ? page.data.map(opts.map) : page.data
       },
-      ...(opts.mode === 'append-only' && { onInsert: save }),
+      ...(mode !== 'read-only' && { onInsert: save }),
+      ...(mode === 'crud' && { onUpdate: save, onDelete: save }),
     }),
   )
-  if (!opts.id) register(collection as AnyCollection, entity, opts.mode ?? 'read-only')
+  self = collection as AnyCollection
+  if (!opts.id) register(collection as AnyCollection, entity, mode)
   return collection
 }
 
@@ -401,17 +565,29 @@ export const sessionsCollection = serverCollection<
 export const notificationsCollection = serverCollection<Notification, number>('notifications', (n) => n.id)
 
 // ============================== CRM ==============================
-export const customersCollection = serverCollection<CustomerRow, number>('customers', (c) => c.id, { map: withCustomerDerived })
-export const contactsCollection = serverCollection<Contact, number>('contacts', (c) => c.id)
+/** 250k rows at scale: on-demand windows; search and every sort column pushed down via derived fields */
+export const customersCollection = onDemandCollection<CustomerRow, number>('customers', (c) => c.id, {
+  mode: 'crud', // archive = soft delete on the server
+  map: withCustomerDerived,
+  pushdown: { search: 'searchText', sorts: CUSTOMER_SORTS },
+  // the owner name (search, sort) comes from the users collection
+  before: () => usersCollection.toArrayWhenReady(),
+})
+export const contactsCollection = onDemandCollection<Contact, number>('contacts', (c) => c.id, { mode: 'crud' })
 export const tagsCollection = serverCollection<Tag, number>('tags', (t) => t.id)
-export const customerTagsCollection = serverCollection<CustomerTag, string>('customer-tags', (t) => t.id)
+export const customerTagsCollection = onDemandCollection<CustomerTag, string>('customer-tags', (t) => t.id, { mode: 'crud' })
 
 // ============================== catalog & billing ==============================
 export const productsCollection = serverCollection<Product, number>('products', (p) => p.id)
-export const subscriptionsCollection = serverCollection<Subscription, number>('subscriptions', (s) => s.id)
-export const invoicesCollection = serverCollection<InvoiceRow, number>('invoices', (i) => i.id, { map: withInvoiceDerived })
+export const subscriptionsCollection = onDemandCollection<Subscription, number>('subscriptions', (s) => s.id, { mode: 'crud' })
+/** 1.1M rows at scale: on-demand; the server joins in the customer company (search, sort, display) */
+export const invoicesCollection = onDemandCollection<InvoiceRow, number>('invoices', (i) => i.id, {
+  mode: 'crud', // status changes only; the server refuses creates/deletes
+  map: withInvoiceDerived,
+  pushdown: { search: 'searchText', sorts: INVOICE_SORTS },
+})
 export const mrrSnapshotsCollection = serverCollection<MrrSnapshot, string>('mrr-snapshots', (s) => s.id, { mode: 'read-only' })
-/** the payment ledger is large and append-only: load windows on demand, insert-only */
+/** the payment ledger is large (1.1M rows at scale) and append-only: windows on demand, insert-only */
 export const paymentsCollection = onDemandCollection<Payment, number>('payments', (p) => p.id, { mode: 'append-only' })
 /** issued invoices are immutable; fetched per invoice on demand */
 export const lineItemsCollection = onDemandCollection<InvoiceLineItem, number>('invoice-line-items', (l) => l.id, {
@@ -549,31 +725,20 @@ export const selectionCollection = createCollection(
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
-/** Eager collections a signed-in session needs for most pages. */
-export const CORE = [usersCollection, customersCollection, invoicesCollection, projectsCollection, tasksCollection] as const
+/** Eager collections a signed-in session needs for most pages (all small and bounded). */
+export const CORE = [usersCollection, projectsCollection, tasksCollection] as const
 
 export const preloadAll = () => Promise.all(CORE.map((c) => c.preload()))
-
-/**
- * Module-level live query collections (src/db/views.ts) over the server
- * collections. A view whose sources are cleaned up goes into an error state
- * and stays frozen, so views are torn down first on reset; a cleaned-up view
- * restarts from the fresh sources the next time it is read.
- */
-const VIEWS: AnyCollection[] = []
-export function registerViews(...views: AnyCollection[]) {
-  VIEWS.push(...views)
-}
 
 /**
  * Sign-in / sign-out: drop every server-backed collection's rows and cache so
  * nothing from the previous user can leak into the next session.
  */
 export async function resetServerCollections() {
-  await Promise.all(VIEWS.map((v) => v.cleanup()))
   const all = [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)]
   await Promise.all(all.map((c) => c.cleanup()))
   for (const p of FEED_PAGERS) p.reset()
+  customerAlertsDetector.reset()
   queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'auth' })
   // in-memory UI state that refers to the previous user's rows
   if (selectionCollection.size) selectionCollection.delete([...selectionCollection.keys()])

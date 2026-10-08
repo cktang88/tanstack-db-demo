@@ -1,5 +1,5 @@
 import { eq, useLiveQuery } from '@tanstack/react-db'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { DEFAULT_PREFS, prefsCollection, usersCollection, type Prefs } from './collections'
 
 /** Preferences live in a localStorage collection: reactive, persisted, cross-tab synced — no custom store. */
@@ -28,3 +28,26 @@ export function useUsersById() {
   const { data } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }) })
   return useMemo(() => new Map(data.map((u) => [u.id, u])), [data])
 }
+
+/**
+ * The rows of an on-demand window, keeping the previous window on screen
+ * (dimmed) while the next one loads instead of flashing an empty table.
+ */
+export function useWindow<T>(result: { data: T[] | undefined; isReady: boolean }) {
+  const [shown, setShown] = useState<T[]>([])
+  const current = result.data ?? shown
+  if (result.isReady && current !== shown) setShown(current)
+  return { rows: result.isReady ? current : shown, isPlaceholder: !result.isReady }
+}
+
+/**
+ * Live-query options for an on-demand window that the user moves (filters,
+ * sort, paging). The previous window stays subscribed for a few seconds after
+ * the UI moved on, so the rows the next window already shows from local state
+ * are not garbage-collected from under it before its own request lands: the
+ * query collection drops a subset's rows as soon as nothing holds it, and
+ * TanStack DB treats the removal of rows a window already showed as an
+ * ordering change it can only repair by loading every match (a where-only,
+ * unbounded request). It also makes going back to a window instant.
+ */
+export const WINDOW = { gcTime: 10_000 } as const

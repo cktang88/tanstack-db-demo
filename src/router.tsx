@@ -12,16 +12,14 @@ import type { Me, Permission } from '../shared/domain'
 import { ErrorView } from './components/ErrorView'
 import { Layout } from './components/Layout'
 import { Empty } from './components/ui'
+import { breakdownQuery, overviewQuery, revenueQuery, signupsQuery } from './db/aggregates'
 import {
   claimClientState,
-  customersCollection,
-  invoicesCollection,
   mrrSnapshotsCollection,
   preloadAll,
   productsCollection,
   projectsCollection,
   queryClient as dbQueryClient,
-  subscriptionsCollection,
   tasksCollection,
   teamMembersCollection,
   teamsCollection,
@@ -103,14 +101,26 @@ const requires =
 const overviewRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/',
-  loader: () => Promise.all([customersCollection.preload(), invoicesCollection.preload(), tasksCollection.preload()]),
+  // server aggregates for the KPIs and charts; the lists are on-demand windows the page loads itself
+  loader: ({ context: { queryClient } }) =>
+    Promise.all([
+      queryClient.ensureQueryData(overviewQuery()),
+      queryClient.ensureQueryData(revenueQuery(12)),
+      queryClient.ensureQueryData(signupsQuery(12)),
+      queryClient.ensureQueryData(breakdownQuery('plan')),
+    ]),
   component: OverviewPage,
 })
 
 const analyticsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/analytics',
-  loader: () => Promise.all([customersCollection.preload(), invoicesCollection.preload()]),
+  loader: ({ context: { queryClient } }) =>
+    Promise.all([
+      queryClient.ensureQueryData(breakdownQuery('country')),
+      queryClient.ensureQueryData(breakdownQuery('status')),
+      queryClient.ensureQueryData(breakdownQuery('plan')),
+    ]),
   component: AnalyticsPage,
 })
 
@@ -120,7 +130,8 @@ export const customersRoute = createRoute({
   beforeLoad: requires('customers:read'),
   validateSearch: customersSearch,
   search: { middlewares: [stripSearchParams({ page: 1, pageSize: 25, sort: '-createdAt' })] },
-  loader: () => Promise.all([customersCollection.preload(), usersCollection.preload()]),
+  // the window itself is loaded on demand by the page's live query
+  loader: () => usersCollection.preload(),
   component: CustomersPage,
 })
 
@@ -132,14 +143,8 @@ export const customerDetailRoute = createRoute({
     parse: (p) => ({ customerId: Number(p.customerId) }),
     stringify: (p) => ({ customerId: String(p.customerId) }),
   },
-  loader: () =>
-    Promise.all([
-      customersCollection.preload(),
-      invoicesCollection.preload(),
-      usersCollection.preload(),
-      subscriptionsCollection.preload(),
-      productsCollection.preload(),
-    ]),
+  // eager lookups only: the customer and its rows are loaded on demand by id / customerId
+  loader: () => Promise.all([usersCollection.preload(), productsCollection.preload()]),
   errorComponent: ErrorView,
   component: CustomerDetailPage,
 })
@@ -150,7 +155,6 @@ export const invoicesRoute = createRoute({
   beforeLoad: requires('billing:read'),
   validateSearch: invoicesSearch,
   search: { middlewares: [stripSearchParams({ page: 1, pageSize: 25, sort: '-issuedAt' })] },
-  loader: () => Promise.all([invoicesCollection.preload(), customersCollection.preload()]),
   component: InvoicesPage,
 })
 
@@ -158,7 +162,7 @@ const billingRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/billing',
   beforeLoad: requires('billing:read'),
-  loader: () => Promise.all([mrrSnapshotsCollection.preload(), invoicesCollection.preload(), customersCollection.preload()]),
+  loader: () => mrrSnapshotsCollection.preload(),
   component: BillingPage,
 })
 
@@ -166,7 +170,7 @@ const productsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/products',
   beforeLoad: requires('products:read'),
-  loader: () => Promise.all([productsCollection.preload(), subscriptionsCollection.preload()]),
+  loader: () => productsCollection.preload(),
   component: ProductsPage,
 })
 

@@ -13,10 +13,13 @@ import {
   paymentsCollection,
   persist,
   productsCollection,
+  rederiveCustomer,
+  rederiveInvoice,
   selectionCollection,
   subscriptionsCollection,
   tasksCollection,
   withCustomerDerived,
+  type CustomerRow,
 } from './collections'
 import { applyChange } from './live'
 
@@ -35,16 +38,20 @@ type Billing = Pick<Customer, 'id' | 'plan' | 'seats' | 'status' | 'mrr'>
  * Σ quantity × unit_price over the account's active/past-due subscriptions
  * (base plan at its *sold* price + add-ons), and editing the customer only
  * changes the base-plan subscription — so predict exactly that when the
- * subscriptions are loaded, and otherwise move the known MRR by the base-plan
- * delta. The real value is read back after commit either way.
+ * account's subscriptions are loaded (subscriptions are on-demand: the detail
+ * page loads them), and otherwise move the known MRR by the base-plan delta.
+ * The real value is read back after commit either way.
  */
 export function predictMrr(before: Billing, next: Pick<Customer, 'plan' | 'seats' | 'status'>) {
   // trial -> subscriptions are "trialing", churned -> canceled: neither counts
   if (next.status !== 'active') return 0
-  if (subscriptionsCollection.status === 'ready' && productsCollection.status === 'ready') {
-    const live = subscriptionsCollection.toArray.filter((s) => s.customerId === before.id && s.status !== 'canceled')
-    const kind = (s: Subscription) => productsCollection.get(s.productId)
-    const base = live.filter((s) => kind(s)?.kind === 'plan').sort((a, b) => b.id - a.id)[0]
+  const live =
+    productsCollection.status === 'ready'
+      ? subscriptionsCollection.toArray.filter((s) => s.customerId === before.id && s.status !== 'canceled')
+      : []
+  const kind = (s: Subscription) => productsCollection.get(s.productId)
+  const base = live.filter((s) => kind(s)?.kind === 'plan').sort((a, b) => b.id - a.id)[0]
+  if (base) {
     const addons = live.filter((s) => kind(s)?.kind === 'addon').reduce((sum, s) => sum + s.quantity * s.unitPrice, 0)
     // same plan keeps its sold price; a plan change starts a new subscription at list price
     const unitPrice = base && kind(base)?.planCode === next.plan ? base.unitPrice : PLAN_PRICE[next.plan]
@@ -60,6 +67,8 @@ export function applyBillingPatch(d: Billing, patch: Partial<Pick<Customer, 'pla
   const before = { id: d.id, plan: d.plan, seats: d.seats, status: d.status, mrr: d.mrr }
   Object.assign(d, patch)
   if (before.plan !== d.plan || before.seats !== d.seats || before.status !== d.status) d.mrr = predictMrr(before, d)
+  // sort keys / search text follow the optimistic values (e.g. the row moves in an MRR-sorted window)
+  if ('order' in d) rederiveCustomer(d as CustomerRow)
 }
 
 /** Create a customer with a client-generated id — the row never changes key, so nothing flickers. */
@@ -87,6 +96,7 @@ export function updateCustomers(ids: number[], patch: Partial<CustomerFormValues
         ...(status !== undefined && { status }),
       })
       d.updatedAt = new Date().toISOString()
+      rederiveCustomer(d)
     }
   })
 }
@@ -124,7 +134,7 @@ export const markInvoicePaid = createOptimisticAction<{ invoiceId: number; numbe
     invoicesCollection.update(invoiceId, (d) => {
       d.status = 'paid'
       d.paidAt = now
-      d.paidMonth = now.slice(0, 7)
+      rederiveInvoice(d)
     })
     // provisional feed entry; `derived` = not sent, replaced by the server's real event.
     // A positive (client-generated, larger than any server id) key sorts it at the head.
@@ -214,7 +224,7 @@ export const recordPayment = createOptimisticAction<{
       invoicesCollection.update(invoiceId, { metadata: { derived: true } }, (d) => {
         d.status = 'paid'
         d.paidAt = now
-        d.paidMonth = now.slice(0, 7)
+        rederiveInvoice(d)
       })
   },
   mutationFn: async (_vars, { transaction }) => persist(transaction.mutations),
@@ -234,7 +244,10 @@ export function addAddon(customerId: number, product: Product, quantity: number)
       startedAt: new Date().toISOString(),
       canceledAt: null,
     })
-    customersCollection.update(customerId, { metadata: { derived: true } }, (d) => void (d.mrr += quantity * product.unitPrice))
+    customersCollection.update(customerId, { metadata: { derived: true } }, (d) => {
+      d.mrr += quantity * product.unitPrice
+      rederiveCustomer(d)
+    })
   })
   return tx
 }
@@ -247,11 +260,10 @@ export function cancelSubscription(sub: Subscription) {
       d.canceledAt = new Date().toISOString()
     })
     if (sub.status === 'active' || sub.status === 'past_due')
-      customersCollection.update(
-        sub.customerId,
-        { metadata: { derived: true } },
-        (d) => void (d.mrr -= sub.quantity * sub.unitPrice),
-      )
+      customersCollection.update(sub.customerId, { metadata: { derived: true } }, (d) => {
+        d.mrr -= sub.quantity * sub.unitPrice
+        rederiveCustomer(d)
+      })
   })
   return tx
 }

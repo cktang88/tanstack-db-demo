@@ -1,13 +1,16 @@
 import { and, eq, useLiveQuery } from '@tanstack/react-db'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { createColumnHelper } from '@tanstack/react-table'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { AUDIT_ACTIONS } from '../../shared/domain'
 import { DataTable, type ServerFeatures } from '../components/DataTable'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { date, relative } from '../lib/format'
 import { auditCollection, usersCollection } from '../db/collections'
-import { api } from '../lib/api'
+import { WINDOW } from '../db/hooks'
+import { listTotalQuery } from '../db/aggregates'
+import { MAX_ROWS } from '../db/pushdown'
 import type { AuditParams } from '../lib/search'
 import { auditRoute } from '../router'
 
@@ -60,6 +63,7 @@ function useAuditRows(search: AuditParams) {
   // On-demand: filters + window pushed down (action[eq]/entity[eq]/actorId[eq], sort=-id, limit/offset);
   // the actor join happens locally against the eager users collection.
   const { data } = useLiveQuery({
+    ...WINDOW,
     query: (q) => {
       const base = q.from({ a: auditCollection })
       const conds = (a: any) =>
@@ -132,13 +136,10 @@ export function AuditPage() {
   const navigate = useNavigate({ from: '/audit' })
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
   const rows = useAuditRows(search)
-  const [total, setTotal] = useState(0)
-  useEffect(() => {
-    void api
-      .get<{ total: number }>('/audit-log', { limit: 0, action: search.action, entity: search.entity, actorId: search.actorId })
-      .then((r) => setTotal(r.total))
-      .catch(() => {})
-  }, [search.action, search.entity, search.actorId])
+  // the pager's total: a server count (the log itself is only ever loaded a window at a time)
+  const total =
+    useQuery(listTotalQuery('audit-log', { action: search.action, entity: search.entity, actorId: search.actorId })).data
+      ?.total ?? 0
   const set = (patch: Partial<AuditParams>) =>
     navigate({ search: (p) => ({ ...p, ...patch, page: patch.page ?? 1 }), replace: true })
   return (
@@ -152,6 +153,7 @@ export function AuditPage() {
         columns={columns}
         data={rows}
         rowCount={total}
+        maxRows={MAX_ROWS}
         pagination={{ pageIndex: search.page - 1, pageSize: search.pageSize }}
         onPaginationChange={(p) => set({ page: p.pageIndex + 1, pageSize: p.pageSize })}
         sorting={[]}
