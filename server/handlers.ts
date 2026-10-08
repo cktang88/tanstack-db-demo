@@ -216,6 +216,7 @@ export const remove = (name: string, id: unknown) =>
     else yield* sql(() => deleteRow(db, r, id))
     yield* touch(name, id, r.ownerField ? (before[r.ownerField] as number) : undefined)
     yield* audit('delete', name, id, before)
+    yield* lookup(business, name)?.afterRemove?.(before) ?? Effect.void
     return null
   })
 
@@ -229,6 +230,7 @@ interface Business {
   remove?: (before: Row) => Effect.Effect<void, any, any>
   afterCreate?: (row: Row) => Effect.Effect<void, any, any>
   afterUpdate?: (before: Row, after: Row) => Effect.Effect<void, any, any>
+  afterRemove?: (before: Row) => Effect.Effect<void, any, any>
 }
 
 const SUB_STATUS: Record<CustomerStatus, string> = { active: 'active', trial: 'trialing', churned: 'canceled' }
@@ -385,6 +387,7 @@ const business: Record<string, Business> = {
           () => (db.prepare(`SELECT id FROM contacts WHERE customer_id = ?`).get(id) as { id: number }).id,
         )
         yield* touch('contacts', contact)
+        yield* touch('customer-health', id)
         yield* audit('create', 'customers', id, undefined, row!)
         yield* recordEvent('customer.created', id, `New customer ${data.company}`)
         return row!
@@ -423,6 +426,7 @@ const business: Record<string, Business> = {
         if (next.plan !== before.plan || next.seats !== before.seats || next.status !== before.status)
           yield* syncSubscriptions(before as Customer, next)
         const after = (yield* touch('customers', before.id))!
+        yield* touch('customer-health', before.id) // mrr / status feed the health view
         yield* audit('update', 'customers', before.id, before, after)
         yield* recordEvent('customer.updated', before.id, `Updated ${after.company} (${Object.keys(patch).join(', ')})`)
         if (patch.ownerId && patch.ownerId !== before.ownerId)
@@ -523,6 +527,7 @@ const business: Record<string, Business> = {
         )
         const row = (yield* touch('subscriptions', id))!
         yield* touch('customers', data.customerId)
+        yield* touch('customer-health', data.customerId)
         yield* audit('create', 'subscriptions', id, undefined, row)
         yield* recordEvent('subscription.changed', data.customerId, `Added add-on to ${customer.company}`)
         return row
@@ -557,6 +562,7 @@ const business: Record<string, Business> = {
         if (isPlan && patch.quantity)
           yield* sql(() => db.prepare(`UPDATE customers SET seats = ? WHERE id = ?`).run(patch.quantity, before.customerId))
         yield* touch('customers', before.customerId)
+        yield* touch('customer-health', before.customerId)
         yield* audit('update', 'subscriptions', before.id, before, after)
         yield* recordEvent('subscription.changed', before.customerId, `Subscription #${before.id} changed`)
         return after
@@ -601,26 +607,46 @@ const business: Record<string, Business> = {
     create: (input) =>
       Effect.gen(function* () {
         const { db } = yield* ctx
-        const data = yield* decode(UsageEventInput, input)
+        const decoded = yield* decode(UsageEventInput, input)
+        // stored (and bucketed into usage_daily) as a UTC timestamp, whatever offset the client sent
+        const data = { ...decoded, occurredAt: toUtcIso(decoded.occurredAt) }
         const r = resources['usage-events']!
+        const customer = yield* sql(
+          () =>
+            db.prepare(`SELECT deleted_at AS deletedAt FROM customers WHERE id = ?`).get(data.customerId) as
+              | { deletedAt: string | null }
+              | undefined,
+        )
+        if (!customer) return yield* new NotFound({ entity: 'customers', id: data.customerId })
+        if (customer.deletedAt) return yield* new Conflict({ message: 'Customer is archived; usage is no longer metered' })
         if (data.idempotencyKey) {
-          const existing = yield* sql(
-            () =>
-              db.prepare(`SELECT id FROM usage_events WHERE idempotency_key = ?`).get(data.idempotencyKey) as
-                | { id: number }
-                | undefined,
-          )
-          if (existing) return (yield* sql(() => getRow(db, r, existing.id)))! // exactly-once: replay returns the original
+          // keys are scoped per customer; a replay must be the same event
+          const existing = yield* sql(() => {
+            const hit = db
+              .prepare(`SELECT id FROM usage_events WHERE customer_id = ? AND idempotency_key = ?`)
+              .get(data.customerId, data.idempotencyKey) as { id: number } | undefined
+            return hit ? getRow<Row>(db, r, hit.id) : undefined
+          })
+          if (existing) {
+            if (existing.metric !== data.metric || existing.quantity !== data.quantity || existing.occurredAt !== data.occurredAt)
+              return yield* new Conflict({ message: 'Idempotency key was already used for a different usage event' })
+            return existing // exactly-once: replay returns the original
+          }
         }
         const id = yield* sql(() => insertRow(db, r, data))
         const row = (yield* touch('usage-events', id))!
         yield* touch('usage-daily', `${data.customerId}:${data.metric}:${data.occurredAt.slice(0, 10)}`)
+        yield* touch('customer-health', data.customerId)
         return row
       }),
   },
 
   tasks: {
-    afterCreate: (row) => notify(row.assigneeId, 'assignment', 'New task assigned', row.title, 'tasks', row.id),
+    afterCreate: (row) =>
+      Effect.gen(function* () {
+        yield* touch('project-stats', row.projectId)
+        yield* notify(row.assigneeId, 'assignment', 'New task assigned', row.title, 'tasks', row.id)
+      }),
     afterUpdate: (before, after) =>
       Effect.gen(function* () {
         if (after.assigneeId !== before.assigneeId)
@@ -628,6 +654,8 @@ const business: Record<string, Business> = {
         if (after.status !== before.status)
           yield* recordEvent('task.updated', null, `Moved task "${after.title}" to ${after.status}`)
         yield* touch('project-stats', after.projectId)
+        // moved to another project: the old one lost a task (and its time)
+        if (before.projectId !== after.projectId) yield* touch('project-stats', before.projectId)
       }),
     remove: (before) =>
       Effect.gen(function* () {
@@ -670,6 +698,7 @@ const business: Record<string, Business> = {
   'time-entries': {
     afterCreate: (row) => touchProjectOfTask(row.taskId),
     afterUpdate: (_b, row) => touchProjectOfTask(row.taskId),
+    afterRemove: (before) => touchProjectOfTask(before.taskId),
   },
 
   users: {

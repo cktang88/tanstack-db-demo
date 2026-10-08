@@ -291,8 +291,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
   customer_id  INTEGER NOT NULL REFERENCES customers(id),
   metric       TEXT NOT NULL,       -- api_calls | storage_gb | active_seats
   quantity     INTEGER NOT NULL,
-  occurred_at  TEXT NOT NULL,
-  idempotency_key TEXT UNIQUE
+  occurred_at  TEXT NOT NULL,       -- UTC (…Z): usage_daily buckets by its first 10 characters
+  idempotency_key TEXT,
+  UNIQUE (customer_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_customer ON usage_events(customer_id, occurred_at);
 
