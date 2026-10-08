@@ -72,6 +72,8 @@ export function ProductsPage() {
                 <td className="td text-right">
                   {editable ? (
                     <input
+                      // remounts with the current price whenever it changes — including a rollback
+                      key={p.unitPrice}
                       type="number"
                       className="input w-28 text-right"
                       aria-label={`Price of ${p.sku}`}
@@ -79,7 +81,14 @@ export function ProductsPage() {
                       min={0}
                       step={1}
                       onBlur={(e) => {
-                        const cents = Math.round(Number(e.target.value) * 100)
+                        const input = e.currentTarget
+                        const raw = input.value.trim()
+                        const cents = Math.round(Number(raw) * 100)
+                        // empty / invalid / negative input is not "$0": put the current price back
+                        if (raw === '' || !Number.isFinite(cents) || cents < 0) {
+                          input.value = String(p.unitPrice / 100)
+                          return
+                        }
                         if (cents !== p.unitPrice) void save(p.id, (d) => void (d.unitPrice = cents))
                       }}
                     />
