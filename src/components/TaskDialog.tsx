@@ -25,7 +25,7 @@ export function TaskDialog({ task, users, canAssign, onClose }: Props) {
 }
 
 function TaskBody({ task, users, canAssign }: { task: Task; users: User[]; canAssign: boolean }) {
-  const { me, can } = useCan()
+  const { me, can, privileged } = useCan()
   const update = useUpdateTask(task.id)
   const byId = new Map(users.map((u) => [u.id, u]))
   return (
@@ -53,13 +53,30 @@ function TaskBody({ task, users, canAssign }: { task: Task; users: User[]; canAs
           </select>
         </label>
       </div>
-      <Comments taskId={task.id} byId={byId} canComment={can('comments:write')} />
-      <TimeLog taskId={task.id} byId={byId} meId={me.user.id} canLog={can('time:write')} />
+      <Comments taskId={task.id} byId={byId} meId={me.user.id} canComment={can('comments:write')} />
+      <TimeLog
+        taskId={task.id}
+        byId={byId}
+        meId={me.user.id}
+        canLog={can('time:write')}
+        // server: own entries only, unless owner/admin
+        canDelete={(e) => can('time:write') && (privileged || e.userId === me.user.id)}
+      />
     </div>
   )
 }
 
-function Comments({ taskId, byId, canComment }: { taskId: number; byId: Map<number, User>; canComment: boolean }) {
+function Comments({
+  taskId,
+  byId,
+  meId,
+  canComment,
+}: {
+  taskId: number
+  byId: Map<number, User>
+  meId: number
+  canComment: boolean
+}) {
   const { data: comments = [] } = useQuery(taskCommentsQuery(taskId))
   const add = useAddComment()
   // optimistic "via the UI": render pending comment variables until the refetch lands
@@ -99,11 +116,18 @@ function Comments({ taskId, byId, canComment }: { taskId: number; byId: Map<numb
             </li>
           )
         })}
-        {pending.map((p, i) => (
-          <li key={`p${i}`} className="opacity-50">
-            {p.body} <span className="text-xs">(sending…)</span>
-          </li>
-        ))}
+        {pending.map((p, i) => {
+          const u = byId.get(meId)
+          return (
+            <li key={`p${i}`} className="flex gap-2 opacity-60">
+              {u && <Avatar name={u.name} color={u.avatarColor} size={22} />}
+              <div>
+                <div className="text-xs text-zinc-500">{u?.name ?? 'Someone'} · sending…</div>
+                <div>{p.body}</div>
+              </div>
+            </li>
+          )
+        })}
         {comments.length + pending.length === 0 && <li className="text-zinc-500">No comments yet.</li>}
       </ul>
       {canComment && (
@@ -117,26 +141,61 @@ function Comments({ taskId, byId, canComment }: { taskId: number; byId: Map<numb
   )
 }
 
-function TimeLog({ taskId, byId, meId, canLog }: { taskId: number; byId: Map<number, User>; meId: number; canLog: boolean }) {
+type NewTimeEntry = { taskId: number; minutes: number; spentOn: string; billable: boolean; note: string }
+
+function TimeLog({
+  taskId,
+  byId,
+  meId,
+  canLog,
+  canDelete,
+}: {
+  taskId: number
+  byId: Map<number, User>
+  meId: number
+  canLog: boolean
+  canDelete: (e: { userId: number }) => boolean
+}) {
   const { data: entries = [] } = useQuery(taskTimeQuery(taskId))
   const log = useLogTime()
   const del = useDeleteTime()
-  const total = entries.reduce((s, e) => s + e.minutes, 0)
-  const billable = entries.filter((e) => e.billable).reduce((s, e) => s + e.minutes, 0)
+  // entries being logged are rendered from mutation state (dimmed) until the refetch lands
+  const logging = useMutationState({
+    filters: { mutationKey: ['time-entries', 'create'], status: 'pending' },
+    select: (m) => m.state.variables as NewTimeEntry,
+  }).filter((v) => v.taskId === taskId)
+  const deleting = new Set(
+    useMutationState({
+      filters: { mutationKey: ['time-entries', 'delete'], status: 'pending' },
+      select: (m) => m.state.variables as number,
+    }),
+  )
+  // totals count what's being logged right away (and stop counting what's being deleted)
+  const counted = [...logging, ...entries.filter((e) => !deleting.has(e.id))]
+  const total = counted.reduce((s, e) => s + e.minutes, 0)
+  const billable = counted.filter((e) => e.billable).reduce((s, e) => s + e.minutes, 0)
   return (
     <section>
       <h3 className="label">
         Time — {(total / 60).toFixed(1)}h total, {(billable / 60).toFixed(1)}h billable
       </h3>
       <ul className="max-h-40 space-y-1 overflow-auto" data-testid="time-entries">
+        {logging.map((e, i) => (
+          <li key={`p${i}`} className="flex items-center justify-between gap-2 opacity-60">
+            <span>
+              {e.spentOn} · {byId.get(meId)?.name ?? '?'} {!e.billable && <Badge value="non-billable" tone="zinc" />}
+            </span>
+            <span className="flex items-center gap-2 tabular-nums">{e.minutes}m</span>
+          </li>
+        ))}
         {entries.map((e) => (
-          <li key={e.id} className="flex items-center justify-between gap-2">
+          <li key={e.id} className={`flex items-center justify-between gap-2 ${deleting.has(e.id) ? 'opacity-60' : ''}`}>
             <span>
               {e.spentOn} · {byId.get(e.userId)?.name ?? '?'} {!e.billable && <Badge value="non-billable" tone="zinc" />}
             </span>
             <span className="flex items-center gap-2 tabular-nums">
               {e.minutes}m
-              {e.userId === meId && (
+              {canDelete(e) && (
                 <button
                   className="text-xs text-zinc-400 hover:text-red-600"
                   aria-label="Delete time entry"

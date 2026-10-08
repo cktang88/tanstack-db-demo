@@ -1,9 +1,9 @@
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { useMutationState, useQuery, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
 import { Activity, useOptimistic, useState, useTransition } from 'react'
 import { ROLES, type Role, type User } from '../../shared/domain'
 import { Avatar, Badge, Card, Empty, PageHeader, Segmented, Skeleton } from '../components/ui'
 import { date, titleCase } from '../lib/format'
-import { useUpdateUser } from '../lib/mutations'
+import { fetchOpenTaskIds, useReassignTasks, useUpdateUser, type Reassignment } from '../lib/mutations'
 import {
   assigneeTasksQuery,
   permissionsQuery,
@@ -16,10 +16,15 @@ import {
 } from '../lib/queries'
 import { useCan } from '../lib/auth'
 import { useTeamMembership } from '../lib/mutations'
+import { toast } from '../lib/toast'
 
 export function TeamPage() {
   const [tab, setTab] = useState<'members' | 'teams' | 'roles' | 'workload'>('members')
   const [selected, setSelected] = useState<number | null>(null)
+  // The staged reassignment lives here, not in <Rebalance>: that panel sits in
+  // an <Activity> (hidden tabs keep their state). It is plain React state, never
+  // written to the query cache, so leaving the page simply drops the preview.
+  const [draft, setDraft] = useState<Reassignment | null>(null)
   return (
     <>
       <PageHeader
@@ -53,7 +58,7 @@ export function TeamPage() {
         <RolesMatrix />
       </Activity>
       <Activity mode={tab === 'workload' ? 'visible' : 'hidden'}>
-        <Workload />
+        <Workload draft={draft} setDraft={setDraft} />
       </Activity>
     </>
   )
@@ -155,25 +160,155 @@ function MemberTasks({ userId }: { userId: number | null }) {
   )
 }
 
-function Workload() {
-  const { data = [] } = useQuery(workloadQuery())
-  const max = Math.max(1, ...data.map((d) => d.open + d.done))
+type WorkloadRow = { userId: number; name: string; open: number; done: number }
+
+/** Move `n` open tasks from one member to another in the server's numbers (a preview, nothing is written). */
+function overlay(rows: WorkloadRow[], r: Reassignment | null | undefined): WorkloadRow[] {
+  if (!r) return rows
+  const n = r.taskIds.length
+  return rows
+    .map((d) => (d.userId === r.fromId ? { ...d, open: d.open - n } : d.userId === r.toId ? { ...d, open: d.open + n } : d))
+    .sort((a, b) => b.open - a.open || a.name.localeCompare(b.name))
+}
+
+function Workload({ draft, setDraft }: { draft: Reassignment | null; setDraft: (d: Reassignment | null) => void }) {
+  const { data = [], dataUpdatedAt } = useQuery(workloadQuery())
+  // a save in flight keeps showing its numbers until workload data fetched after it lands
+  const saving = useMutationState({
+    filters: { mutationKey: ['tasks', 'reassign'], status: 'pending' },
+    select: (m) => ({ ...(m.state.variables as Reassignment), at: m.state.submittedAt }),
+  }).filter((r) => r.at >= dataUpdatedAt)
+  const rows = [draft, ...saving].reduce(overlay, data)
+  const max = Math.max(1, ...rows.map((d) => d.open + d.done))
+  const { can, privileged } = useCan()
+  // reassigning across every project needs owner/admin (members may only edit their teams' projects)
+  const canRebalance = can('projects:write') && privileged
   return (
-    <Card title="Open vs done tasks per member">
-      <ul className="space-y-2" data-testid="workload">
-        {data.map((d) => (
-          <li key={d.userId} className="grid grid-cols-[160px_1fr_80px] items-center gap-3 text-sm">
-            <span className="truncate">{d.name}</span>
-            <div className="flex h-3 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
-              <div className="bg-amber-500" style={{ width: `${(d.open / max) * 100}%` }} />
-              <div className="bg-emerald-500" style={{ width: `${(d.done / max) * 100}%` }} />
+    <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+      <Card title="Open vs done tasks per member">
+        <ul className="space-y-2" data-testid="workload">
+          {rows.map((d) => (
+            <li key={d.userId} className="grid grid-cols-[160px_1fr_90px] items-center gap-3 text-sm" data-testid="workload-row">
+              <span className="truncate">{d.name}</span>
+              <div className="flex h-3 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+                <div className="bg-amber-500 transition-all" style={{ width: `${(d.open / max) * 100}%` }} />
+                <div className="bg-emerald-500 transition-all" style={{ width: `${(d.done / max) * 100}%` }} />
+              </div>
+              <span className="text-right text-xs text-zinc-500 tabular-nums" data-testid="workload-open">
+                {d.open} open · {d.done}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </Card>
+      {canRebalance && <Rebalance users={rows} draft={draft} setDraft={setDraft} />}
+    </div>
+  )
+}
+
+/**
+ * A staged draft: Preview fetches the member's open tasks and overlays the
+ * move on the workload above without sending anything; Save writes it as one
+ * atomic batch, Discard just forgets it.
+ */
+function Rebalance({
+  users,
+  draft,
+  setDraft,
+}: {
+  users: WorkloadRow[]
+  draft: Reassignment | null
+  setDraft: (d: Reassignment | null) => void
+}) {
+  const qc = useQueryClient()
+  const reassign = useReassignTasks()
+  const [from, setFrom] = useState<number | ''>('')
+  const [to, setTo] = useState<number | ''>('')
+  const [loading, setLoading] = useState(false)
+
+  const preview = async () => {
+    if (from === '' || to === '' || from === to) return
+    setLoading(true)
+    try {
+      const taskIds = await fetchOpenTaskIds(qc, from)
+      if (!taskIds.length) return void toast.info('Nothing to move', 'That member has no open tasks')
+      setDraft({ fromId: from, toId: to, taskIds })
+    } catch (e) {
+      toast.error('Could not load open tasks', (e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+  const save = () => {
+    if (!draft) return
+    setDraft(null)
+    reassign.mutate(draft)
+  }
+
+  return (
+    <Card title="Rebalance workload">
+      <div className="space-y-3 text-sm">
+        <label className="block">
+          <span className="label">Move all open tasks from</span>
+          <select
+            className="input"
+            aria-label="From member"
+            value={from}
+            disabled={!!draft}
+            onChange={(e) => setFrom(e.target.value ? Number(e.target.value) : '')}
+          >
+            <option value="">Choose…</option>
+            {users.map((u) => (
+              <option key={u.userId} value={u.userId}>
+                {u.name} ({u.open} open)
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="block">
+          <span className="label">to</span>
+          <select
+            className="input"
+            aria-label="To member"
+            value={to}
+            disabled={!!draft}
+            onChange={(e) => setTo(e.target.value ? Number(e.target.value) : '')}
+          >
+            <option value="">Choose…</option>
+            {users.map((u) => (
+              <option key={u.userId} value={u.userId}>
+                {u.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        {draft ? (
+          <div
+            className="rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-500/30 dark:bg-amber-500/10"
+            data-testid="rebalance-draft"
+          >
+            <p className="mb-2">
+              Previewing <b>{draft.taskIds.length}</b> reassigned tasks — nothing has been sent yet.
+            </p>
+            <div className="flex gap-2">
+              <button className="btn-primary" onClick={save}>
+                Save
+              </button>
+              <button className="btn-secondary" onClick={() => setDraft(null)}>
+                Discard
+              </button>
             </div>
-            <span className="text-right text-xs text-zinc-500 tabular-nums">
-              {d.open} open · {d.done}
-            </span>
-          </li>
-        ))}
-      </ul>
+          </div>
+        ) : (
+          <button
+            className="btn-secondary"
+            disabled={from === '' || to === '' || from === to || loading}
+            onClick={() => void preview()}
+          >
+            Preview
+          </button>
+        )}
+      </div>
     </Card>
   )
 }
