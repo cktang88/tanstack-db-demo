@@ -28,18 +28,26 @@ export function useMe() {
   return useSuspenseQuery(meQuery()).data
 }
 
+type ProjectAccess = { teamId: number | null; ownerId: number | null }
+
 export function useCan() {
   const me = useMe()
   const privileged = me.user.role === 'owner' || me.user.role === 'admin'
+  /** row-level rule mirrored from the server: members may only edit projects they own or that belong to one of their teams */
+  const canEditProject = (p: ProjectAccess) =>
+    me.permissions.includes('projects:write') &&
+    (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId)))
   return {
     me,
     can: (p: Permission) => me.permissions.includes(p),
     /** row-level rule mirrored from the server: members may only edit customers they own */
     canEditCustomer: (c: { ownerId: number | null }) =>
       me.permissions.includes('customers:write') && (privileged || c.ownerId === me.user.id),
-    canEditProject: (p: { teamId: number | null; ownerId: number | null }) =>
-      me.permissions.includes('projects:write') &&
-      (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId))),
+    canEditProject,
+    /** tasks: project editors, plus the task's assignee (server: tasks.canWrite) */
+    canEditTask: (p: ProjectAccess | undefined, t: { assigneeId: number | null }) =>
+      (!!p && canEditProject(p)) || (me.permissions.includes('projects:write') && t.assigneeId === me.user.id),
+    privileged,
   }
 }
 

@@ -1,9 +1,10 @@
 import { and, count, eq, SchemaValidationError, sum, useLiveQuery } from '@tanstack/react-db'
-import { useActionState } from 'react'
+import { useState, type FormEvent } from 'react'
 import type { User } from '../../shared/domain'
 import {
   commentsCollection,
   newId,
+  projectsCollection,
   tasksCollection,
   timeEntriesCollection,
   usersCollection,
@@ -35,8 +36,15 @@ export function TaskDialog({ taskId, onClose }: { taskId: number | null; onClose
 }
 
 function TaskBody({ task }: { task: TaskRow }) {
-  const { me, can } = useCan()
+  const { me, can, canEditTask, privileged } = useCan()
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const { data: project } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: projectsCollection })
+        .where(({ p }) => eq(p.id, task.projectId))
+        .findOne(),
+  })
   const byId = new Map(users.map((u) => [u.id, u]))
   return (
     <div className="space-y-5 text-sm" data-testid="task-dialog">
@@ -49,7 +57,7 @@ function TaskBody({ task }: { task: TaskRow }) {
             className="input w-44"
             aria-label="Assignee"
             value={task.assigneeId ?? ''}
-            disabled={!can('projects:write')}
+            disabled={!canEditTask(project, task)}
             onChange={(e) =>
               tasksCollection
                 .update(task.id, (d) => void (d.assigneeId = e.target.value ? Number(e.target.value) : null))
@@ -67,7 +75,14 @@ function TaskBody({ task }: { task: TaskRow }) {
         </label>
       </div>
       <Comments taskId={task.id} byId={byId} meId={me.user.id} canComment={can('comments:write')} />
-      <TimeLog taskId={task.id} byId={byId} meId={me.user.id} canLog={can('time:write')} />
+      <TimeLog
+        taskId={task.id}
+        byId={byId}
+        meId={me.user.id}
+        canLog={can('time:write')}
+        // server: own entries only, unless owner/admin
+        canDelete={(e) => can('time:write') && (privileged || e.userId === me.user.id)}
+      />
     </div>
   )
 }
@@ -91,19 +106,24 @@ function Comments({
         .orderBy(({ c }) => c.createdAt)
         .orderBy(({ c }) => c.id),
   })
-  const [error, action] = useActionState((_: string | null, f: FormData) => {
+  // controlled + onSubmit (a form action would reset the input) so a rejected comment stays editable
+  const [body, setBody] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const post = (e: FormEvent) => {
+    e.preventDefault()
     try {
       // append-only collection (insert handler only); the Effect Schema rejects empty bodies before render
       commentsCollection
-        .insert({ id: newId(), taskId, authorId: meId, body: field(f, 'body'), createdAt: new Date().toISOString() })
+        .insert({ id: newId(), taskId, authorId: meId, body: body.trim(), createdAt: new Date().toISOString() })
         .when('settled')
         .catch(rollback('Could not post comment — removed'))
-      return null
+      setBody('')
+      setError(null)
     } catch (e) {
-      if (e instanceof SchemaValidationError) return e.issues[0]?.message ?? 'Invalid comment'
+      if (e instanceof SchemaValidationError) return setError(e.issues[0]?.message ?? 'Invalid comment')
       throw e
     }
-  }, null)
+  }
   return (
     <section>
       <h3 className="label">Discussion (append-only)</h3>
@@ -125,8 +145,15 @@ function Comments({
         {comments.length === 0 && <li className="text-zinc-500">No comments yet.</li>}
       </ul>
       {canComment && (
-        <form action={action} className="mt-2 flex gap-2">
-          <input name="body" className="input" placeholder="Write a comment…" aria-label="Comment" />
+        <form onSubmit={post} className="mt-2 flex gap-2">
+          <input
+            name="body"
+            className="input"
+            placeholder="Write a comment…"
+            aria-label="Comment"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+          />
           <button className="btn-secondary">Post</button>
         </form>
       )}
@@ -135,7 +162,19 @@ function Comments({
   )
 }
 
-function TimeLog({ taskId, byId, meId, canLog }: { taskId: number; byId: Map<number, User>; meId: number; canLog: boolean }) {
+function TimeLog({
+  taskId,
+  byId,
+  meId,
+  canLog,
+  canDelete,
+}: {
+  taskId: number
+  byId: Map<number, User>
+  meId: number
+  canLog: boolean
+  canDelete: (e: { userId: number }) => boolean
+}) {
   const { data: entries } = useLiveQuery({
     query: (q) =>
       q
@@ -174,7 +213,7 @@ function TimeLog({ taskId, byId, meId, canLog }: { taskId: number; byId: Map<num
             </span>
             <span className="flex items-center gap-2 tabular-nums">
               {e.minutes}m
-              {e.userId === meId && (
+              {canDelete(e) && (
                 <button
                   className="text-xs text-zinc-400 hover:text-red-600"
                   aria-label="Delete time entry"
