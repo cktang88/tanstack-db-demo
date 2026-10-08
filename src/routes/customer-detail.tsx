@@ -435,9 +435,12 @@ function InvoiceDetail({ invoice }: { invoice: Invoice }) {
               ))}
             </select>
             <button className="btn-secondary">Record payment</button>
-            <button type="button" className="btn-ghost text-red-600" onClick={() => voidIt.mutate(invoice.id)}>
-              Void
-            </button>
+            {/* the server refuses (409) to void an invoice that already has payments */}
+            {payments.length === 0 && (
+              <button type="button" className="btn-ghost text-red-600" onClick={() => voidIt.mutate(invoice.id)}>
+                Void
+              </button>
+            )}
           </form>
         )}
       </div>
