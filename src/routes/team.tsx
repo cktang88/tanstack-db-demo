@@ -74,7 +74,10 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
 
 function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean; onSelect: () => void }) {
   const update = useUpdateUser(user.id)
-  const canManage = useCan().can('team:manage')
+  const { can, me } = useCan()
+  // mirrors the server: no changing your own role, only the owner may touch (or grant) 'owner'
+  const isOwner = me.user.role === 'owner'
+  const locked = !can('team:manage') || user.id === me.user.id || (user.role === 'owner' && !isOwner)
   // React 19 useOptimistic: the select shows the new role immediately during the transition
   const [role, setOptimisticRole] = useOptimistic(user.role)
   const [, startTransition] = useTransition()
@@ -97,7 +100,7 @@ function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean
         className="input w-28"
         aria-label={`Role for ${user.name}`}
         value={role}
-        disabled={user.role === 'owner' || !canManage}
+        disabled={locked}
         onChange={(e) => {
           const next = e.target.value as Role
           startTransition(async () => {
@@ -106,7 +109,7 @@ function MemberRow({ user, selected, onSelect }: { user: User; selected: boolean
           })
         }}
       >
-        {ROLES.map((r) => (
+        {ROLES.filter((r) => r !== 'owner' || isOwner || role === 'owner').map((r) => (
           <option key={r} value={r}>
             {titleCase(r)}
           </option>

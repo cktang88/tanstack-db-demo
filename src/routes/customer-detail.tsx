@@ -47,7 +47,7 @@ export function CustomerDetailPage() {
   const { data: users = [] } = useQuery(usersQuery())
   const { data: balance } = useQuery(customerBalanceQuery(customerId))
   const { data: health } = useQuery(customerHealthQuery(customerId))
-  const { can, canEditCustomer } = useCan()
+  const { can, canEditCustomer, privileged } = useCan()
   const owner = users.find((u) => u.id === customer.ownerId)
   const update = useUpdateCustomer(customerId)
   const del = useDeleteCustomers()
@@ -73,7 +73,7 @@ export function CustomerDetailPage() {
             <button className="btn-secondary" onClick={() => setEditing(true)} disabled={!editable}>
               Edit
             </button>
-            {can('customers:delete') && (
+            {can('customers:delete') && editable && (
               <button
                 className="btn-danger"
                 onClick={() => {
@@ -138,6 +138,7 @@ export function CustomerDetailPage() {
       <Dialog open={editing} onClose={() => setEditing(false)} title="Edit customer">
         <CustomerForm
           initial={customer}
+          canAssignOwner={privileged}
           submitLabel="Save changes"
           onSubmit={(patch) => update.mutateAsync({ id: customer.id, patch })}
           onDone={() => setEditing(false)}

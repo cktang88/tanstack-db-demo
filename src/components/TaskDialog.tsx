@@ -8,15 +8,23 @@ import { useAddComment, useDeleteTime, useLogTime, useUpdateTask } from '../lib/
 import { taskCommentsQuery, taskTimeQuery } from '../lib/queries'
 import { Avatar, Badge, Dialog } from './ui'
 
-export function TaskDialog({ task, users, onClose }: { task: Task | null; users: User[]; onClose: () => void }) {
+interface Props {
+  task: Task | null
+  users: User[]
+  /** may (re)assign the task: only for those who can edit the project, not just the assignee */
+  canAssign: boolean
+  onClose: () => void
+}
+
+export function TaskDialog({ task, users, canAssign, onClose }: Props) {
   return (
     <Dialog open={!!task} onClose={onClose} title={task?.title ?? ''}>
-      {task && <TaskBody task={task} users={users} />}
+      {task && <TaskBody task={task} users={users} canAssign={canAssign} />}
     </Dialog>
   )
 }
 
-function TaskBody({ task, users }: { task: Task; users: User[] }) {
+function TaskBody({ task, users, canAssign }: { task: Task; users: User[]; canAssign: boolean }) {
   const { me, can } = useCan()
   const update = useUpdateTask(task.id)
   const byId = new Map(users.map((u) => [u.id, u]))
@@ -31,7 +39,7 @@ function TaskBody({ task, users }: { task: Task; users: User[] }) {
             className="input w-44"
             aria-label="Assignee"
             value={task.assigneeId ?? ''}
-            disabled={!can('projects:write')}
+            disabled={!canAssign || task.id < 0}
             onChange={(e) =>
               update.mutate({ id: task.id, patch: { assigneeId: e.target.value ? Number(e.target.value) : null } })
             }

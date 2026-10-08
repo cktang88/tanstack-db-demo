@@ -1,9 +1,10 @@
 import { useMutationState, useSuspenseQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { useActionState, useMemo, useRef, useState, ViewTransition, type RefObject } from 'react'
-import { TASK_PRIORITIES, TASK_STATUSES, type Task, type TaskStatus, type User } from '../../shared/domain'
+import { TASK_PRIORITIES, TASK_STATUSES, type Project, type Task, type TaskStatus, type User } from '../../shared/domain'
 import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
+import { useCan } from '../lib/auth'
 import { date, titleCase } from '../lib/format'
 import { useCreateTask, useDeleteTask, useUpdateTask, type NewTask } from '../lib/mutations'
 import { projectQuery, projectTasksQuery, usersQuery } from '../lib/queries'
@@ -14,6 +15,7 @@ export function ProjectBoardPage() {
   const { data: project } = useSuspenseQuery(projectQuery(projectId))
   const { data: tasks } = useSuspenseQuery(projectTasksQuery(projectId))
   const { data: users } = useSuspenseQuery(usersQuery())
+  const { canEditProject } = useCan()
   const [assignee, setAssignee] = useState<number | 'all'>('all')
   const [openId, setOpenId] = useState<number | null>(null)
   // Drag & drop: the column records where a card was dropped and the card
@@ -66,7 +68,12 @@ export function ProjectBoardPage() {
           </select>
         }
       />
-      <TaskDialog task={tasks.find((t) => t.id === openId) ?? null} users={users} onClose={() => setOpenId(null)} />
+      <TaskDialog
+        task={tasks.find((t) => t.id === openId) ?? null}
+        users={users}
+        canAssign={canEditProject(project)}
+        onClose={() => setOpenId(null)}
+      />
       <div className="grid gap-4 lg:grid-cols-4" data-testid="board">
         {columns.map((col) => (
           <Column
@@ -74,7 +81,7 @@ export function ProjectBoardPage() {
             status={col.status}
             tasks={col.tasks}
             users={users}
-            projectId={projectId}
+            project={project}
             dropTarget={dropTarget}
             onOpen={(t) => setOpenId(t.id)}
           />
@@ -88,17 +95,18 @@ function Column({
   status,
   tasks,
   users,
-  projectId,
+  project,
   dropTarget,
   onOpen,
 }: {
   status: TaskStatus
   tasks: Task[]
   users: User[]
-  projectId: number
+  project: Project
   dropTarget: RefObject<TaskStatus | null>
   onOpen: (t: Task) => void
 }) {
+  const { canEditProject } = useCan()
   const [over, setOver] = useState(false)
   return (
     <section
@@ -124,11 +132,11 @@ function Column({
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} users={users} dropTarget={dropTarget} onOpen={onOpen} />
+            <TaskCard task={t} users={users} project={project} dropTarget={dropTarget} onOpen={onOpen} />
           </ViewTransition>
         ))}
       </ul>
-      {status === 'todo' && <NewTaskForm projectId={projectId} />}
+      {status === 'todo' && canEditProject(project) && <NewTaskForm projectId={project.id} />}
     </section>
   )
 }
@@ -136,11 +144,13 @@ function Column({
 function TaskCard({
   task,
   users,
+  project,
   dropTarget,
   onOpen,
 }: {
   task: Task
   users: User[]
+  project: Project
   dropTarget: RefObject<TaskStatus | null>
   onOpen: (t: Task) => void
 }) {
@@ -149,9 +159,11 @@ function TaskCard({
   const assignee = users.find((u) => u.id === task.assigneeId)
   const idx = TASK_STATUSES.indexOf(task.status)
   const optimistic = task.id < 0
+  // viewers / non-team members get a read-only card (the server would 403 and we'd roll back)
+  const editable = useCan().canEditTask(task, project)
   return (
     <li
-      draggable={!optimistic}
+      draggable={!optimistic && editable}
       onDragStart={(e) => {
         dropTarget.current = null
         e.dataTransfer.setData('text/task', String(task.id))
@@ -162,20 +174,22 @@ function TaskCard({
         if (status && status !== task.status) update.mutate({ id: task.id, patch: { status } })
       }}
       data-testid="task-card"
-      className={`card group cursor-grab p-3 text-sm ${optimistic ? 'opacity-60' : ''}`}
+      className={`card group p-3 text-sm ${editable ? 'cursor-grab' : ''} ${optimistic ? 'opacity-60' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
         <button className="text-left font-medium hover:text-brand-600" data-testid="task-title" onClick={() => onOpen(task)}>
           {task.title}
         </button>
-        <button
-          className="text-xs text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-red-600"
-          aria-label={`Delete ${task.title}`}
-          onClick={() => del.mutate(task.id)}
-          disabled={optimistic}
-        >
-          ✕
-        </button>
+        {editable && (
+          <button
+            className="text-xs text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-red-600"
+            aria-label={`Delete ${task.title}`}
+            onClick={() => del.mutate(task.id)}
+            disabled={optimistic}
+          >
+            ✕
+          </button>
+        )}
       </div>
       <div className="mt-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
@@ -184,24 +198,26 @@ function TaskCard({
         </div>
         {assignee && <Avatar name={assignee.name} color={assignee.avatarColor} size={20} />}
       </div>
-      <div className="mt-2 flex justify-between">
-        <button
-          className="btn-ghost px-1.5 py-0.5 text-xs"
-          disabled={idx === 0 || optimistic}
-          aria-label="Move left"
-          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx - 1]! } })}
-        >
-          ←
-        </button>
-        <button
-          className="btn-ghost px-1.5 py-0.5 text-xs"
-          disabled={idx === TASK_STATUSES.length - 1 || optimistic}
-          aria-label="Move right"
-          onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx + 1]! } })}
-        >
-          →
-        </button>
-      </div>
+      {editable && (
+        <div className="mt-2 flex justify-between">
+          <button
+            className="btn-ghost px-1.5 py-0.5 text-xs"
+            disabled={idx === 0 || optimistic}
+            aria-label="Move left"
+            onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx - 1]! } })}
+          >
+            ←
+          </button>
+          <button
+            className="btn-ghost px-1.5 py-0.5 text-xs"
+            disabled={idx === TASK_STATUSES.length - 1 || optimistic}
+            aria-label="Move right"
+            onClick={() => update.mutate({ id: task.id, patch: { status: TASK_STATUSES[idx + 1]! } })}
+          >
+            →
+          </button>
+        </div>
+      )}
     </li>
   )
 }

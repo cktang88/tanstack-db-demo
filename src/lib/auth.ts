@@ -30,19 +30,34 @@ export function useMe() {
   return useSuspenseQuery(meQuery()).data
 }
 
-export function useCan() {
-  const me = useMe()
+type ProjectRef = { teamId: number | null; ownerId: number | null }
+
+/**
+ * Permission + row-level rules, mirrored from the server (server/resources.ts)
+ * so the UI doesn't offer actions that would only 403 and roll back.
+ */
+export function permissionsFor(me: Me) {
+  const can = (p: Permission) => me.permissions.includes(p)
   const privileged = me.user.role === 'owner' || me.user.role === 'admin'
+  const canEditProject = (p: ProjectRef) =>
+    can('projects:write') && (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId)))
   return {
     me,
-    can: (p: Permission) => me.permissions.includes(p),
-    /** row-level rule mirrored from the server: members may only edit customers they own */
-    canEditCustomer: (c: { ownerId: number | null }) =>
-      me.permissions.includes('customers:write') && (privileged || c.ownerId === me.user.id),
-    canEditProject: (p: { teamId: number | null; ownerId: number | null }) =>
-      me.permissions.includes('projects:write') &&
-      (privileged || p.ownerId === me.user.id || (p.teamId !== null && me.teamIds.includes(p.teamId))),
+    can,
+    /** owners/admins bypass row-level rules (and may (re)assign account owners) */
+    privileged,
+    /** members may only edit (and archive) customers they own */
+    canEditCustomer: (c: { ownerId: number | null }) => can('customers:write') && (privileged || c.ownerId === me.user.id),
+    /** members may only touch projects owned by them or one of their teams (includes creating tasks there) */
+    canEditProject,
+    /** a task's assignee may move/edit/delete it even in a foreign project (but not reassign it) */
+    canEditTask: (t: { assigneeId: number | null }, p: ProjectRef) =>
+      can('projects:write') && (t.assigneeId === me.user.id || canEditProject(p)),
   }
+}
+
+export function useCan() {
+  return permissionsFor(useMe())
 }
 
 export function useLogin({ redirect }: { redirect?: string } = {}) {

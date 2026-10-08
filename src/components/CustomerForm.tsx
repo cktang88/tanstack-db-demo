@@ -11,6 +11,11 @@ interface Props {
   submitLabel: string
   onSubmit: (values: CustomerFormValues) => Promise<unknown>
   onDone?: () => void
+  /**
+   * Only owners/admins may (re)assign the account owner: the server forces
+   * ownerId = self on create and rejects reassignment by members.
+   */
+  canAssignOwner?: boolean
 }
 
 type State = { errors: Record<string, string>; values: Record<string, string> }
@@ -25,7 +30,7 @@ function SubmitButton({ label }: { label: string }) {
   )
 }
 
-export function CustomerForm({ initial, submitLabel, onSubmit, onDone }: Props) {
+export function CustomerForm({ initial, submitLabel, onSubmit, onDone, canAssignOwner = true }: Props) {
   const { data: users = [] } = useQuery(usersQuery())
   const [state, action] = useActionState<State, FormData>(
     async (_prev, form) => {
@@ -97,7 +102,14 @@ export function CustomerForm({ initial, submitLabel, onSubmit, onDone }: Props) 
       </label>
       <label className="col-span-2">
         <span className="label">Account owner</span>
-        <select name="ownerId" className="input" defaultValue={v('ownerId')}>
+        {/* a disabled <select> isn't submitted: send the fixed value via a hidden input */}
+        {!canAssignOwner && <input type="hidden" name="ownerId" value={v('ownerId')} />}
+        <select
+          name={canAssignOwner ? 'ownerId' : undefined}
+          className="input"
+          defaultValue={v('ownerId')}
+          disabled={!canAssignOwner}
+        >
           <option value="">Unassigned</option>
           {users.map((u) => (
             <option key={u.id} value={u.id}>

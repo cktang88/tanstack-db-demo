@@ -68,7 +68,7 @@ function useColumns(users: User[]) {
 }
 
 export function CustomersPage() {
-  const { can } = useCan()
+  const { can, canEditCustomer, privileged, me } = useCan()
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
   const qc = useQueryClient()
@@ -79,6 +79,7 @@ export function CustomersPage() {
   const create = useCreateCustomer()
   const bulk = useBulkUpdateCustomers()
   const del = useDeleteCustomers()
+  const rows = query.data?.data ?? EMPTY
 
   const setSearch = (patch: Partial<CustomerListParams>, resetPage = true) =>
     navigate({ search: (prev) => ({ ...prev, ...patch, ...(resetPage ? { page: 1 } : {}) }), replace: true })
@@ -112,7 +113,7 @@ export function CustomersPage() {
       <DataTable
         testId="customers-table"
         columns={columns}
-        data={query.data?.data ?? EMPTY}
+        data={rows}
         rowCount={query.data?.total ?? 0}
         isFetching={query.isFetching}
         isPlaceholder={query.isPlaceholderData}
@@ -170,25 +171,34 @@ export function CustomersPage() {
             </select>
           </div>
         }
-        bulkActions={(ids, clear) =>
-          !can('customers:write') ? (
-            <span className="text-zinc-500">read-only</span>
-          ) : (
+        bulkActions={(ids, clear) => {
+          // Only act on rows that are still listed and that the server will let us
+          // change (members: their own accounts) instead of firing doomed requests.
+          const selected = ids.flatMap((id) => rows.find((r) => r.id === id) ?? [])
+          const editable = selected.filter(canEditCustomer).map((c) => c.id)
+          const archivable = can('customers:delete') ? editable : []
+          if (!editable.length) return <span className="text-zinc-500">read-only</span>
+          return (
             <>
+              {editable.length < ids.length && (
+                <span className="text-xs text-zinc-500" data-testid="bulk-editable">
+                  {editable.length} you can edit
+                </span>
+              )}
               {CUSTOMER_STATUSES.map((s) => (
                 <button
                   key={s}
                   className="btn-secondary py-1 text-xs"
-                  onClick={() => bulk.mutate({ ids, patch: { status: s } }, { onSuccess: clear })}
+                  onClick={() => bulk.mutate({ ids: editable, patch: { status: s } }, { onSuccess: clear })}
                 >
                   Mark {s}
                 </button>
               ))}
-              {can('customers:delete') && (
+              {archivable.length > 0 && (
                 <button
                   className="btn-danger py-1 text-xs"
                   onClick={() => {
-                    if (confirm(`Archive ${ids.length} customers?`)) del.mutate(ids, { onSuccess: clear })
+                    if (confirm(`Archive ${archivable.length} customers?`)) del.mutate(archivable, { onSuccess: clear })
                   }}
                 >
                   Archive
@@ -196,10 +206,17 @@ export function CustomersPage() {
               )}
             </>
           )
-        }
+        }}
       />
       <Dialog open={creating} onClose={() => setCreating(false)} title="New customer">
-        <CustomerForm submitLabel="Create customer" onSubmit={(v) => create.mutateAsync(v)} onDone={() => setCreating(false)} />
+        <CustomerForm
+          submitLabel="Create customer"
+          // members always own the accounts they create (the server enforces it)
+          initial={privileged ? undefined : { ownerId: me.user.id }}
+          canAssignOwner={privileged}
+          onSubmit={(v) => create.mutateAsync(v)}
+          onDone={() => setCreating(false)}
+        />
       </Dialog>
     </>
   )
