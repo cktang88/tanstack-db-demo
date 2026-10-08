@@ -1,27 +1,11 @@
 import { afterAll, describe, expect, it } from 'vite-plus/test'
-import { Effect } from 'effect'
-import { Sqlite } from '../../server/services.ts'
-import { testApp, type Role } from './helpers.ts'
-
-const dbOf = (app: ReturnType<typeof testApp>) =>
-  app.runtime.runSync(
-    Effect.gen(function* () {
-      return yield* Sqlite
-    }),
-  )
+import { testApp } from './helpers.ts'
 
 const t = testApp()
 afterAll(t.dispose)
 const { app } = t
 
-const login = async (role: Role) => {
-  const res = await app.request('/api/auth/login', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email: `${role}@saasly.dev`, password: 'password' }),
-  })
-  return ((await res.json()) as { token: string }).token
-}
+const { login } = t
 const auth = (token: string) => ({ authorization: `Bearer ${token}` })
 
 describe('write transactions', () => {
@@ -126,7 +110,7 @@ describe('demo features outside demo mode', () => {
 describe('sessions & sign-in', () => {
   it('stores only a hash of the session token', async () => {
     const token = await login('billing')
-    const db = dbOf(t)
+    const db = t.db()
     const ids = (db.prepare(`SELECT id FROM sessions`).all() as Array<{ id: string }>).map((r) => r.id)
     expect(ids).not.toContain(token)
     const mine = await app.request('/api/sessions', { headers: auth(token) })
@@ -172,36 +156,7 @@ describe('request ids & error messages', () => {
   })
 })
 
-const openStream = async (token: string) => {
-  const res = await app.request('/api/events/stream', { headers: auth(token) })
-  const reader = res.body!.getReader()
-  const dec = new TextDecoder()
-  const events: Array<{ event?: string; data?: string }> = []
-  let buf = ''
-  let closed = false
-  void (async () => {
-    for (;;) {
-      const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }))
-      if (done) return void (closed = true)
-      buf += dec.decode(value)
-      for (let i = buf.indexOf('\n\n'); i >= 0; i = buf.indexOf('\n\n')) {
-        const chunk = buf.slice(0, i)
-        buf = buf.slice(i + 2)
-        events.push({ event: /^event: (.*)$/m.exec(chunk)?.[1], data: /^data: (.*)$/m.exec(chunk)?.[1] })
-      }
-    }
-  })()
-  const until = async (pred: () => boolean, ms = 3000) => {
-    const start = Date.now()
-    while (!pred()) {
-      if (Date.now() - start > ms) throw new Error('timed out waiting for the stream')
-      await new Promise((r) => setTimeout(r, 5))
-    }
-  }
-  const changes = () => events.filter((e) => e.event === 'change').map((e) => JSON.parse(e.data!))
-  await until(() => events.some((e) => e.event === 'ready'))
-  return { events, changes, until, closed: () => closed, cancel: () => reader.cancel().catch(() => {}) }
-}
+const { openStream } = t
 
 describe('change stream authorization', () => {
   it('delivers deletes of per-user rows only to their owner', async () => {
@@ -294,5 +249,18 @@ describe('project & task row-level rules', () => {
     expect((await member.post('/tasks', { ...input, projectId: project.id })).status).toBe(403)
     const own = (await member.post('/tasks', { ...input, projectId: 1 })).body
     expect((await member.patch(`/tasks/${own.id}`, { projectId: project.id })).status).toBe(403)
+  })
+})
+
+describe('client-chosen ids', () => {
+  it('accepts client id generators (≈ Date.now() * 1000) but rejects ids near the float precision limit', async () => {
+    const owner = t.as('owner')
+    const ok = Date.now() * 1000 + 7
+    expect((await owner.post('/tags', { id: ok, name: 'client-id', color: '#123456' })).body.id).toBe(ok)
+    expect((await owner.post('/tags', { id: 2 ** 53 + 2, name: 'too-big', color: '#123456' })).status).toBe(400)
+    expect((await owner.post('/tags', { id: 2 ** 52 + 1, name: 'too-big', color: '#123456' })).status).toBe(400)
+    // the next autoincrement id is still exact
+    const next = (await owner.post('/tags', { name: 'after-client-id', color: '#123456' })).body.id
+    expect(next).toBe(ok + 1)
   })
 })
