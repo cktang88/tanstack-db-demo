@@ -45,7 +45,14 @@ import { isNewestFirstWindow, loadSubsetToSearch } from './pushdown'
 // collection. TanStack DB adds a normalized, queryable client store on top.
 // ---------------------------------------------------------------------------
 export const queryClient = new QueryClient({
-  defaultOptions: { queries: { staleTime: 60_000, refetchOnWindowFocus: false } },
+  defaultOptions: {
+    queries: {
+      staleTime: 60_000,
+      refetchOnWindowFocus: false,
+      // 4xx (auth, permissions, bad filters) won't fix themselves: fail fast; retry 5xx/network twice
+      retry: (n, e) => !(e instanceof HttpError && e.status < 500) && n < 2,
+    },
+  },
 })
 
 // ---------------------------------------------------------------------------
@@ -107,25 +114,66 @@ type SyncUtils = {
   writeDelete: (key: number | string) => Promise<void>
   refetch: () => Promise<unknown>
 }
+type Mode = 'crud' | 'append-only' | 'read-only'
 const ENTITY_OF = new WeakMap<AnyCollection, string>()
 /** resource name -> collection (for persistence, SSE routing and resets) */
 export const BY_ENTITY: Record<string, AnyCollection> = {}
+/** resource name -> what the server accepts for it (mirrors server/resources.ts) */
+const MODE_OF: Record<string, Mode> = {}
+const register = (collection: AnyCollection, entity: string, mode: Mode) => {
+  ENTITY_OF.set(collection, entity)
+  BY_ENTITY[entity] = collection
+  MODE_OF[entity] = mode
+}
 const DERIVE: Record<string, (row: any) => any> = { customers: withCustomerDerived, invoices: withInvoiceDerived }
+/** client-side derived buckets — never part of the API */
 const DERIVED_FIELDS = new Set(['createdMonth', 'issuedMonth', 'paidMonth'])
-const SERVER_FIELDS = new Set(['createdAt', 'updatedAt'])
+/**
+ * Fields the server computes or forces itself (see server/resources.ts and the
+ * business handlers). They exist on optimistic rows so the UI can show them,
+ * but are never sent: the canonical values come back in the batch response.
+ */
+const SERVER_FIELDS: Record<string, ReadonlySet<string>> = {
+  '*': new Set(['createdAt', 'updatedAt']),
+  customers: new Set(['mrr', 'teamId']),
+  invoices: new Set(['number', 'customerId', 'amount', 'issuedAt', 'paidAt']),
+  payments: new Set(['customerId', 'reference', 'receivedAt', 'recordedBy']),
+  subscriptions: new Set(['unitPrice', 'startedAt', 'canceledAt']),
+  'task-comments': new Set(['authorId']),
+  'time-entries': new Set(['userId']),
+}
 
-const strip = (o: Record<string, unknown>) => Object.fromEntries(Object.entries(o).filter(([k]) => !DERIVED_FIELDS.has(k)))
+const writable = (entity: string, o: Record<string, unknown>) =>
+  Object.fromEntries(
+    Object.entries(o).filter(
+      ([k]) => !DERIVED_FIELDS.has(k) && !SERVER_FIELDS['*']!.has(k) && !SERVER_FIELDS[entity]?.has(k),
+    ),
+  )
 const meta = (m: PendingMutation<any>) => (m.metadata ?? {}) as { cascade?: boolean; derived?: boolean }
 const keyOf = (k: unknown) => (typeof k === 'number' ? k : String(k))
+
+/** Thrown before any request when a transaction touches a collection in a way the server never accepts. */
+export class UnsupportedMutationError extends Error {
+  constructor(entity: string, op: string, mode: Mode) {
+    super(`Cannot ${op} ${entity}: the resource is ${mode}`)
+    this.name = 'UnsupportedMutationError'
+  }
+}
 
 export function toBatchOps(mutations: ReadonlyArray<PendingMutation<any>>): BatchOp[] {
   return mutations.flatMap((m): BatchOp[] => {
     const entity = ENTITY_OF.get(m.collection as AnyCollection)
     if (!entity) return [] // local-only collections don't persist to the server
     if (meta(m).cascade || meta(m).derived) return []
-    if (m.type === 'insert') return [{ entity, op: 'insert', data: strip(m.modified) }]
+    // Inside an ambient transaction, collection.update()/delete() don't check
+    // for handlers, so enforce the resource's mode here instead of letting the
+    // server answer 405 after the UI already showed the change.
+    const mode = MODE_OF[entity] ?? 'crud'
+    if (mode === 'read-only' || (mode === 'append-only' && m.type !== 'insert'))
+      throw new UnsupportedMutationError(entity, m.type, mode)
+    if (m.type === 'insert') return [{ entity, op: 'insert', data: writable(entity, m.modified) }]
     if (m.type === 'update') {
-      const changes = Object.fromEntries(Object.entries(strip(m.changes)).filter(([k]) => !SERVER_FIELDS.has(k)))
+      const changes = writable(entity, m.changes)
       return Object.keys(changes).length ? [{ entity, op: 'update', id: keyOf(m.key), data: changes }] : []
     }
     return [{ entity, op: 'delete', id: keyOf(m.key) }]
@@ -136,28 +184,41 @@ interface BatchResult {
   results: Array<{ entity: string; op: 'insert' | 'update' | 'delete'; id: number | string; row?: { id: number | string } }>
 }
 
-const utilsOf = (entity: string) => BY_ENTITY[entity]?.utils as SyncUtils | undefined
+/**
+ * Direct writes need a running sync: an idle or cleaned-up collection (e.g.
+ * right after a sign-in reset) throws on writeUpsert/writeDelete. Such a
+ * collection loads fresh server state the next time it is used, so the write
+ * can simply be skipped.
+ */
+export const isSyncing = (c: AnyCollection | undefined): c is AnyCollection =>
+  !!c && c.status !== 'idle' && c.status !== 'cleaned-up'
+
+const utilsOf = (entity: string) => {
+  const c = BY_ENTITY[entity]
+  return isSyncing(c) ? (c.utils as SyncUtils) : undefined
+}
 
 async function writeResults(results: BatchResult['results']) {
   const byEntity = new Map<string, BatchResult['results']>()
   for (const r of results) byEntity.set(r.entity, [...(byEntity.get(r.entity) ?? []), r])
   await Promise.all(
-    [...byEntity].map(([entity, rs]) => {
+    [...byEntity].map(async ([entity, rs]) => {
       const utils = utilsOf(entity)
-      if (!utils) return Promise.resolve()
+      if (!utils) return
       const derive = DERIVE[entity] ?? ((r: unknown) => r)
-      const upserts = rs.filter((r) => r.op !== 'delete' && r.row)
+      // last write per key wins (a row can appear twice, e.g. written and re-read)
+      const upserts = new Map(rs.filter((r) => r.op !== 'delete' && r.row).map((r) => [r.id, r.row!]))
       // since query-db-collection 1.4 direct writes report validation failures by
       // rejecting (not throwing), so every inner write promise is awaited too
       const inner: Array<Promise<void>> = []
-      return Promise.all([
-        upserts.length
+      await Promise.all([
+        upserts.size
           ? utils
               .writeBatch(() => {
-                for (const r of upserts) inner.push(utils.writeUpsert(derive(r.row)))
+                for (const row of upserts.values()) inner.push(utils.writeUpsert(derive(row)))
               })
               .then(() => Promise.all(inner))
-          : Promise.resolve(),
+          : undefined,
         // the SSE echo may already have removed the row; that's fine
         ...rs.filter((r) => r.op === 'delete').map((r) => utils.writeDelete(r.id).catch(() => {})),
       ])
@@ -165,10 +226,42 @@ async function writeResults(results: BatchResult['results']) {
   )
 }
 
+let onUnauthorized: ((e: HttpError) => void) | undefined
+/** Called when a write is rejected with 401 (the session expired or was revoked). */
+export function setUnauthorizedHandler(fn: (e: HttpError) => void) {
+  onUnauthorized = fn
+}
+
 /** Send mutations to the server atomically and reconcile synced state with the response. */
 export async function persist(mutations: ReadonlyArray<PendingMutation<any>>) {
+  // throws (rolling the transaction back) before anything is sent if an op is not allowed
   const ops = toBatchOps(mutations)
-  const results = ops.length ? (await api.post<BatchResult>('/batch', { ops })).results : []
+  let results: BatchResult['results'] = []
+  if (ops.length) {
+    try {
+      results = (await api.post<BatchResult>('/batch', { ops })).results
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) onUnauthorized?.(e)
+      throw e
+    }
+  }
+  // From here on the server has committed: the transaction must not be reported
+  // as failed. If reconciling local state goes wrong, log it and resync the
+  // affected collections from the server instead.
+  try {
+    await reconcile(mutations, results)
+  } catch (e) {
+    console.error('[persist] the server committed, but reconciling local state failed — refetching', e)
+    const entities = new Set([
+      ...results.map((r) => r.entity),
+      ...mutations.flatMap((m) => ENTITY_OF.get(m.collection as AnyCollection) ?? []),
+    ])
+    await Promise.all([...entities].map((entity) => utilsOf(entity)?.refetch().catch(() => {})))
+  }
+}
+
+async function reconcile(mutations: ReadonlyArray<PendingMutation<any>>, committed: BatchResult['results']) {
+  const results = [...committed]
   for (const m of mutations) {
     const entity = ENTITY_OF.get(m.collection as AnyCollection)
     if (!entity) continue
@@ -203,6 +296,23 @@ const save = async ({ transaction }: Mutations) => {
 const indexing = { autoIndex: 'eager', defaultIndexType: BTreeIndex } as const
 
 /**
+ * Eager collections load a whole table in one request, capped by the server
+ * at 10,000 rows (MAX_PAGE_SIZE). Past that the table would be silently
+ * truncated — every local aggregate would be wrong — so say so loudly. A
+ * table that big should become an on-demand collection.
+ */
+const EAGER_LIMIT = 10_000
+async function fetchAll<T>(entity: string, params: QueryParams | undefined, signal: AbortSignal) {
+  const page = await api.get<Page<T>>(`/${entity}`, { limit: EAGER_LIMIT, ...params }, signal)
+  if (page.total > page.data.length)
+    console.error(
+      `[collections] ${entity}: loaded ${page.data.length} of ${page.total} rows — the eager collection is truncated; ` +
+        'make it on-demand',
+    )
+  return page.data
+}
+
+/**
  * Eager collection for a server resource: loads the whole table once, then
  * every filter/sort/join/aggregate runs locally. The resource's server-side
  * mode decides which handlers exist — an append-only collection simply has no
@@ -222,15 +332,14 @@ function serverCollection<T extends object, K extends string | number>(
       getKey,
       ...indexing,
       queryFn: async ({ signal }) => {
-        const rows = (await api.get<Page<T>>(`/${entity}`, { limit: 10_000, ...opts.params }, signal)).data
+        const rows = await fetchAll<T>(entity, opts.params, signal)
         return opts.map ? rows.map(opts.map) : rows
       },
       ...(mode !== 'read-only' && { onInsert: save }),
       ...(mode === 'crud' && { onUpdate: save, onDelete: save }),
     }),
   )
-  ENTITY_OF.set(collection as AnyCollection, entity)
-  BY_ENTITY[entity] = collection as AnyCollection
+  register(collection as AnyCollection, entity, mode)
   return collection
 }
 
@@ -245,6 +354,7 @@ function onDemandCollection<T extends object, K extends string | number>(
   opts: {
     id?: string
     scope?: Record<string, string>
+    /** defaults to read-only */
     mode?: 'append-only' | 'read-only'
     map?: (row: any) => T
     /** serves unfiltered newest-first windows from a cursor-paginated endpoint instead */
@@ -275,10 +385,7 @@ function onDemandCollection<T extends object, K extends string | number>(
       ...(opts.mode === 'append-only' && { onInsert: save }),
     }),
   )
-  if (!opts.id) {
-    ENTITY_OF.set(collection as AnyCollection, entity)
-    BY_ENTITY[entity] = collection as AnyCollection
-  }
+  if (!opts.id) register(collection as AnyCollection, entity, opts.mode ?? 'read-only')
   return collection
 }
 
@@ -333,14 +440,13 @@ export const tasksCollection = createCollection(
     schema: Schema.toStandardSchemaV1(TaskSchema),
     getKey: (t: TaskRow) => t.id,
     ...indexing,
-    queryFn: async ({ signal }) => (await api.get<Page<TaskRow>>('/tasks', { limit: 10_000 }, signal)).data,
+    queryFn: ({ signal }) => fetchAll<TaskRow>('tasks', undefined, signal),
     onInsert: save,
     onUpdate: save,
     onDelete: save,
   }),
 )
-ENTITY_OF.set(tasksCollection as AnyCollection, 'tasks')
-BY_ENTITY.tasks = tasksCollection as AnyCollection
+register(tasksCollection as AnyCollection, 'tasks', 'crud')
 
 /** append-only: no update/delete handlers, validated by an Effect Schema */
 export const commentsCollection = createCollection(
@@ -351,12 +457,11 @@ export const commentsCollection = createCollection(
     schema: Schema.toStandardSchemaV1(CommentSchema),
     getKey: (c: TaskComment) => c.id,
     ...indexing,
-    queryFn: async ({ signal }) => (await api.get<Page<TaskComment>>('/task-comments', { limit: 10_000 }, signal)).data,
+    queryFn: ({ signal }) => fetchAll<TaskComment>('task-comments', undefined, signal),
     onInsert: save,
   }),
 )
-ENTITY_OF.set(commentsCollection as AnyCollection, 'task-comments')
-BY_ENTITY['task-comments'] = commentsCollection as AnyCollection
+register(commentsCollection as AnyCollection, 'task-comments', 'append-only')
 
 export const timeEntriesCollection = serverCollection<TimeEntry, number>('time-entries', (e) => e.id)
 
@@ -462,14 +567,46 @@ export const CORE = [usersCollection, customersCollection, invoicesCollection, p
 export const preloadAll = () => Promise.all(CORE.map((c) => c.preload()))
 
 /**
+ * Module-level live query collections (src/db/views.ts) over the server
+ * collections. A view whose sources are cleaned up goes into an error state
+ * and stays frozen, so views are torn down first on reset; a cleaned-up view
+ * restarts from the fresh sources the next time it is read.
+ */
+const VIEWS: AnyCollection[] = []
+export function registerViews(...views: AnyCollection[]) {
+  VIEWS.push(...views)
+}
+
+/**
  * Sign-in / sign-out: drop every server-backed collection's rows and cache so
  * nothing from the previous user can leak into the next session.
  */
 export async function resetServerCollections() {
+  await Promise.all(VIEWS.map((v) => v.cleanup()))
   const all = [...Object.values(BY_ENTITY), ...Object.values(eventsByCategory)]
   await Promise.all(all.map((c) => c.cleanup()))
   for (const p of FEED_PAGERS) p.reset()
   queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'auth' })
+  // in-memory UI state that refers to the previous user's rows
+  if (selectionCollection.size) selectionCollection.delete([...selectionCollection.keys()])
+}
+
+/**
+ * Pins live in localStorage, which outlives sessions. Remember whose pins they
+ * are and drop them when a different user signs in on this browser.
+ * (Preferences such as the theme are per-browser and stay.)
+ */
+const CLIENT_STATE_OWNER = 'saasly:client-state-owner'
+export function claimClientState(userId: number) {
+  let previous: string | null = null
+  try {
+    previous = localStorage.getItem(CLIENT_STATE_OWNER)
+    if (previous === String(userId)) return
+    localStorage.setItem(CLIENT_STATE_OWNER, String(userId))
+  } catch {
+    return // storage unavailable: nothing persisted to leak either
+  }
+  if (previous !== null && pinsCollection.size) pinsCollection.delete([...pinsCollection.keys()])
 }
 
 /** Client-side id generation: rows get their final id before the server sees them (no temp-id swap). */

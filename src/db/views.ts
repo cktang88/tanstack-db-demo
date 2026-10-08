@@ -1,5 +1,5 @@
 import { count, createLiveQueryCollection, eq, inArray, not, sum } from '@tanstack/react-db'
-import { customersCollection, invoicesCollection, tasksCollection } from './collections'
+import { customersCollection, invoicesCollection, registerViews, tasksCollection } from './collections'
 
 // Materialized views: live query collections defined once at module scope.
 // They are maintained incrementally as the underlying collections change, can
@@ -74,3 +74,6 @@ export const mrrByPlan = createLiveQueryCollection({
       .groupBy(({ c }) => c.plan)
       .select(({ c }) => ({ key: c.plan, value: sum(c.mrr) })),
 })
+
+// torn down before their sources on sign-in/out, so the next session recomputes them
+registerViews(customersByStatus, outstandingByStatus, openTaskCount, revenueByMonth, signupsByMonth, mrrByPlan)
