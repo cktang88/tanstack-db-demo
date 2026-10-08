@@ -1,14 +1,23 @@
-import { caseWhen, count, eq, sum, useLiveQuery, type Transaction } from '@tanstack/react-db'
+import { caseWhen, count, eq, sum, toArray, useLiveQuery, type Transaction } from '@tanstack/react-db'
 import { Activity, useState } from 'react'
 import { ROLES, type Role } from '../../shared/domain'
 import { Avatar, Badge, Card, Empty, PageHeader, Segmented } from '../components/ui'
 import { stageReassignment } from '../db/actions'
-import { tasksCollection, usersCollection } from '../db/collections'
+import {
+  permissionsCollection,
+  rolePermissionsCollection,
+  rolesCollection,
+  tasksCollection,
+  teamMembersCollection,
+  teamsCollection,
+  usersCollection,
+} from '../db/collections'
+import { useCan } from '../lib/auth'
 import { date, titleCase } from '../lib/format'
 import { toast } from '../lib/toast'
 
 export function TeamPage() {
-  const [tab, setTab] = useState<'members' | 'workload'>('members')
+  const [tab, setTab] = useState<'members' | 'teams' | 'roles' | 'workload'>('members')
   const [selected, setSelected] = useState<number | null>(null)
   return (
     <>
@@ -22,6 +31,8 @@ export function TeamPage() {
             onChange={setTab}
             options={[
               { value: 'members', label: 'Members' },
+              { value: 'teams', label: 'Teams' },
+              { value: 'roles', label: 'Roles' },
               { value: 'workload', label: 'Workload' },
             ]}
           />
@@ -33,6 +44,12 @@ export function TeamPage() {
           <MemberTasks userId={selected} />
         </div>
       </Activity>
+      <Activity mode={tab === 'teams' ? 'visible' : 'hidden'}>
+        <Teams />
+      </Activity>
+      <Activity mode={tab === 'roles' ? 'visible' : 'hidden'}>
+        <RolesMatrix />
+      </Activity>
       <Activity mode={tab === 'workload' ? 'visible' : 'hidden'}>
         <Workload />
       </Activity>
@@ -42,6 +59,7 @@ export function TeamPage() {
 
 function Members({ selected, onSelect }: { selected: number | null; onSelect: (id: number) => void }) {
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const canManage = useCan().can('team:manage')
   return (
     <Card title={`${users.length} members`}>
       <ul className="divide-y divide-zinc-100 dark:divide-zinc-800" data-testid="member-list">
@@ -66,7 +84,7 @@ function Members({ selected, onSelect }: { selected: number | null; onSelect: (i
               className="input w-28"
               aria-label={`Role for ${u.name}`}
               value={u.role}
-              disabled={u.role === 'owner'}
+              disabled={u.role === 'owner' || !canManage}
               onChange={(e) =>
                 usersCollection
                   .update(u.id, (d) => void (d.role = e.target.value as Role))
@@ -144,6 +162,7 @@ function Workload() {
     },
   })
   const max = Math.max(1, ...data.map((d) => (d.open ?? 0) + (d.done ?? 0)))
+  const canWrite = useCan().can('projects:write')
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <Card title="Open vs done tasks per member">
@@ -162,7 +181,7 @@ function Workload() {
           ))}
         </ul>
       </Card>
-      <Rebalance users={data} />
+      {canWrite && <Rebalance users={data} />}
     </div>
   )
 }
@@ -260,6 +279,145 @@ function Rebalance({ users }: { users: Array<{ userId: number; name: string; ope
             Preview
           </button>
         )}
+      </div>
+    </Card>
+  )
+}
+
+function Teams() {
+  const canManage = useCan().can('team:manage')
+  // teams ⨝ lead, with each team's members as a nested array (includes + toArray):
+  // one live query instead of three requests stitched together with Maps.
+  const { data: teams } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ t: teamsCollection })
+        .leftJoin({ lead: usersCollection }, ({ t, lead }) => eq(t.leadId, lead.id))
+        .orderBy(({ t }) => t.name)
+        .select(({ t, lead }) => ({
+          ...t,
+          leadName: lead?.name,
+          members: toArray(
+            q
+              .from({ m: teamMembersCollection })
+              .innerJoin({ u: usersCollection }, ({ m, u }) => eq(m.userId, u.id))
+              .where(({ m }) => eq(m.teamId, t.id))
+              .orderBy(({ u }) => u.name)
+              .select(({ m, u }) => ({ id: m.id, userId: u.id, name: u.name, color: u.avatarColor })),
+          ),
+        })),
+  })
+  const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
+  const fail = (e: Error) => toast.error('Membership change failed — rolled back', e.message)
+  return (
+    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3" data-testid="teams">
+      {teams.map((t) => (
+        <Card key={t.id} title={`${t.name} (${t.members.length})`}>
+          <p className="mb-3 text-xs text-zinc-500">
+            {t.description}
+            {t.leadName && ` · lead: ${t.leadName}`}
+          </p>
+          <ul className="flex flex-wrap gap-1.5">
+            {t.members.map((m) => (
+              <li
+                key={m.id}
+                className="flex items-center gap-1 rounded-full bg-zinc-100 py-0.5 pr-2 pl-0.5 text-xs dark:bg-zinc-800"
+              >
+                <Avatar name={m.name} color={m.color} size={18} /> {m.name}
+                {canManage && (
+                  <button
+                    aria-label={`Remove ${m.name} from ${t.name}`}
+                    className="text-zinc-400 hover:text-red-600"
+                    onClick={() => teamMembersCollection.delete(m.id).when('settled').catch(fail)}
+                  >
+                    ✕
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+          {canManage && (
+            <select
+              className="input mt-3"
+              aria-label={`Add member to ${t.name}`}
+              value=""
+              onChange={(e) => {
+                const userId = Number(e.target.value)
+                if (!userId) return
+                teamMembersCollection
+                  .insert({ id: `${t.id}:${userId}`, teamId: t.id, userId, joinedAt: new Date().toISOString() })
+                  .when('settled')
+                  .catch(fail)
+              }}
+            >
+              <option value="">+ Add member…</option>
+              {users
+                .filter((u) => !t.members.some((m) => m.userId === u.id))
+                .map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name}
+                  </option>
+                ))}
+            </select>
+          )}
+        </Card>
+      ))}
+    </div>
+  )
+}
+
+function RolesMatrix() {
+  const { data: roles } = useLiveQuery({ query: (q) => q.from({ r: rolesCollection }) })
+  // permissions with the granted role ids nested per row
+  const { data: perms } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ p: permissionsCollection })
+        .orderBy(({ p }) => p.id)
+        .select(({ p }) => ({
+          ...p,
+          roles: toArray(
+            q
+              .from({ g: rolePermissionsCollection })
+              .where(({ g }) => eq(g.permissionId, p.id))
+              .select(({ g }) => g.roleId),
+          ),
+        })),
+  })
+  return (
+    <Card title="Role → permission matrix (role_permissions)">
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm" data-testid="roles-matrix">
+          <thead>
+            <tr>
+              <th className="th">Permission</th>
+              {roles.map((r) => (
+                <th key={r.id} className="th text-center">
+                  {r.name}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+            {perms.map((p) => (
+              <tr key={p.id}>
+                <td className="td">
+                  <div className="font-mono text-xs">{p.id}</div>
+                  <div className="text-xs text-zinc-500">{p.description}</div>
+                </td>
+                {roles.map((r) => (
+                  <td key={r.id} className="td text-center">
+                    {p.roles.includes(r.id) ? (
+                      <span className="text-emerald-600">✓</span>
+                    ) : (
+                      <span className="text-zinc-300">—</span>
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </Card>
   )

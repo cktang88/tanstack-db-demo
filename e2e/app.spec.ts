@@ -3,9 +3,11 @@ import { expect, test, type Page } from '@playwright/test'
 const setChaos = (page: Page, chaos: { latencyMs: number; failRate: number }) =>
   page.request.put('/api/dev/chaos', { data: chaos })
 
-test.beforeAll(async ({ request }) => {
-  await request.post('/api/dev/reset', { data: {} })
-  await request.put('/api/dev/chaos', { data: { latencyMs: 120, failRate: 0 } })
+test.beforeAll(async ({ playwright, baseURL }) => {
+  const owner = await playwright.request.newContext({ baseURL, storageState: 'e2e/.auth/owner.json' })
+  await owner.post('/api/dev/reset', { data: {} })
+  await owner.put('/api/dev/chaos', { data: { latencyMs: 120, failRate: 0 } })
+  await owner.dispose()
 })
 
 test.afterEach(async ({ page }) => {
@@ -80,10 +82,12 @@ test.describe('customers table', () => {
 
     await page.getByRole('button', { name: 'Enterprise', pressed: false }).click()
     await expect(page).toHaveURL(/plan=.*enterprise/)
-    for (const row of await table.getByTestId('row').all()) {
-      await expect(row).toContainText('Churned')
-      await expect(row).toContainText('Enterprise')
-    }
+    await expect
+      .poll(async () => {
+        const texts = await table.getByTestId('row').allTextContents()
+        return texts.length > 0 && texts.every((t) => t.includes('Churned') && t.includes('Enterprise'))
+      })
+      .toBe(true)
 
     await page.getByLabel('Search customers').fill('zzzz-no-match')
     await expect(table).toContainText('No results.')
@@ -220,7 +224,7 @@ test.describe('project board', () => {
 test.describe('team, activity, settings', () => {
   test('changes a role optimistically and persists it', async ({ page }) => {
     await page.goto('/team')
-    const row = page.getByTestId('member-row').nth(3)
+    const row = page.getByTestId('member-row').filter({ hasText: 'Hedy Turing' })
     const select = row.getByRole('combobox')
     const next = (await select.inputValue()) === 'viewer' ? 'admin' : 'viewer'
     const saved = page.waitForResponse((r) => r.request().method() !== 'GET' && /\/api\/(users|batch)/.test(r.url()))
@@ -228,9 +232,9 @@ test.describe('team, activity, settings', () => {
     await expect(select).toHaveValue(next)
     await saved
     await page.reload()
-    await expect(page.getByTestId('member-row').nth(3).getByRole('combobox')).toHaveValue(next)
+    await expect(page.getByTestId('member-row').filter({ hasText: 'Hedy Turing' }).getByRole('combobox')).toHaveValue(next)
 
-    await page.getByTestId('member-row').nth(3).getByRole('button').first().click()
+    await page.getByTestId('member-row').filter({ hasText: 'Hedy Turing' }).getByRole('button').first().click()
     await expect(page.getByTestId('member-tasks').or(page.getByText('No tasks assigned.'))).toBeVisible()
   })
 

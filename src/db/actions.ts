@@ -1,13 +1,16 @@
 import { createOptimisticAction, createTransaction } from '@tanstack/react-db'
 import { PLAN_PRICE, type Customer } from '../../shared/domain'
 import type { CustomerFormValues } from '../lib/validation'
+import type { Product, Subscription } from '../../shared/domain'
 import {
   customersCollection,
   eventsCollection,
   invoicesCollection,
   newId,
+  paymentsCollection,
   persist,
   selectionCollection,
+  subscriptionsCollection,
   tasksCollection,
   withCustomerDerived,
 } from './collections'
@@ -24,7 +27,7 @@ export function createCustomer(values: CustomerFormValues) {
   const now = new Date().toISOString()
   const id = newId()
   const tx = customersCollection.insert(
-    withCustomerDerived({ ...values, id, mrr: mrrOf(values), createdAt: now, updatedAt: now }),
+    withCustomerDerived({ ...values, id, teamId: null, mrr: mrrOf(values), createdAt: now, updatedAt: now }),
   )
   return { id, tx }
 }
@@ -75,15 +78,19 @@ export const markInvoicePaid = createOptimisticAction<{ invoiceId: number; numbe
       d.paidAt = now
       d.paidMonth = now.slice(0, 7)
     })
-    eventsCollection.insert({
-      id: -newId(),
-      type: 'invoice.paid',
-      category: 'invoice',
-      actorId: 1,
-      customerId,
-      message: `Invoice ${number} marked paid`,
-      createdAt: now,
-    })
+    // provisional feed entry; `derived` = not sent, replaced by the server's real event
+    eventsCollection.insert(
+      {
+        id: -newId(),
+        type: 'invoice.paid',
+        category: 'invoice',
+        actorId: null,
+        customerId,
+        message: `Invoice ${number} marked paid`,
+        createdAt: now,
+      },
+      { metadata: { derived: true } },
+    )
   },
   mutationFn: async (_vars, { transaction }) => {
     await persist(transaction.mutations)
@@ -110,4 +117,76 @@ export function stageReassignment(fromUserId: number, toUserId: number | null) {
       }),
     )
   return { tx, count: ids.length }
+}
+
+/**
+ * Append a payment to the (append-only, on-demand) ledger. If it covers the
+ * remainder, the invoice flips to "paid" optimistically — a *derived* change
+ * the server computes itself (DB trigger), so it is re-read after commit
+ * instead of being sent.
+ */
+export const recordPayment = createOptimisticAction<{
+  invoiceId: number
+  customerId: number
+  amount: number
+  remaining: number
+  method: 'card' | 'ach' | 'wire'
+  userId: number
+}>({
+  onMutate: ({ invoiceId, customerId, amount, remaining, method, userId }) => {
+    const now = new Date().toISOString()
+    paymentsCollection.insert({
+      id: newId(),
+      invoiceId,
+      customerId,
+      amount,
+      method,
+      reference: 'pending…',
+      receivedAt: now,
+      recordedBy: userId,
+    })
+    if (amount >= remaining)
+      invoicesCollection.update(invoiceId, { metadata: { derived: true } }, (d) => {
+        d.status = 'paid'
+        d.paidAt = now
+        d.paidMonth = now.slice(0, 7)
+      })
+  },
+  mutationFn: async (_vars, { transaction }) => persist(transaction.mutations),
+})
+
+/** Add an add-on: the subscription row is sent; the customer's MRR is predicted locally and re-read. */
+export function addAddon(customerId: number, product: Product, quantity: number) {
+  const tx = createTransaction({ mutationFn: async ({ transaction }) => persist(transaction.mutations) })
+  tx.mutate(() => {
+    subscriptionsCollection.insert({
+      id: newId(),
+      customerId,
+      productId: product.id,
+      quantity,
+      unitPrice: product.unitPrice,
+      status: 'active',
+      startedAt: new Date().toISOString(),
+      canceledAt: null,
+    })
+    customersCollection.update(customerId, { metadata: { derived: true } }, (d) => void (d.mrr += quantity * product.unitPrice))
+  })
+  return tx
+}
+
+export function cancelSubscription(sub: Subscription) {
+  const tx = createTransaction({ mutationFn: async ({ transaction }) => persist(transaction.mutations) })
+  tx.mutate(() => {
+    subscriptionsCollection.update(sub.id, (d) => {
+      d.status = 'canceled'
+      d.canceledAt = new Date().toISOString()
+    })
+    if (sub.status === 'active' || sub.status === 'past_due')
+      customersCollection.update(
+        sub.customerId,
+        { metadata: { derived: true } },
+        (d) => void (d.mrr -= sub.quantity * sub.unitPrice),
+      )
+  })
+  return tx
 }

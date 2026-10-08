@@ -153,3 +153,80 @@ export function HBarChart({
   )
   return <Chart definition={definition} height={height} ariaLabel={label} />
 }
+
+/** Side-by-side bars per category, e.g. new vs churned MRR per month. */
+export function GroupedBars({
+  data,
+  label,
+  height = 260,
+  format = number,
+  stacked = false,
+}: {
+  data: ReadonlyArray<{ label: string; series: string; value: number }>
+  label: string
+  height?: number
+  format?: (n: number) => string
+  stacked?: boolean
+}) {
+  const definition = useMemo(
+    () =>
+      defineChart({
+        marks: [
+          barY([...data], {
+            x: 'label',
+            y: 'value',
+            color: 'series',
+            layout: stacked ? stack() : group({ padding: 0.1 }),
+            radius: { end: 3 },
+          }),
+          ruleY([0]),
+        ],
+        scales: {
+          x: { scale: () => scaleBand<string>().padding(0.25) },
+          y: { scale: scaleLinear, nice: true, grid: true, axis: { ticks: { count: 5, format: (v: number) => format(v) } } },
+        },
+        color: { legend: colorLegend({ label: '' }) },
+        focus: 'group-x',
+        tooltip: {
+          use: tooltip,
+          formatGroup: (points) =>
+            [points[0]?.datum.label ?? '', ...points.map((p) => `${p.datum.series}: ${format(p.datum.value)}`)].join('\n'),
+        },
+      }),
+    [data, format, stacked],
+  )
+  return <Chart definition={definition} height={height} ariaLabel={label} />
+}
+
+const dayFmt = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+
+/** Daily series (YYYY-MM-DD) as an area chart, e.g. metered usage. */
+export function DailyChart({
+  data,
+  label,
+  height = 200,
+  format = number,
+}: {
+  data: ReadonlyArray<{ day: string; value: number }>
+  label: string
+  height?: number
+  format?: (n: number) => string
+}) {
+  const definition = useMemo(() => {
+    const rows = data.map((d) => ({ date: new Date(`${d.day}T00:00:00Z`), value: d.value }))
+    return defineChart({
+      marks: [
+        areaY(rows, { x: 'date', y: 'value', fill: 'var(--ts-chart-2)', fillOpacity: 0.15 }),
+        lineY(rows, { x: 'date', y: 'value', stroke: 'var(--ts-chart-2)', strokeWidth: 2 }),
+      ],
+      scales: {
+        x: { scale: scaleUtc, axis: { ticks: { count: 5, format: (d: Date) => dayFmt.format(d) } } },
+        y: { scale: scaleLinear, nice: true, grid: true, axis: { ticks: { count: 4, format: (v: number) => format(v) } } },
+      },
+      focus: 'nearest-x',
+      maxFocusDistance: Number.POSITIVE_INFINITY,
+      tooltip: { use: tooltip, format: (p) => `${dayFmt.format(p.datum.date)}: ${format(p.datum.value)}` },
+    })
+  }, [data, format])
+  return <Chart definition={definition} height={height} ariaLabel={label} />
+}

@@ -3,7 +3,7 @@ import { Link } from '@tanstack/react-router'
 import { useState } from 'react'
 import { PROJECT_STATUSES, type ProjectStatus } from '../../shared/domain'
 import { Avatar, Badge, ChipFilter, Empty, PageHeader } from '../components/ui'
-import { projectsCollection, tasksCollection, usersCollection } from '../db/collections'
+import { projectsCollection, tasksCollection, timeEntriesCollection, usersCollection } from '../db/collections'
 import { date } from '../lib/format'
 
 export function ProjectsPage() {
@@ -23,10 +23,17 @@ export function ProjectsPage() {
           total: count(t.id),
           done: sum(caseWhen(eq(t.status, 'done'), 1, 0)),
         }))
+      // replaces the server's project_stats view: time_entries ⨝ tasks, minutes per project
+      const logged = qb
+        .from({ e: timeEntriesCollection })
+        .innerJoin({ t: tasksCollection }, ({ e, t }) => eq(e.taskId, t.id))
+        .groupBy(({ t }) => t.projectId)
+        .select(({ t, e }) => ({ projectId: t.projectId, minutes: sum(e.minutes) }))
       let base = qb
         .from({ p: projectsCollection })
         .leftJoin({ u: usersCollection }, ({ p, u }) => eq(p.ownerId, u.id))
         .leftJoin({ s: progress }, ({ p, s }) => eq(p.id, s.projectId))
+        .leftJoin({ h: logged }, ({ p, h }) => eq(p.id, h.projectId))
       if (q || status.length)
         base = base.where(({ p }) =>
           q && status.length
@@ -37,12 +44,13 @@ export function ProjectsPage() {
         )
       return base
         .orderBy(({ p }) => p.name)
-        .select(({ p, u, s }) => ({
+        .select(({ p, u, s, h }) => ({
           ...p,
           ownerName: u?.name,
           ownerColor: u?.avatarColor,
           total: s?.total,
           done: s?.done,
+          minutes: h?.minutes,
           nextUp: toArray(
             qb
               .from({ t: tasksCollection })
@@ -57,7 +65,10 @@ export function ProjectsPage() {
 
   return (
     <>
-      <PageHeader title="Projects" description={`${projects.length} delivery projects — progress computed live from tasks.`} />
+      <PageHeader
+        title="Projects"
+        description={`${projects.length} delivery projects — progress and hours computed live from tasks and time entries.`}
+      />
       <div className="mb-4 flex flex-wrap items-center gap-4">
         <input
           className="input max-w-xs"
@@ -76,6 +87,7 @@ export function ProjectsPage() {
             const total = p.total ?? 0
             const done = p.done ?? 0
             const pct = total ? Math.round((done / total) * 100) : 0
+            const hours = Math.round((p.minutes ?? 0) / 60)
             return (
               <Link
                 key={p.id}
@@ -102,7 +114,7 @@ export function ProjectsPage() {
                 </div>
                 <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
                   <span data-testid="project-progress">
-                    {done}/{total} tasks · {pct}%
+                    {done}/{total} tasks · {pct}% · {hours}/{p.budgetHours}h
                   </span>
                   <span className="flex items-center gap-2">
                     {date(p.createdAt)}

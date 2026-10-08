@@ -12,7 +12,10 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test'
 import {
   customersCollection,
+  invoicesCollection,
   newId,
+  paymentsCollection,
+  teamMembersCollection,
   tasksCollection,
   toBatchOps,
   usersCollection,
@@ -81,6 +84,25 @@ describe('batch op mapping', () => {
       { entity: 'customers', op: 'update', id: 2, data: { seats: 3, mrr: 10 } },
       { entity: 'customers', op: 'delete', id: 4 },
       { entity: 'users', op: 'update', id: 6, data: { role: 'admin' } },
+    ])
+  })
+
+  it('skips server-derived echoes and keeps string keys of join tables', () => {
+    const ops = toBatchOps([
+      // payment settles the invoice: the server's trigger does that, so the optimistic patch is not sent
+      m({
+        type: 'update',
+        key: 7,
+        changes: { status: 'paid' },
+        metadata: { derived: true },
+        collection: invoicesCollection as never,
+      }),
+      m({ type: 'insert', key: 9, modified: { id: 9, invoiceId: 7, amount: 100 }, collection: paymentsCollection as never }),
+      m({ type: 'delete', key: '1:4', collection: teamMembersCollection as never }),
+    ])
+    expect(ops).toEqual([
+      { entity: 'payments', op: 'insert', data: { id: 9, invoiceId: 7, amount: 100 } },
+      { entity: 'team-members', op: 'delete', id: '1:4' },
     ])
   })
 

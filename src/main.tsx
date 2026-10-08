@@ -4,12 +4,14 @@ import { RouterProvider } from '@tanstack/react-router'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { queryClient } from './db/collections'
-import { startLiveSync } from './db/live'
+import { isUnauthorized } from './lib/auth'
 import { makeRouter } from './router'
 import './styles.css'
 
 const router = makeRouter()
-startLiveSync()
+// a 401 anywhere means the session expired or was revoked: go to the login page
+const on401 = (e: unknown) => isUnauthorized(e) && void router.navigate({ to: '/login' })
+queryClient.getQueryCache().subscribe((ev) => ev.type === 'updated' && ev.action.type === 'error' && on401(ev.action.error))
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

@@ -10,6 +10,7 @@ import { createCustomer, deleteCustomers, updateCustomers } from '../db/actions'
 import { customersCollection, selectionCollection, usersCollection } from '../db/collections'
 import { date, money, number } from '../lib/format'
 import { formatSort, parseSort, type CustomerListParams } from '../lib/search'
+import { useCan } from '../lib/auth'
 import { toast } from '../lib/toast'
 import { customersRoute } from '../router'
 
@@ -156,6 +157,7 @@ export function CustomersPage() {
   const search = customersRoute.useSearch()
   const navigate = useNavigate({ from: '/customers' })
   const { rows, total, totalMrr } = useCustomerRows(search)
+  const { can } = useCan()
   const [creating, setCreating] = useState(false)
 
   // Selection lives in a local-only collection: it survives paging & filtering,
@@ -190,9 +192,11 @@ export function CustomersPage() {
         title="Customers"
         description={`${number(total)} matching · ${money(totalMrr)} MRR — filtering, sorting & paging run locally, no requests.`}
         actions={
-          <button className="btn-primary" onClick={() => setCreating(true)}>
-            + New customer
-          </button>
+          can('customers:write') && (
+            <button className="btn-primary" onClick={() => setCreating(true)}>
+              + New customer
+            </button>
+          )
         }
       />
       <DataTable
@@ -245,47 +249,53 @@ export function CustomersPage() {
             <OwnerFilter value={search.ownerId} onChange={(ownerId) => setSearch({ ownerId })} />
           </div>
         }
-        bulkActions={(ids) => (
-          <>
-            <span className="text-zinc-500" data-testid="selection-summary">
-              ({number(selectionSummary?.n ?? 0)} across all pages · {money(selectionSummary?.mrr ?? 0)} MRR)
-            </span>
-            {CUSTOMER_STATUSES.map((s) => (
-              <button
-                key={s}
-                className="btn-secondary py-1 text-xs"
-                onClick={() => {
-                  // one transaction for N rows -> one atomic /api/batch request
-                  const tx = updateCustomers(ids, { status: s })
-                  tx.when('settled').then(
-                    () => toast.success(`Updated ${ids.length} customers`),
-                    (e: Error) => toast.error('Bulk update failed — rolled back', e.message),
-                  )
-                  clearSelection()
-                }}
-              >
-                Mark {s}
+        bulkActions={(ids) =>
+          !can('customers:write') ? (
+            <span className="text-zinc-500">read-only</span>
+          ) : (
+            <>
+              <span className="text-zinc-500" data-testid="selection-summary">
+                ({number(selectionSummary?.n ?? 0)} across all pages · {money(selectionSummary?.mrr ?? 0)} MRR)
+              </span>
+              {CUSTOMER_STATUSES.map((s) => (
+                <button
+                  key={s}
+                  className="btn-secondary py-1 text-xs"
+                  onClick={() => {
+                    // one transaction for N rows -> one atomic /api/batch request
+                    const tx = updateCustomers(ids, { status: s })
+                    tx.when('settled').then(
+                      () => toast.success(`Updated ${ids.length} customers`),
+                      (e: Error) => toast.error('Bulk update failed — rolled back', e.message),
+                    )
+                    clearSelection()
+                  }}
+                >
+                  Mark {s}
+                </button>
+              ))}
+              {can('customers:delete') && (
+                <button
+                  className="btn-danger py-1 text-xs"
+                  onClick={() => {
+                    if (!confirm(`Archive ${ids.length} customers?`)) return
+                    deleteCustomers(ids)
+                      .when('settled')
+                      .then(
+                        () => toast.success(`Archived ${ids.length} customer${ids.length === 1 ? '' : 's'}`),
+                        (e: Error) => toast.error('Archive failed — rows restored', e.message),
+                      )
+                  }}
+                >
+                  Archive
+                </button>
+              )}
+              <button className="btn-ghost py-1 text-xs" onClick={clearSelection}>
+                Clear
               </button>
-            ))}
-            <button
-              className="btn-danger py-1 text-xs"
-              onClick={() => {
-                if (!confirm(`Delete ${ids.length} customers?`)) return
-                deleteCustomers(ids)
-                  .when('settled')
-                  .then(
-                    () => toast.success(`Deleted ${ids.length} customer${ids.length === 1 ? '' : 's'}`),
-                    (e: Error) => toast.error('Delete failed — rows restored', e.message),
-                  )
-              }}
-            >
-              Delete
-            </button>
-            <button className="btn-ghost py-1 text-xs" onClick={clearSelection}>
-              Clear
-            </button>
-          </>
-        )}
+            </>
+          )
+        }
       />
       <Dialog open={creating} onClose={() => setCreating(false)} title="New customer">
         <CustomerForm

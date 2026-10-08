@@ -1,9 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useLiveQuery } from '@tanstack/react-db'
 import { useActionState } from 'react'
 import { Card, PageHeader, Segmented } from '../components/ui'
 import { applyChange } from '../db/live'
 import { usePrefs } from '../db/hooks'
-import { pinsCollection } from '../db/collections'
+import { pinsCollection, sessionsCollection } from '../db/collections'
+import { useCan } from '../lib/auth'
+import { relative } from '../lib/format'
 import { api } from '../lib/api'
 import { toast } from '../lib/toast'
 
@@ -14,6 +17,7 @@ interface Chaos {
 
 export function SettingsPage() {
   const [prefs, setPrefs] = usePrefs()
+  const { can } = useCan()
   return (
     <>
       <PageHeader
@@ -47,8 +51,9 @@ export function SettingsPage() {
             </label>
           </div>
         </Card>
-        <ChaosCard />
-        <ResetCard />
+        <SessionsCard />
+        {can('admin:dev') && <ChaosCard />}
+        {can('admin:dev') && <ResetCard />}
       </div>
     </>
   )
@@ -109,6 +114,38 @@ function ResetCard() {
       <button className="btn-danger" onClick={() => reset.mutate()} disabled={reset.isPending}>
         {reset.isPending ? 'Resetting…' : 'Reset database'}
       </button>
+    </Card>
+  )
+}
+
+function SessionsCard() {
+  // the server scopes `sessions` to the caller (ownerField), so this is "my sessions"
+  const { data: sessions } = useLiveQuery({
+    query: (q) => q.from({ s: sessionsCollection }).orderBy(({ s }) => s.createdAt, 'desc'),
+  })
+  return (
+    <Card title="Your sessions">
+      <ul className="space-y-2 text-sm" data-testid="sessions">
+        {sessions.map((s) => (
+          <li key={s.id} className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate">
+              {s.userAgent?.slice(0, 40) ?? 'unknown client'}{' '}
+              <span className="text-xs text-zinc-500">· signed in {relative(s.createdAt)}</span>
+            </span>
+            <button
+              className="btn-ghost text-xs"
+              onClick={() =>
+                sessionsCollection
+                  .delete(s.id)
+                  .when('settled')
+                  .catch((e: Error) => toast.error('Could not revoke session', e.message))
+              }
+            >
+              Revoke
+            </button>
+          </li>
+        ))}
+      </ul>
     </Card>
   )
 }

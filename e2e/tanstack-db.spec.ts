@@ -20,9 +20,11 @@ async function apiRequestsDuring(page: Page, fn: () => Promise<void>) {
   return seen
 }
 
-test.beforeAll(async ({ request }) => {
-  await request.post('/api/dev/reset', { data: {} })
-  await request.put('/api/dev/chaos', { data: { latencyMs: 120, failRate: 0 } })
+test.beforeAll(async ({ playwright, baseURL }) => {
+  const owner = await playwright.request.newContext({ baseURL, storageState: 'e2e/.auth/owner.json' })
+  await owner.post('/api/dev/reset', { data: {} })
+  await owner.put('/api/dev/chaos', { data: { latencyMs: 120, failRate: 0 } })
+  await owner.dispose()
 })
 
 test.afterEach(async ({ page }) => {
@@ -50,6 +52,11 @@ test('a write is reflected in every view instantly, with no refetches', async ({
   // client-side navigation to a customer that is active
   await page.getByTestId('top-customers').getByRole('link').first().click()
   await expect(page).toHaveURL(/\/customers\/\d+/)
+  // let the page's first loads (health view, contacts, tags, usage rollup) finish before measuring
+  await expect(page.getByTestId('customer-health')).toContainText('API calls')
+  await expect(page.getByTestId('tags').getByRole('button').first()).toBeVisible()
+  await expect(page.getByTestId('contacts').getByRole('listitem').first()).toBeVisible()
+  await expect(page.getByTestId('usage')).toHaveAttribute('data-state', 'ready')
   const requests = await apiRequestsDuring(page, async () => {
     await page.getByRole('button', { name: 'Edit' }).click()
     const dialog = page.getByRole('dialog')
@@ -108,7 +115,7 @@ test('row selection is a local-only collection: survives paging, summarised by a
   await expect(table.getByTestId('bulk-bar')).toHaveCount(0)
 })
 
-test('multi-collection delete transaction rolls back customers AND their invoices', async ({ page }) => {
+test('multi-collection archive transaction rolls back customers AND their invoices', async ({ page }) => {
   await page.goto('/invoices?status=open')
   const link = page.getByTestId('invoices-table').getByTestId('row').first().getByRole('link')
   const company = (await link.textContent())!
@@ -116,10 +123,10 @@ test('multi-collection delete transaction rolls back customers AND their invoice
   await expect(page.getByTestId('customer-invoices')).toBeVisible()
   await setChaos(page, { latencyMs: 800, failRate: 1 })
   page.once('dialog', (d) => void d.accept())
-  await page.getByRole('button', { name: 'Delete' }).click()
+  await page.getByRole('button', { name: 'Archive' }).click()
   await expect(page).toHaveURL(/\/customers$/)
   await page.getByLabel('Search customers').fill(company)
-  await expect(page.getByRole('alert').filter({ hasText: 'Delete failed' })).toBeVisible()
+  await expect(page.getByRole('alert').filter({ hasText: 'Archive failed' })).toBeVisible()
   // the customer is back, and so are its invoices
   await expect(page.getByTestId('customers-table').getByText(company, { exact: true }).first()).toBeVisible()
   await setChaos(page, { latencyMs: 120, failRate: 0 })
@@ -214,4 +221,87 @@ test('on-demand collections push filters, order and windows down to the API', as
   expect(events).toContain('GET /api/events?sort=-id&limit=30&offset=31&category[eq]=invoice')
   // never an unbounded load of the event log: the only un-limited requests are single-row boundary lookups
   expect(events.filter((r) => r.includes('limit=10000') && !r.includes('id[eq]='))).toEqual([])
+})
+
+test('a partial payment goes to the append-only ledger optimistically; the balance is a live aggregate', async ({ page }) => {
+  await page.goto('/invoices?status=open')
+  await page.getByTestId('invoices-table').getByTestId('row').first().getByRole('link').click()
+  const balance = page.getByTestId('balance-value')
+  await expect(balance).toBeVisible()
+  const row = page
+    .getByTestId('customer-invoices')
+    .getByRole('row')
+    .filter({ hasText: /open|overdue/i })
+    .first()
+  const detail = page.getByTestId('invoice-detail')
+  // line items and payments are on-demand collections: fetched for this invoice only
+  const requests = await apiRequestsDuring(page, async () => {
+    await row.click()
+    await expect(detail.getByTestId('invoice-payments')).toBeVisible()
+  })
+  const loads = requests.map(decodeURIComponent)
+  expect(loads.some((r) => r.startsWith('GET /api/invoice-line-items?invoiceId[eq]='))).toBe(true)
+  expect(loads.some((r) => r.startsWith('GET /api/payments?invoiceId[eq]='))).toBe(true)
+  const before = await balance.textContent()
+  await setChaos(page, { latencyMs: 1500, failRate: 0 })
+  await detail.getByLabel('Payment amount').fill('1')
+  await detail.getByRole('button', { name: 'Record payment' }).click()
+  // the ledger row shows up before the server has answered
+  await expect(detail.getByTestId('invoice-payments').getByText('$1', { exact: true })).toBeVisible({ timeout: 1000 })
+  await expect(balance).not.toHaveText(before!, { timeout: 1000 })
+})
+
+test('many-to-many tag toggles and team membership are optimistic inserts/deletes on join tables', async ({ page }) => {
+  await page.goto('/customers/1')
+  const tag = page.getByTestId('tags').getByRole('button').first()
+  const pressed = await tag.getAttribute('aria-pressed')
+  await tag.click()
+  await expect(tag).toHaveAttribute('aria-pressed', pressed === 'true' ? 'false' : 'true')
+  await page.reload()
+  await expect(page.getByTestId('tags').getByRole('button').first()).toHaveAttribute(
+    'aria-pressed',
+    pressed === 'true' ? 'false' : 'true',
+  )
+
+  await page.goto('/team')
+  await page.getByRole('radio', { name: 'Teams' }).click()
+  const team = page.getByTestId('teams').locator('section').first()
+  const add = team.getByRole('combobox')
+  const name = (await add.locator('option').nth(1).textContent())!
+  await add.selectOption({ index: 1 })
+  const chip = team.getByRole('button', { name: new RegExp(`^Remove ${name} from`) })
+  await expect(chip).toBeVisible()
+  await chip.click()
+  await expect(chip).toHaveCount(0)
+})
+
+test('a server-side refusal (409: task has comments) rolls the optimistic delete back', async ({ page }) => {
+  await page.goto('/projects/1')
+  const card = page.getByTestId('task-card').first()
+  const title = (await card.getByTestId('task-title').textContent())!
+  await card.getByTestId('task-title').click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByLabel('Comment').fill('Blocking the delete')
+  await dialog.getByRole('button', { name: 'Post' }).click()
+  await expect(dialog.getByText('Blocking the delete')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await page.getByTestId('task-card').filter({ hasText: title }).first().hover()
+  await page
+    .getByRole('button', { name: `Delete ${title}` })
+    .first()
+    .click()
+  await expect(page.getByRole('alert').filter({ hasText: 'Could not delete task' })).toBeVisible()
+  await expect(page.getByTestId('task-card').filter({ hasText: title }).first()).toBeVisible()
+})
+
+test('a viewer gets read-only UI driven by the same permissions the API enforces', async ({ browser, baseURL }) => {
+  const ctx = await browser.newContext({ baseURL, storageState: 'e2e/.auth/viewer.json' })
+  const page = await ctx.newPage()
+  await page.goto('/customers/1')
+  await expect(page.getByText(/read-only — owned by/)).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Archive' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Edit' })).toBeDisabled()
+  await page.goto('/customers')
+  await expect(page.getByRole('button', { name: '+ New customer' })).toHaveCount(0)
+  await ctx.close()
 })

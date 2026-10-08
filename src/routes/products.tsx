@@ -1,0 +1,109 @@
+import { count, eq, inArray, multiply, sum, useLiveQuery } from '@tanstack/react-db'
+import { Badge, Card, PageHeader } from '../components/ui'
+import { productsCollection, subscriptionsCollection } from '../db/collections'
+import { useCan } from '../lib/auth'
+import { money, number } from '../lib/format'
+import { toast } from '../lib/toast'
+
+export function ProductsPage() {
+  const { can } = useCan()
+  // products ⨝ (subscriptions GROUP BY product): adoption & MRR per SKU, live
+  const { data: products } = useLiveQuery({
+    query: (q) => {
+      const adoption = q
+        .from({ s: subscriptionsCollection })
+        .where(({ s }) => inArray(s.status, ['active', 'past_due']))
+        .groupBy(({ s }) => s.productId)
+        .select(({ s }) => ({
+          productId: s.productId,
+          subs: count(s.id),
+          units: sum(s.quantity),
+          mrr: sum(multiply(s.quantity, s.unitPrice)),
+        }))
+      return q
+        .from({ p: productsCollection })
+        .leftJoin({ a: adoption }, ({ p, a }) => eq(p.id, a.productId))
+        .orderBy(({ p }) => p.id)
+        .select(({ p, a }) => ({ ...p, subs: a?.subs, units: a?.units, mrr: a?.mrr }))
+    },
+  })
+  const editable = can('products:write')
+  const save = (id: number, mutate: (d: { unitPrice: number; active: boolean }) => void) =>
+    productsCollection
+      .update(id, mutate)
+      .when('settled')
+      .then(
+        () => toast.success('Product updated'),
+        (e: Error) => toast.error('Could not update product — rolled back', e.message),
+      )
+
+  return (
+    <>
+      <PageHeader
+        title="Products"
+        description="Catalog ⨝ live adoption from every subscription. Prices are locked into subscriptions at signup."
+      />
+      <Card>
+        <table className="w-full" data-testid="products-table">
+          <thead>
+            <tr>
+              <th className="th">SKU</th>
+              <th className="th">Name</th>
+              <th className="th">Kind</th>
+              <th className="th text-right">List price</th>
+              <th className="th text-right">Active subs</th>
+              <th className="th text-right">Units</th>
+              <th className="th text-right">MRR</th>
+              <th className="th">For sale</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+            {products.map((p) => (
+              <tr
+                key={p.id}
+                data-testid="product-row"
+                className={p.$hasPendingWrites ? 'bg-amber-50/50 dark:bg-amber-500/5' : undefined}
+              >
+                <td className="td font-mono text-xs">{p.sku}</td>
+                <td className="td">{p.name}</td>
+                <td className="td">
+                  <Badge value={p.planCode ?? p.kind} />
+                </td>
+                <td className="td text-right">
+                  {editable ? (
+                    <input
+                      type="number"
+                      className="input w-28 text-right"
+                      aria-label={`Price of ${p.sku}`}
+                      defaultValue={p.unitPrice / 100}
+                      min={0}
+                      step={1}
+                      onBlur={(e) => {
+                        const cents = Math.round(Number(e.target.value) * 100)
+                        if (cents !== p.unitPrice) void save(p.id, (d) => void (d.unitPrice = cents))
+                      }}
+                    />
+                  ) : (
+                    money(p.unitPrice)
+                  )}
+                </td>
+                <td className="td text-right tabular-nums">{number(p.subs ?? 0)}</td>
+                <td className="td text-right tabular-nums">{number(p.units ?? 0)}</td>
+                <td className="td text-right tabular-nums">{money(p.mrr ?? 0)}</td>
+                <td className="td">
+                  <input
+                    type="checkbox"
+                    aria-label={`${p.sku} for sale`}
+                    checked={p.active}
+                    disabled={!editable}
+                    onChange={(e) => save(p.id, (d) => void (d.active = e.target.checked))}
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+    </>
+  )
+}

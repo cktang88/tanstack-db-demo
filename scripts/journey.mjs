@@ -4,6 +4,9 @@ import { chromium } from '@playwright/test'
 const base = process.env.BASE ?? 'http://localhost:5173'
 const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? '/opt/pw-browsers/chromium' })
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
+// the session cookie set here is shared with the page
+const login = await page.request.post(`${base}/api/auth/login`, { data: { email: 'owner@saasly.dev', password: 'password' } })
+if (!login.ok()) throw new Error(`login failed: ${login.status()}`)
 await page.request.post(`${base}/api/dev/reset`, { data: {} })
 await page.request.put(`${base}/api/dev/chaos`, { data: { latencyMs: 150, failRate: 0 } })
 
@@ -93,6 +96,26 @@ await step('mark first invoice paid', async () => {
     n,
   )
 })
+await step('customer: expand invoice (line items + ledger)', async () => {
+  await page.getByTestId('invoices-table').getByTestId('row').first().getByRole('link').click()
+  await page.getByTestId('customer-invoices').waitFor()
+  await page.getByTestId('customer-invoices').getByRole('row').nth(1).click()
+  await page.getByTestId('invoice-payments').waitFor()
+})
+await step('toggle a tag (many-to-many)', async () => {
+  const tag = page.getByTestId('tags').getByRole('button').first()
+  const before = await tag.getAttribute('aria-pressed')
+  await tag.click()
+  await page.waitForFunction(
+    (b) => document.querySelector('[data-testid=tags] button').getAttribute('aria-pressed') !== b,
+    before,
+  )
+})
+await step('Billing (MRR rollup, AR aging, ledger)', async () => {
+  await nav('Billing')
+  await page.getByTestId('billing-mrr').getByText(/\$/).first().waitFor()
+  await page.getByTestId('payments-table').getByTestId('row').first().waitFor()
+})
 await step('Projects -> board', async () => {
   await nav('Projects')
   await page.getByTestId('project-card').first().click()
@@ -110,6 +133,16 @@ await step('move a task right', async () => {
 await step('Team page', async () => {
   await nav('Team')
   await page.getByTestId('member-row').first().waitFor()
+})
+await step('Teams tab: add a member', async () => {
+  await page.getByRole('radio', { name: 'Teams' }).click()
+  const team = page.getByTestId('teams').locator('section').first()
+  const before = await team.getByRole('listitem').count()
+  await team.getByRole('combobox').selectOption({ index: 1 })
+  await page.waitForFunction(
+    (b) => document.querySelector('[data-testid=teams] section').querySelectorAll('li').length !== b,
+    before,
+  )
 })
 console.table(results.map(({ detail: _detail, ...r }) => r))
 console.log(JSON.stringify(results))

@@ -10,6 +10,7 @@ import {
 import { Link } from '@tanstack/react-router'
 import { useActionState, useState, ViewTransition } from 'react'
 import { TASK_PRIORITIES, TASK_STATUSES, type TaskStatus } from '../../shared/domain'
+import { TaskDialog } from '../components/TaskDialog'
 import { Avatar, Badge, PageHeader } from '../components/ui'
 import { newId, persist, projectsCollection, tasksCollection, usersCollection, type TaskRow } from '../db/collections'
 import { date, titleCase } from '../lib/format'
@@ -28,6 +29,7 @@ export function ProjectBoardPage() {
         .findOne(),
   })
   const [assignee, setAssignee] = useState<number | 'all'>('all')
+  const [openId, setOpenId] = useState<number | null>(null)
   const { data: users } = useLiveQuery({ query: (q) => q.from({ u: usersCollection }).orderBy(({ u }) => u.name) })
   // tasks for this project ⨝ assignee, filtered by the (indexed) projectId
   const { data: tasks } = useLiveQuery({
@@ -82,9 +84,16 @@ export function ProjectBoardPage() {
         }
       />
       <DescriptionEditor projectId={project.id} value={project.description} />
+      <TaskDialog taskId={openId} onClose={() => setOpenId(null)} />
       <div className="grid gap-4 lg:grid-cols-4" data-testid="board">
         {TASK_STATUSES.map((status) => (
-          <Column key={status} status={status} tasks={tasks.filter((t) => t.status === status)} projectId={projectId} />
+          <Column
+            key={status}
+            status={status}
+            tasks={tasks.filter((t) => t.status === status)}
+            projectId={projectId}
+            onOpen={setOpenId}
+          />
         ))}
       </div>
     </>
@@ -123,7 +132,17 @@ function DescriptionEditor({ projectId, value }: { projectId: number; value: str
 
 type BoardTask = TaskRow & { assigneeName?: string; assigneeColor?: string; $hasPendingWrites?: boolean }
 
-function Column({ status, tasks, projectId }: { status: TaskStatus; tasks: BoardTask[]; projectId: number }) {
+function Column({
+  status,
+  tasks,
+  projectId,
+  onOpen,
+}: {
+  status: TaskStatus
+  tasks: BoardTask[]
+  projectId: number
+  onOpen: (id: number) => void
+}) {
   const [over, setOver] = useState(false)
   return (
     <section
@@ -150,7 +169,7 @@ function Column({ status, tasks, projectId }: { status: TaskStatus; tasks: Board
       <ul className="flex flex-1 flex-col gap-2">
         {tasks.map((t) => (
           <ViewTransition key={t.id} name={`task-${t.id}`}>
-            <TaskCard task={t} />
+            <TaskCard task={t} onOpen={onOpen} />
           </ViewTransition>
         ))}
       </ul>
@@ -169,7 +188,7 @@ function moveTask(id: number, status: TaskStatus) {
     .catch(onRollback('Task update failed — rolled back'))
 }
 
-function TaskCard({ task }: { task: BoardTask }) {
+function TaskCard({ task, onOpen }: { task: BoardTask; onOpen: (id: number) => void }) {
   const idx = TASK_STATUSES.indexOf(task.status)
   return (
     <li
@@ -180,12 +199,13 @@ function TaskCard({ task }: { task: BoardTask }) {
       className={`card group cursor-grab p-3 text-sm ${task.$hasPendingWrites ? 'ring-1 ring-amber-400/60' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <span className="font-medium" data-testid="task-title">
+        <button className="text-left font-medium hover:text-brand-600" data-testid="task-title" onClick={() => onOpen(task.id)}>
           {task.title}
-        </span>
+        </button>
         <button
           className="text-xs text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-red-600"
           aria-label={`Delete ${task.title}`}
+          // the server refuses (409) tasks that have comments: the optimistic delete rolls back by itself
           onClick={() => tasksCollection.delete(task.id).when('settled').catch(onRollback('Could not delete task — restored'))}
         >
           ✕

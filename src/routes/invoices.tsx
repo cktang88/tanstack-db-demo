@@ -8,6 +8,7 @@ import { markInvoicePaid } from '../db/actions'
 import { customersCollection, invoicesCollection } from '../db/collections'
 import { date, money, number } from '../lib/format'
 import { formatSort, parseSort, type InvoiceListParams } from '../lib/search'
+import { useCan } from '../lib/auth'
 import { toast } from '../lib/toast'
 import { invoicesRoute } from '../router'
 
@@ -112,21 +113,26 @@ const columns = col.columns([
   col.display({
     id: 'actions',
     header: '',
-    cell: ({ row }) =>
-      row.original.status === 'open' || row.original.status === 'overdue' ? (
-        <button
-          className="btn-ghost px-2 py-0.5 text-xs"
-          onClick={() =>
-            markInvoicePaid({ invoiceId: row.original.id, number: row.original.number, customerId: row.original.customerId })
-              .when('settled')
-              .catch((e: Error) => toast.error('Could not mark invoice paid — rolled back', e.message))
-          }
-        >
-          Mark paid
-        </button>
-      ) : null,
+    cell: ({ row }) => <MarkPaid invoice={row.original} />,
   }),
 ])
+
+function MarkPaid({ invoice }: { invoice: Row }) {
+  const canPay = useCan().can('billing:write')
+  if (!canPay || (invoice.status !== 'open' && invoice.status !== 'overdue')) return null
+  return (
+    <button
+      className="btn-ghost px-2 py-0.5 text-xs"
+      onClick={() =>
+        markInvoicePaid({ invoiceId: invoice.id, number: invoice.number, customerId: invoice.customerId })
+          .when('settled')
+          .catch((e: Error) => toast.error('Could not mark invoice paid — rolled back', e.message))
+      }
+    >
+      Mark paid
+    </button>
+  )
+}
 
 export function InvoicesPage() {
   const search = invoicesRoute.useSearch()

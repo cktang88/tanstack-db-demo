@@ -1,6 +1,10 @@
-import { count, gt, useLiveQuery, useLiveQueryEffect, eq } from '@tanstack/react-db'
+import { count, eq, gt, isNull, useLiveQuery, useLiveQueryEffect } from '@tanstack/react-db'
+import { useEffect, useRef, useState } from 'react'
+import type { Permission } from '../../shared/domain'
+import { useCan, useLogout } from '../lib/auth'
 import { Link, Outlet, useRouterState } from '@tanstack/react-router'
 import {
+  notificationsCollection,
   customersCollection,
   invoicesCollection,
   projectsCollection,
@@ -9,20 +13,121 @@ import {
   type CustomerRow,
 } from '../db/collections'
 import { usePrefs } from '../db/hooks'
-import { money, number } from '../lib/format'
+import { money, number, relative } from '../lib/format'
 import { toast } from '../lib/toast'
-import { cx, Spinner, Toaster } from './ui'
+import { Avatar, Badge, cx, Spinner, Toaster } from './ui'
 
-const NAV = [
+const NAV: ReadonlyArray<{ to: string; label: string; icon: string; permission?: Permission }> = [
   { to: '/', label: 'Overview', icon: '◧' },
   { to: '/analytics', label: 'Analytics', icon: '◔' },
-  { to: '/customers', label: 'Customers', icon: '◎' },
-  { to: '/invoices', label: 'Invoices', icon: '▤' },
-  { to: '/projects', label: 'Projects', icon: '▦' },
-  { to: '/team', label: 'Team', icon: '◍' },
+  { to: '/customers', label: 'Customers', icon: '◎', permission: 'customers:read' },
+  { to: '/invoices', label: 'Invoices', icon: '▤', permission: 'billing:read' },
+  { to: '/billing', label: 'Billing', icon: '$', permission: 'billing:read' },
+  { to: '/products', label: 'Products', icon: '▣', permission: 'products:read' },
+  { to: '/projects', label: 'Projects', icon: '▦', permission: 'projects:read' },
+  { to: '/team', label: 'Team', icon: '◍', permission: 'team:read' },
   { to: '/activity', label: 'Activity', icon: '≋' },
+  { to: '/audit', label: 'Audit log', icon: '⎙', permission: 'audit:read' },
   { to: '/settings', label: 'Settings', icon: '⚙' },
-] as const
+]
+
+function Notifications() {
+  // my notifications (server-scoped) as a live collection; unread count is a live aggregate
+  const { data } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ n: notificationsCollection })
+        .orderBy(({ n }) => n.createdAt, 'desc')
+        .orderBy(({ n }) => n.id, 'desc')
+        .limit(30),
+  })
+  const { data: unread } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ n: notificationsCollection })
+        .where(({ n }) => isNull(n.readAt))
+        .select(({ n }) => ({ n: count(n.id) }))
+        .findOne(),
+  })
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const close = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false)
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [])
+  const markAll = () => {
+    const ids = data.filter((n) => !n.readAt).map((n) => n.id)
+    if (!ids.length) return
+    // one transaction, one batch request, instant badge update
+    notificationsCollection.update(ids, (drafts) => drafts.forEach((d) => (d.readAt = new Date().toISOString())))
+  }
+  const count_ = unread?.n ?? 0
+  return (
+    <div className="relative" ref={ref}>
+      <button className="btn-ghost relative" aria-label={`Notifications (${count_} unread)`} onClick={() => setOpen((o) => !o)}>
+        🔔
+        {count_ > 0 && (
+          <span
+            className="absolute -top-0.5 -right-0.5 rounded-full bg-red-600 px-1 text-[10px] text-white"
+            data-testid="unread-count"
+          >
+            {count_}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="card absolute right-0 z-30 mt-2 w-80 p-0 shadow-xl" data-testid="notifications">
+          <div className="flex items-center justify-between border-b border-zinc-100 px-3 py-2 text-sm font-medium dark:border-zinc-800">
+            Notifications
+            <button className="text-xs text-brand-600" onClick={markAll} disabled={!count_}>
+              Mark all read
+            </button>
+          </div>
+          <ul className="max-h-96 divide-y divide-zinc-100 overflow-auto dark:divide-zinc-800">
+            {data.map((n) => (
+              <li key={n.id} className={cx('px-3 py-2 text-sm', !n.readAt && 'bg-brand-50/50 dark:bg-brand-500/10')}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">{n.title}</span>
+                  {!n.readAt && (
+                    <button
+                      className="text-xs text-zinc-400 hover:text-zinc-700"
+                      onClick={() => notificationsCollection.update(n.id, (d) => void (d.readAt = new Date().toISOString()))}
+                      aria-label="Mark read"
+                    >
+                      ✓
+                    </button>
+                  )}
+                </div>
+                <div className="text-xs text-zinc-500">
+                  {n.body} · {relative(n.createdAt)}
+                </div>
+              </li>
+            ))}
+            {data.length === 0 && <li className="px-3 py-6 text-center text-sm text-zinc-500">Nothing yet</li>}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function UserMenu() {
+  const { me } = useCan()
+  const logout = useLogout()
+  return (
+    <div className="flex items-center gap-2" data-testid="user-menu">
+      <Avatar name={me.user.name} color={me.user.avatarColor} size={26} />
+      <div className="hidden text-xs leading-tight sm:block">
+        <div className="font-medium">{me.user.name}</div>
+        <Badge value={me.user.role} />
+      </div>
+      <button className="btn-ghost text-xs" onClick={() => logout.mutate()}>
+        Sign out
+      </button>
+    </div>
+  )
+}
 
 /** Live row counts of the local database — these are reactive queries too. */
 function DbStats() {
@@ -81,6 +186,8 @@ function LiveAlerts() {
 
 export function Layout() {
   const [prefs] = usePrefs()
+  const { can } = useCan()
+  const nav = NAV.filter((n) => !n.permission || can(n.permission))
   const loading = useRouterState({ select: (s) => s.status === 'pending' })
   return (
     <div className="flex min-h-screen">
@@ -90,7 +197,7 @@ export function Layout() {
           Saasly
         </Link>
         <nav className="flex flex-col gap-0.5" aria-label="Main">
-          {NAV.map((n) => (
+          {nav.map((n) => (
             <Link
               key={n.to}
               to={n.to}
@@ -113,7 +220,7 @@ export function Layout() {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-zinc-200 bg-white/80 px-6 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/80">
           <nav className="flex gap-3 overflow-x-auto text-sm md:hidden" aria-label="Mobile">
-            {NAV.map((n) => (
+            {nav.map((n) => (
               <Link key={n.to} to={n.to} activeOptions={{ exact: n.to === '/' }} activeProps={{ className: 'font-semibold' }}>
                 {n.label}
               </Link>
@@ -126,7 +233,11 @@ export function Layout() {
               </span>
             )}
           </div>
-          <ThemeToggle />
+          <div className="ml-auto flex items-center gap-2">
+            <ThemeToggle />
+            <Notifications />
+            <UserMenu />
+          </div>
         </header>
         <main className={cx('mx-auto w-full flex-1 px-6 py-6', prefs.compact ? 'max-w-[1600px]' : 'max-w-7xl')}>
           <Outlet />
@@ -142,7 +253,7 @@ function ThemeToggle() {
   const [prefs, update] = usePrefs()
   return (
     <button
-      className="btn-ghost ml-auto"
+      className="btn-ghost"
       aria-label="Toggle theme"
       onClick={() => update({ theme: prefs.theme === 'dark' ? 'light' : 'dark' })}
     >

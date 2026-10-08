@@ -2,6 +2,10 @@
 // client (form validation). One source of truth for what a valid write is.
 import { Schema, SchemaTransformation } from 'effect'
 import {
+  PAYMENT_METHODS,
+  PRODUCT_KINDS,
+  SUBSCRIPTION_STATUSES,
+  USAGE_METRICS,
   COUNTRIES,
   CUSTOMER_STATUSES,
   INVOICE_STATUSES,
@@ -43,9 +47,10 @@ export const CustomerPatch = Schema.Struct({
 })
 export type CustomerPatch = typeof CustomerPatch.Type
 
+/** Invoices are immutable except for voiding and moving the due date; "paid" is reached by recording payments. */
 export const InvoicePatch = Schema.Struct({
   status: Schema.optionalKey(Schema.Literals(INVOICE_STATUSES)),
-  paidAt: Schema.optionalKey(Schema.NullOr(IsoDate)),
+  dueAt: Schema.optionalKey(IsoDate),
 })
 
 export const ProjectPatch = Schema.Struct({
@@ -53,6 +58,8 @@ export const ProjectPatch = Schema.Struct({
   description: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
   status: Schema.optionalKey(Schema.Literals(PROJECT_STATUSES)),
   ownerId: Schema.optionalKey(Schema.NullOr(Id)),
+  teamId: Schema.optionalKey(Schema.NullOr(Id)),
+  budgetHours: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100_000 }))),
 })
 
 export const TaskInput = Schema.Struct({
@@ -83,16 +90,132 @@ export const UserPatch = Schema.Struct({
   active: Schema.optionalKey(Schema.Boolean),
 })
 
-export const BATCH_ENTITIES = ['customers', 'invoices', 'projects', 'tasks', 'users'] as const
-export type BatchEntity = (typeof BATCH_ENTITIES)[number]
+export const LoginInput = Schema.Struct({ email: Schema.String, password: Schema.String })
+
+export const TeamInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  name: Name,
+  description: Schema.String.check(Schema.isMaxLength(500)),
+  leadId: Schema.NullOr(Id),
+})
+export const TeamPatch = Schema.Struct({
+  name: Schema.optionalKey(Name),
+  description: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(500))),
+  leadId: Schema.optionalKey(Schema.NullOr(Id)),
+})
+export const TeamMemberInput = Schema.Struct({ teamId: Id, userId: Id })
+
+export const ContactInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  customerId: Id,
+  name: Name,
+  email: Email,
+  title: Schema.String.check(Schema.isMaxLength(120)),
+  isPrimary: Schema.Boolean,
+})
+export const ContactPatch = Schema.Struct({
+  name: Schema.optionalKey(Name),
+  email: Schema.optionalKey(Email),
+  title: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(120))),
+  isPrimary: Schema.optionalKey(Schema.Boolean),
+})
+
+const Color = Schema.String.check(Schema.isPattern(/^#[0-9a-f]{6}$/i, { message: 'Expected a hex colour' }))
+export const TagInput = Schema.Struct({ id: Schema.optionalKey(Id), name: Name, color: Color })
+export const TagPatch = Schema.Struct({ name: Schema.optionalKey(Name), color: Schema.optionalKey(Color) })
+export const CustomerTagInput = Schema.Struct({ customerId: Id, tagId: Id })
+
+const Cents = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100_000_000 }))
+export const ProductInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  sku: Schema.String.check(Schema.isPattern(/^[A-Z0-9-]{3,32}$/, { message: 'SKU must be 3–32 chars of A–Z, 0–9 or -' })),
+  name: Name,
+  kind: Schema.Literals(PRODUCT_KINDS),
+  planCode: Schema.NullOr(Schema.Literals(PLANS)),
+  unitPrice: Cents,
+  active: Schema.Boolean,
+})
+export const ProductPatch = Schema.Struct({
+  name: Schema.optionalKey(Name),
+  unitPrice: Schema.optionalKey(Cents),
+  active: Schema.optionalKey(Schema.Boolean),
+})
+
+export const SubscriptionInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  customerId: Id,
+  productId: Id,
+  quantity: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100_000 })),
+  status: Schema.optionalKey(Schema.Literals(SUBSCRIPTION_STATUSES)),
+})
+export const SubscriptionPatch = Schema.Struct({
+  quantity: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100_000 }))),
+  status: Schema.optionalKey(Schema.Literals(SUBSCRIPTION_STATUSES)),
+})
+
+export const PaymentInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  invoiceId: Id,
+  /** defaults to the outstanding remainder of the invoice */
+  amount: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  method: Schema.Literals(PAYMENT_METHODS),
+  reference: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+})
+
+export const ProjectInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  name: Name,
+  description: Schema.String.check(Schema.isMaxLength(2000)),
+  customerId: Schema.NullOr(Id),
+  ownerId: Schema.NullOr(Id),
+  teamId: Schema.NullOr(Id),
+  status: Schema.Literals(PROJECT_STATUSES),
+  budgetHours: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100_000 })),
+})
+
+export const CommentInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  taskId: Id,
+  body: Schema.Trimmed.check(Schema.isMinLength(1, { message: 'Comment cannot be empty' }), Schema.isMaxLength(5000)),
+})
+
+const Minutes = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 1440 }, { message: 'Minutes must be between 1 and 1440' }),
+)
+const Day = Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/, { message: 'Expected YYYY-MM-DD' }))
+export const TimeEntryInput = Schema.Struct({
+  id: Schema.optionalKey(Id),
+  taskId: Id,
+  minutes: Minutes,
+  spentOn: Day,
+  billable: Schema.Boolean,
+  note: Schema.String.check(Schema.isMaxLength(500)),
+})
+export const TimeEntryPatch = Schema.Struct({
+  minutes: Schema.optionalKey(Minutes),
+  spentOn: Schema.optionalKey(Day),
+  billable: Schema.optionalKey(Schema.Boolean),
+  note: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(500))),
+})
+
+export const UsageEventInput = Schema.Struct({
+  customerId: Id,
+  metric: Schema.Literals(USAGE_METRICS),
+  quantity: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 })),
+  occurredAt: IsoDate,
+  /** replaying the same key is a no-op (exactly-once ingestion) */
+  idempotencyKey: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(128))),
+})
+
+export const NotificationPatch = Schema.Struct({ readAt: Schema.NullOr(IsoDate) })
 
 /** Atomic multi-entity write: all ops commit in one SQLite transaction or none do. */
 export const BatchRequest = Schema.Struct({
   ops: Schema.Array(
     Schema.Struct({
-      entity: Schema.Literals(BATCH_ENTITIES),
+      entity: Schema.String,
       op: Schema.Literals(['insert', 'update', 'delete']),
-      id: Schema.optionalKey(Id),
+      id: Schema.optionalKey(Schema.Union([Id, Schema.String])),
       data: Schema.optionalKey(Schema.Unknown),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(1000)),
