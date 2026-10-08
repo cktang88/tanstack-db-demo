@@ -188,25 +188,88 @@ only after commit.
 ## TanStack DB layer (this branch)
 
 ```
-src/db/collections.ts  one collection per API resource (27 tables -> ~25 collections), built by two factories:
-                         serverCollection()   eager: whole (permission-scoped) table, queried locally
-                         onDemandCollection() loadSubset: where/orderBy/limit pushed down to the REST grammar
+src/db/collections.ts  one collection per API resource, built by two factories:
+                         serverCollection()   eager: the whole (permission-scoped) table, queried locally
+                         onDemandCollection() query-driven: each live query's where/orderBy/limit is
+                                              pushed down (loadSubset) and only those rows are held
                        mode per resource: crud | append-only (payments, comments: insert only) | read-only
                        (rollups, line items, audit log, views) — enforced before any request; prefs/pins
                        (localStorage), selection (local-only); one atomic persist() -> POST /api/batch for
                        every handler; server-computed fields are stripped from what is sent and derived rows
                        (MRR from subscriptions, invoice settled by payment) are re-read after commit
-src/db/pushdown.ts     live-query predicate -> REST list grammar (where/orderBy/limit/offset)
-src/db/views.ts        materialized views (module-level live query collections) for dashboard aggregates
+src/db/pushdown.ts     live-query predicate -> REST list grammar (where/orderBy/limit/offset, search, sort keys)
+src/db/aggregates.ts   server aggregates over the big tables: /metrics/*, list totals (?limit=0&sum=)
 src/db/actions.ts      intent-level mutations: optimistic actions (record payment, add-on, mark paid),
                        multi-collection & staged transactions (archive customer + invoices, reassign tasks)
-src/db/live.ts         permission-filtered SSE change feed -> direct writes (writeUpsert/writeDelete), no refetching
-src/lib/auth.ts        sign-in / sign-out / 401 clear every server collection, view, cursor pager and the
-                       selection, so no rows leak between users
+src/db/live.ts         permission-filtered SSE change feed -> batched direct writes of loaded rows,
+                       window re-reads for rows not held, debounced invalidation of server aggregates
+src/db/alerts.ts       churn / $20k MRR alerts from server rows as they land (SSE and batch results)
+src/lib/auth.ts        sign-in / sign-out / 401 clear every server collection, cached query, cursor pager
+                       and the selection, so no rows leak between users
 ```
 
-Server rollup tables and views (`customer_balances`, `project_stats`, AR aging, product adoption, team rosters,
-role matrix) become live joins/aggregates on the client, so they update the instant any underlying row changes.
+### Eager vs on-demand
+
+With `pnpm db:big` (250k customers, ~13M rows) "load the table, query it locally" stops being an option: the server
+serves at most 10,000 rows per request, so an eager customers collection was silently a 4% sample (MRR $9.0M instead of
+$557M) and loading everything would be ~70 MB of customers and ~200 MB of invoices as JSON. So:
+
+| collections                                                                                                                                                                        | sync          | why                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | ----------------------------------------------------------------------------- |
+| users, roles, permissions, role-permissions, teams, team-members, sessions (own), notifications (own), tags, products, projects, tasks, time entries, task comments, MRR snapshots | eager         | bounded (tens to a few thousand rows); local joins, aggregates, optimistic UI |
+| customers, contacts, customer-tags, subscriptions, invoices, invoice line items, payments, usage-daily, customer-health, audit log, events (+ per-category)                        | **on-demand** | 100k–3M rows at scale; only the windows and per-customer slices on screen     |
+
+Eager collections still log a loud `console.error` if the server ever truncates them. An on-demand subset without a
+limit that matches more rows than one request returns is refused (`SubsetTooLargeError`) instead of being truncated.
+
+**Push-down coverage** (`pushdown.ts`; anything else throws — never a silently wrong window):
+
+- `eq / neq (not eq) / gt / gte / lt / lte / inArray / isNull / not isNull` on a row's own fields, `and`;
+- **search**: rows carry a derived `searchText` (exactly the columns the server's `?q=` searches: customers name,
+  email, company and owner name, invoices number and customer company), so `ilike(row.searchText, searchPattern(q))`
+  is sent as `?q=` and re-evaluated locally to the same rows (LIKE wildcards are kept literal on both sides);
+- **sort**: TanStack DB cuts a window by its first sort term and then loads every row _tied_ with the last one, which
+  for "sort by plan" means every enterprise customer. Rows therefore carry composite keys `order.<field>` (value + id,
+  encoded to compare like SQLite's `ORDER BY field, id`, NULLs and numbers included; compared with
+  `stringSort: 'lexical'`), pushed down as `?sort=field,id`: windows are exact and the tie group is one row, which the
+  collection answers from the row it already has (no second request). Owner name and customer company sort through
+  the server's `owner` / `customerCompany` sort keys;
+- **windows**: `limit`, and `offset` as a prefix (TanStack DB counts offsets over local rows, so page _n_ loads the first
+  _n_ pages — tables let you page through the first 10,000 matches; flip the sort or filter for the rest);
+- **joins**: the joined side loads lazily by key (`?id[in]=…`), e.g. the ledger's invoices and customers, the selected
+  customers of the bulk-action summary, the pinned accounts.
+
+**Server aggregates** (TanStack Query on the same QueryClient, `aggregates.ts`): overview KPIs, revenue, signups, the
+plan/country/status breakdowns, AR aging and product adoption come from `/metrics/*`; table headers and the sidebar use
+`?limit=0&sum=…` with the table's filters. The change feed invalidates exactly the aggregates a change can move
+(debounced). Local live-query aggregates remain where the data is bounded: a customer's balance, invoices, payments,
+subscriptions; tasks and workload; the selection; the pins.
+
+**Writes** are unchanged (one optimistic transaction, one `POST /api/batch`), with derived fields recomputed on the
+optimistic row so it moves in sorted windows at once.
+
+Against `data/big.db` (production build, local API, owner): Overview MRR and the sidebar counts equal the API
+(250,000 customers, 1,131,510 invoices), every page is ready in 0.2–1.1 s, the JS heap stays at 12–33 MB while browsing
+(62 MB on the deepest customers page, back to ~20 MB once its window is released), no console errors.
+
+### Library behaviours this relies on or works around (TanStack DB 0.12.3, query-db-collection 1.4.2)
+
+- After a direct write (`writeUpsert` from a batch result or SSE) an on-demand query collection **re-reads every
+  active subset** of that collection (`writeDirectCache`, query-db-collection `query.ts`; #1826): a changed row can
+  enter or leave a window that only the server can refill. So a write costs one batch request plus one re-read per
+  window on screen. SSE changes are batched per collection (one write, one re-read), echoes of our own writes and rows
+  already stored as-is are skipped, rows nobody holds are not stored (the windows are re-read instead).
+- A subset's rows are removed **as soon as nothing holds the subset** (`cleanupQueryInternal`). If a window had already
+  shown such a row from local state while its own request was in flight, the ordered loader treats the removal as an
+  ordering change and repairs with a **full-source load** — the where-only, unbounded request
+  (`OrderedSourceLoader.invalidateSourceOrdering` / `loadFullSource`, db `ordered-source-loader.ts`). Windows the user
+  moves are therefore kept alive 10 s after they are left (`WINDOW = { gcTime }`, also making "back" instant), and the
+  windows are never aborted mid-flight (an aborted acquisition counts as failed and is repaired the same way). An e2e
+  test walks every page and fails on any unbounded read of a big table.
+- Inner joins drive from whichever side has fewer rows _loaded_ (`getActiveAndLazySources`, db `joins.ts`), which can
+  be the 250k-row on-demand side; queries that must drive from a small local collection use a left join.
+- A cursor boundary on a string sort is only pushed down with `stringSort: 'lexical'` (`canExpressCursorOrder`, db
+  `utils/cursor.ts`); on-demand collections set it as their `defaultStringCollation`.
 
 `scripts/journey.mjs` replays the same 18-step signed-in user journey against either branch and reports requests/latency
 (`BASE=http://localhost:4173 node scripts/journey.mjs`).
